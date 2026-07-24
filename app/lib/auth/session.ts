@@ -1,0 +1,111 @@
+/**
+ * QHUB Studio — Session / Auth
+ * app/lib/auth/session.ts
+ *
+ * Reads the authenticated user from the Supabase JWT cookie and
+ * returns a typed session object used by Remix loaders and actions.
+ *
+ * SECURITY MODEL:
+ *   QhubSession is the browser-facing session type. It deliberately
+ *   does NOT include hmacSecret or any signing credentials.
+ *   The HMAC secret is only accessible via getHmacSecret() which
+ *   is a server-only call (reads from process.env / cloudflare env).
+ *
+ * Required env vars:
+ *   SUPABASE_URL         e.g. https://xyzxyz.supabase.co
+ *   SUPABASE_ANON_KEY    public anon key (safe to embed)
+ *   QHUB_HMAC_SECRET     NEVER returned to browser — accessed via
+ *                        app/lib/qhub/governance-secrets.server.ts only
+ */
+
+import { createServerClient } from '@supabase/ssr';
+
+/**
+ * Browser-safe session type.
+ * MUST NOT contain QHUB_HMAC_SECRET or any signing credentials.
+ * All fields here may reach window.__remixContext via Remix SSR hydration.
+ */
+export interface QhubSession {
+  userId: string;
+  orgId: string;
+  email: string;
+  role: 'admin' | 'builder' | 'viewer';
+}
+
+/**
+ * Extract the authenticated QHUB session from an incoming Request.
+ * Returns null if unauthenticated.
+ *
+ * Usage in a Remix loader:
+ *   const session = await getSession(request, env);
+ *   if (!session) return redirect('/login');
+ */
+export async function getSession(
+  request: Request,
+  env: Record<string, string | undefined>,
+): Promise<QhubSession | null> {
+  const supabaseUrl = env.SUPABASE_URL ?? process.env.SUPABASE_URL ?? '';
+  const supabaseAnonKey = env.SUPABASE_ANON_KEY ?? process.env.SUPABASE_ANON_KEY ?? '';
+
+  if (!supabaseUrl || !supabaseAnonKey) {
+    console.warn('[Auth] Supabase env vars missing — auth disabled in dev mode');
+    return devFallbackSession();
+  }
+
+  const cookieHeader = request.headers.get('Cookie') ?? '';
+
+  const supabase = createServerClient(supabaseUrl, supabaseAnonKey, {
+    cookies: {
+      get(name: string) {
+        return parseCookies(cookieHeader)[name];
+      },
+      set() {/* SSR: handled by response headers */},
+      remove() {/* SSR: handled by response headers */},
+    },
+  });
+
+  const {
+    data: { user },
+    error,
+  } = await supabase.auth.getUser();
+
+  if (error || !user) {
+    return null;
+  }
+
+  // org_id and role are stored in user_metadata by the Supabase invite flow
+  const orgId: string = (user.user_metadata?.org_id as string) ?? 'default';
+  const role: QhubSession['role'] =
+    (user.user_metadata?.role as QhubSession['role']) ?? 'builder';
+
+  // hmacSecret is intentionally NOT included here.
+  // Use getHmacSecret(env) in server actions/routes that need to sign events.
+  return {
+    userId: user.id,
+    orgId,
+    email: user.email ?? '',
+    role,
+  };
+}
+
+// getHmacSecret has been moved to app/lib/qhub/governance-secrets.server.ts
+// Import from there to enforce the .server.ts module boundary.
+
+/** Dev-mode fallback when Supabase is not configured */
+function devFallbackSession(): QhubSession {
+  return {
+    userId: 'dev-user',
+    orgId: 'dev-org',
+    email: 'dev@quantex-tech.com',
+    role: 'admin',
+  };
+}
+
+function parseCookies(header: string): Record<string, string> {
+  return Object.fromEntries(
+    header.split(';').map((c) => {
+      const [k, ...v] = c.trim().split('=');
+      return [decodeURIComponent(k ?? ''), decodeURIComponent(v.join('='))];
+    }),
+  );
+}

@@ -1,4 +1,7 @@
 import { type ActionFunctionArgs } from '@remix-run/cloudflare';
+import { getSession } from '~/lib/auth/session';
+import { getHmacSecret } from '~/lib/qhub/governance-secrets.server';
+import { generateStableSessionId } from '~/lib/qhub/session-id.server';
 import { createDataStream, generateId } from 'ai';
 import { MAX_RESPONSE_SEGMENTS, MAX_TOKENS, type FileMap } from '~/lib/.server/llm/constants';
 import { CONTINUE_PROMPT } from '~/lib/common/prompts/prompts';
@@ -73,6 +76,30 @@ async function chatAction({ context, request }: ActionFunctionArgs) {
     parseCookies(cookieHeader || '').providers || '{}',
   );
 
+  // QHUB: Extract authenticated session for governance hook propagation.
+  // Session ID is now stable: derived from userId + first message ID,
+  // so the same conversation always maps to the same QHUB chain.
+  // hmacSecret is NOT included here — the GovernanceService reads it
+  // directly from process.env at signing time (server-only, never returned to browser).
+  const serverEnv = (context.cloudflare?.env as unknown as Record<string, string | undefined>) ?? {};
+  const qhubRawSession = await getSession(request, serverEnv);
+
+  // Use first user message ID as the stable conversation anchor.
+  // Falls back to orgId+timestamp hash only if messages array is empty.
+  const firstMessageId = messages.find((m) => m.role === 'user')?.id ?? `init-${Date.now()}`;
+
+  const qhubContext = qhubRawSession
+    ? {
+        // Stable: same userId + conversationId → same sessionId across all LLM calls
+        sessionId: generateStableSessionId(qhubRawSession.userId, firstMessageId),
+        conversationId: firstMessageId,
+        userId: qhubRawSession.userId,
+        orgId: qhubRawSession.orgId,
+        // hmacSecret is NOT passed here — GovernanceService reads from env directly
+        serverEnv,
+      }
+    : undefined;
+
   const stream = new SwitchableStream();
 
   const cumulativeUsage = {
@@ -120,7 +147,7 @@ async function chatAction({ context, request }: ActionFunctionArgs) {
 
           summary = await createSummary({
             messages: [...processedMessages],
-            env: context.cloudflare?.env,
+            env: (context.cloudflare?.env ?? process.env) as any,
             apiKeys,
             providerSettings,
             promptId,
@@ -162,7 +189,7 @@ async function chatAction({ context, request }: ActionFunctionArgs) {
           console.log(`Messages count: ${processedMessages.length}`);
           filteredFiles = await selectContext({
             messages: [...processedMessages],
-            env: context.cloudflare?.env,
+            env: (context.cloudflare?.env ?? process.env) as any,
             apiKeys,
             files,
             providerSettings,
@@ -268,7 +295,7 @@ async function chatAction({ context, request }: ActionFunctionArgs) {
 
             const result = await streamText({
               messages: [...processedMessages],
-              env: context.cloudflare?.env,
+              env: (context.cloudflare?.env ?? process.env) as any,
               options,
               apiKeys,
               files,
@@ -280,6 +307,7 @@ async function chatAction({ context, request }: ActionFunctionArgs) {
               designScheme,
               summary,
               messageSliceId,
+              qhubContext,
             });
 
             result.mergeIntoDataStream(dataStream);
@@ -309,7 +337,7 @@ async function chatAction({ context, request }: ActionFunctionArgs) {
 
         const result = await streamText({
           messages: [...processedMessages],
-          env: context.cloudflare?.env,
+          env: (context.cloudflare?.env ?? process.env) as any,
           options,
           apiKeys,
           files,
@@ -321,6 +349,7 @@ async function chatAction({ context, request }: ActionFunctionArgs) {
           designScheme,
           summary,
           messageSliceId,
+          qhubContext,
         });
 
         (async () => {

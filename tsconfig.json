@@ -34,5 +34,9 @@
     "**/.server/**/*.tsx",
     "**/.client/**/*.ts",
     "**/.client/**/*.tsx"
+  ],
+  "exclude": [
+    "node_modules",
+    "functions"
   ]
 }

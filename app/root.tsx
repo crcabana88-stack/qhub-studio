@@ -1,21 +1,51 @@
 import { useStore } from '@nanostores/react';
-import type { LinksFunction } from '@remix-run/cloudflare';
+import type { LinksFunction, LoaderFunctionArgs } from '@remix-run/cloudflare';
+import { redirect } from '@remix-run/cloudflare';
 import { Links, Meta, Outlet, Scripts, ScrollRestoration } from '@remix-run/react';
-import tailwindReset from '@unocss/reset/tailwind-compat.css?url';
-import { themeStore } from './lib/stores/theme';
-import { stripIndents } from './utils/stripIndent';
-import { createHead } from 'remix-island';
 import { useEffect } from 'react';
 import { DndProvider } from 'react-dnd';
 import { HTML5Backend } from 'react-dnd-html5-backend';
+import { createHead } from 'remix-island';
 import { ClientOnly } from 'remix-utils/client-only';
 import { cssTransition, ToastContainer } from 'react-toastify';
-
+import tailwindReset from '@unocss/reset/tailwind-compat.css?url';
 import reactToastifyStyles from 'react-toastify/dist/ReactToastify.css?url';
 import globalStyles from './styles/index.scss?url';
 import xtermStyles from '@xterm/xterm/css/xterm.css?url';
+import { themeStore } from './lib/stores/theme';
+import { stripIndents } from './utils/stripIndent';
+import { getSession } from '~/lib/auth/session';
 
 import 'virtual:uno.css';
+
+// Public paths that don't require auth
+const PUBLIC_PATHS = ['/login', '/auth/callback'];
+
+export async function loader({ request, context }: LoaderFunctionArgs) {
+  const url = new URL(request.url);
+
+  if (PUBLIC_PATHS.some((p) => url.pathname.startsWith(p))) {
+    return null;
+  }
+
+  const session = await getSession(request, (context.cloudflare?.env as unknown as Record<string, string | undefined>) ?? {});
+
+  if (!session) {
+    return redirect('/login');
+  }
+
+  // SECURITY: return only the browser-safe subset of QhubSession.
+  // hmacSecret MUST NOT be included — it would be serialized into
+  // window.__remixContext and become readable from browser JavaScript.
+  return {
+    session: {
+      userId: session.userId,
+      orgId: session.orgId,
+      email: session.email,
+      role: session.role,
+    },
+  };
+}
 
 const toastAnimation = cssTransition({
   enter: 'animated fadeInRight',

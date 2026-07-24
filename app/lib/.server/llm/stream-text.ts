@@ -1,4 +1,6 @@
 import { convertToCoreMessages, streamText as _streamText, type Message } from 'ai';
+// QHUB: AI-BOM logging — server-side only via GovernanceService
+import { createGovernanceService } from '~/lib/qhub/governance-service.server';
 import { MAX_TOKENS, PROVIDER_COMPLETION_LIMITS, isReasoningModel, type FileMap } from './constants';
 import { getSystemPrompt } from '~/lib/common/prompts/prompts';
 import { DEFAULT_MODEL, DEFAULT_PROVIDER, MODIFICATIONS_TAG_NAME, PROVIDER_LIST, WORK_DIR } from '~/utils/constants';
@@ -65,6 +67,14 @@ export async function streamText(props: {
   messageSliceId?: number;
   chatMode?: 'discuss' | 'build';
   designScheme?: DesignScheme;
+  qhubContext?: {
+    sessionId: string;
+    conversationId: string;
+    userId: string;
+    orgId: string;
+    /** Server environment — GovernanceService reads QHUB_HMAC_SECRET from here */
+    serverEnv: Record<string, string | undefined>;
+  };
 }) {
   const {
     messages,
@@ -79,6 +89,7 @@ export async function streamText(props: {
     summary,
     chatMode,
     designScheme,
+    qhubContext,
   } = props;
   let currentModel = DEFAULT_MODEL;
   let currentProvider = DEFAULT_PROVIDER.name;
@@ -161,6 +172,15 @@ export async function streamText(props: {
         credentials: options?.supabaseConnection?.credentials || undefined,
       },
     }) ?? getSystemPrompt();
+
+  // QHUB: Override with QBot governance prompt for authenticated users
+  if (qhubContext?.userId && qhubContext.userId !== 'anonymous') {
+    const { getQBotSystemPrompt } = await import('~/lib/common/prompts/qbot-prompt');
+    systemPrompt = getQBotSystemPrompt({
+      userId: qhubContext.userId,
+      orgId: qhubContext.orgId,
+    } as any);
+  }
 
   if (chatMode === 'build' && contextFiles && contextOptimization) {
     const codeContext = createFilesContext(contextFiles, true);
@@ -306,6 +326,25 @@ export async function streamText(props: {
       2,
     ),
   );
+
+  // ── QHUB HOOK 2: AI-BOM ──────────────────────────────────────────────────
+  // Log every LLM invocation: provider, model, timestamp → QHUB ledger.
+  // Signing happens inside GovernanceService using Node.js crypto.
+  // The HMAC secret is read from serverEnv — never passed through qhubContext.
+  if (qhubContext?.sessionId && qhubContext?.serverEnv) {
+    const svc = createGovernanceService({
+      userId: qhubContext.userId,
+      orgId: qhubContext.orgId,
+      sessionId: qhubContext.sessionId,
+      env: qhubContext.serverEnv,
+    });
+    svc.recordAiModelInvokedDirect({
+      conversationId: qhubContext.conversationId,
+      provider: currentProvider,
+      model: currentModel,
+    }).catch((err: unknown) => console.error('[QHUB] AI-BOM log failed:', err));
+  }
+  // ── END QHUB HOOK 2 ──────────────────────────────────────────────────────
 
   return await _streamText(streamParams);
 }

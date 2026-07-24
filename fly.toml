@@ -1,0 +1,46 @@
+# QHUB Studio — Fly.io deployment config
+# Fly.io is the fastest path to get QHUB Studio live with zero infra setup.
+# AWS App Runner is the production target; use Fly for staging / early access.
+#
+# Deploy: fly deploy
+# Secrets: fly secrets set QHUB_HMAC_SECRET=... SUPABASE_URL=... etc.
+
+app = "qhub-studio"
+primary_region = "iad"   # us-east (IAD) — closest to NY financial clients
+
+[build]
+  dockerfile = "Dockerfile"
+
+[env]
+  NODE_ENV = "production"
+  VITE_LOG_LEVEL = "warn"
+  PORT = "5173"
+  # Non-secret build-time vars only.
+  # Runtime secrets (QHUB_HMAC_SECRET, SUPABASE_URL, etc.) set via:
+  #   fly secrets set KEY=value
+
+[http_service]
+  internal_port = 5173
+  force_https = true
+  auto_stop_machines = true
+  auto_start_machines = true
+  min_machines_running = 1
+
+  [http_service.concurrency]
+    type = "requests"
+    soft_limit = 200
+    hard_limit = 250
+
+[[vm]]
+  size = "shared-cpu-2x"
+  memory = "1gb"
+
+[checks]
+  [checks.alive]
+    port = 5173
+    type = "http"
+    interval = "30s"
+    timeout = "5s"
+    grace_period = "20s"
+    method = "GET"
+    path = "/"

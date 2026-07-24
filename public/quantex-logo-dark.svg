@@ -1,0 +1,20 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 340 100" fill="none">
+  <!-- Three signal shapes (bone/dumbbell marks) -->
+  <!-- Top signal -->
+  <circle cx="22" cy="18" r="12" fill="white"/>
+  <circle cx="72" cy="18" r="12" fill="white"/>
+  <rect x="22" y="11" width="50" height="14" fill="white"/>
+
+  <!-- Middle signal -->
+  <circle cx="22" cy="50" r="12" fill="white"/>
+  <circle cx="72" cy="50" r="12" fill="white"/>
+  <rect x="22" y="43" width="50" height="14" fill="white"/>
+
+  <!-- Bottom signal -->
+  <circle cx="22" cy="82" r="12" fill="white"/>
+  <circle cx="72" cy="82" r="12" fill="white"/>
+  <rect x="22" y="75" width="50" height="14" fill="white"/>
+
+  <!-- QUANTEX text -->
+  <text x="104" y="68" font-family="'Inter', 'Helvetica Neue', Arial, sans-serif" font-size="52" font-weight="700" letter-spacing="-1" fill="white">QUANTEX</text>
+</svg>
