@@ -58,8 +58,11 @@ RUN sed -i 's/\r$//' bindings.sh && chmod +x bindings.sh
 
 EXPOSE 5173
 
-HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
-  CMD node -e "require('http').get('http://localhost:5173/', r => process.exit(r.statusCode === 200 ? 0 : 1))"
+# Probe /login (always 200 for an unauthenticated request); / now 302-redirects
+# to /login once auth is enforced. Accept any 2xx/3xx. Longer start-period covers
+# wrangler pages dev's cold-start bundling (~40s).
+HEALTHCHECK --interval=30s --timeout=5s --start-period=45s --retries=3 \
+  CMD node -e "require('http').get('http://localhost:5173/login', r => process.exit(r.statusCode >= 200 && r.statusCode < 400 ? 0 : 1))"
 
 # dockerstart binds to 0.0.0.0:5173 (required for Fly.io proxy to reach it)
 CMD ["pnpm", "run", "dockerstart"]
