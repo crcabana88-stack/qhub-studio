@@ -1,6 +1,5 @@
 import { type ActionFunctionArgs } from '@remix-run/cloudflare';
 import { getSession } from '~/lib/auth/session';
-import { getHmacSecret } from '~/lib/qhub/governance-secrets.server';
 import { generateStableSessionId } from '~/lib/qhub/session-id.server';
 import { createDataStream, generateId } from 'ai';
 import { MAX_RESPONSE_SEGMENTS, MAX_TOKENS, type FileMap } from '~/lib/.server/llm/constants';
