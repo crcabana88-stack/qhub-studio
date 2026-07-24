@@ -33,6 +33,10 @@ RUN --mount=type=cache,id=pnpm,target=/pnpm/store \
 # .dockerignore has !build to allow the root build/ into the context.
 COPY build ./build
 COPY public ./public
+# Cloudflare Pages Functions: functions/[[path]].ts is the catch-all SSR
+# handler that runs build/server. Without it, `wrangler pages dev` serves
+# only static assets and every dynamic route (including /) returns 404.
+COPY functions ./functions
 COPY bindings.sh ./
 # worker-configuration.d.ts lists the env var names that bindings.sh
 # reads from process.env and forwards to wrangler as --binding flags.
