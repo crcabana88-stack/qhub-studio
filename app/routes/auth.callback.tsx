@@ -9,6 +9,7 @@
 import type { LoaderFunctionArgs } from '@remix-run/cloudflare';
 import { redirect } from '@remix-run/cloudflare';
 import { createServerClient } from '@supabase/ssr';
+import { createCookieMethods } from '~/lib/auth/supabase-cookies';
 
 export async function loader({ request, context }: LoaderFunctionArgs) {
   const env = (context.cloudflare?.env as unknown as Record<string, string | undefined>) ?? {};
@@ -32,18 +33,7 @@ export async function loader({ request, context }: LoaderFunctionArgs) {
   const responseHeaders = new Headers();
 
   const supabase = createServerClient(supabaseUrl, supabaseAnonKey, {
-    cookies: {
-      get: (name) => parseCookies(cookieHeader)[name],
-      set: (name, value, options) => {
-        responseHeaders.append(
-          'Set-Cookie',
-          `${name}=${value}; Path=/; HttpOnly; SameSite=Lax${options?.maxAge ? `; Max-Age=${options.maxAge}` : ''}`,
-        );
-      },
-      remove: (name) => {
-        responseHeaders.append('Set-Cookie', `${name}=; Path=/; Max-Age=0`);
-      },
-    },
+    cookies: createCookieMethods(cookieHeader, responseHeaders),
   });
 
   const { error } = await supabase.auth.exchangeCodeForSession(code);
@@ -71,14 +61,5 @@ export default function AuthCallback() {
     >
       Signing you in…
     </div>
-  );
-}
-
-function parseCookies(header: string): Record<string, string> {
-  return Object.fromEntries(
-    header.split(';').map((c) => {
-      const [k, ...v] = c.trim().split('=');
-      return [decodeURIComponent(k ?? ''), decodeURIComponent(v.join('='))];
-    }),
   );
 }

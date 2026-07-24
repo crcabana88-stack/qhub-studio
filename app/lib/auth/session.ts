@@ -19,6 +19,7 @@
  */
 
 import { createServerClient } from '@supabase/ssr';
+import { createCookieMethods } from '~/lib/auth/supabase-cookies';
 
 /**
  * Browser-safe session type.
@@ -54,14 +55,11 @@ export async function getSession(
 
   const cookieHeader = request.headers.get('Cookie') ?? '';
 
+  // Read-only: getSession only needs to READ the session. Chunked auth cookies
+  // require the getAll interface to reassemble; no responseHeaders → setAll is a
+  // no-op (any token refresh is re-persisted on the next write-capable request).
   const supabase = createServerClient(supabaseUrl, supabaseAnonKey, {
-    cookies: {
-      get(name: string) {
-        return parseCookies(cookieHeader)[name];
-      },
-      set() {/* SSR: handled by response headers */},
-      remove() {/* SSR: handled by response headers */},
-    },
+    cookies: createCookieMethods(cookieHeader),
   });
 
   const {
@@ -99,13 +97,4 @@ function devFallbackSession(): QhubSession {
     email: 'dev@quantex-tech.com',
     role: 'admin',
   };
-}
-
-function parseCookies(header: string): Record<string, string> {
-  return Object.fromEntries(
-    header.split(';').map((c) => {
-      const [k, ...v] = c.trim().split('=');
-      return [decodeURIComponent(k ?? ''), decodeURIComponent(v.join('='))];
-    }),
-  );
 }

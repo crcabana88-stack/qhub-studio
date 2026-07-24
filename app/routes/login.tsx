@@ -10,6 +10,7 @@ import type { ActionFunctionArgs, LoaderFunctionArgs } from '@remix-run/cloudfla
 import { redirect } from '@remix-run/cloudflare';
 import { Form, useActionData } from '@remix-run/react';
 import { createServerClient } from '@supabase/ssr';
+import { createCookieMethods } from '~/lib/auth/supabase-cookies';
 
 // ── Server action: initiate Google OAuth ─────────────────────────────────────
 
@@ -27,18 +28,7 @@ export async function action({ request, context }: ActionFunctionArgs) {
   const responseHeaders = new Headers();
 
   const supabase = createServerClient(supabaseUrl, supabaseAnonKey, {
-    cookies: {
-      get: (name) => parseCookies(cookieHeader)[name],
-      set: (name, value, options) => {
-        responseHeaders.append(
-          'Set-Cookie',
-          `${name}=${value}; Path=/; HttpOnly; SameSite=Lax${options?.maxAge ? `; Max-Age=${options.maxAge}` : ''}`,
-        );
-      },
-      remove: (name) => {
-        responseHeaders.append('Set-Cookie', `${name}=; Path=/; Max-Age=0`);
-      },
-    },
+    cookies: createCookieMethods(cookieHeader, responseHeaders),
   });
 
   const siteUrl =
@@ -229,14 +219,5 @@ export default function LoginPage() {
         WORM audit ledger active · SOC 2 Type II in progress · FedRAMP Ready
       </div>
     </div>
-  );
-}
-
-function parseCookies(header: string): Record<string, string> {
-  return Object.fromEntries(
-    header.split(';').map((c) => {
-      const [k, ...v] = c.trim().split('=');
-      return [decodeURIComponent(k ?? ''), decodeURIComponent(v.join('='))];
-    }),
   );
 }
