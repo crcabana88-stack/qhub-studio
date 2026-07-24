@@ -37,6 +37,11 @@ COPY public ./public
 # handler that runs build/server. Without it, `wrangler pages dev` serves
 # only static assets and every dynamic route (including /) returns 404.
 COPY functions ./functions
+# wrangler.toml carries compatibility_flags = ["nodejs_compat"] and the
+# compatibility_date. Without it in the image, wrangler pages dev runs with
+# no node compat, so the SSR bundle's node: imports (e.g. node:crypto in the
+# governance service) fail to bundle and the worker crashes on boot.
+COPY wrangler.toml ./
 COPY bindings.sh ./
 # worker-configuration.d.ts lists the env var names that bindings.sh
 # reads from process.env and forwards to wrangler as --binding flags.
