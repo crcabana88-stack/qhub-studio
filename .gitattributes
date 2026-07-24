@@ -1,0 +1,4 @@
+# Shell scripts MUST use LF regardless of the checkout platform.
+# On Windows (core.autocrlf=true) a CRLF shebang breaks execution in Docker/Linux.
+*.sh text eol=lf
+bindings.sh text eol=lf

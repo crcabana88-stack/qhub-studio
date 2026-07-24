@@ -35,7 +35,11 @@ COPY bindings.sh ./
 # worker-configuration.d.ts lists the env var names that bindings.sh
 # reads from process.env and forwards to wrangler as --binding flags.
 COPY worker-configuration.d.ts ./
-RUN chmod +x bindings.sh
+# Normalize line endings: the repo is checked out on Windows (core.autocrlf),
+# so bindings.sh can arrive with CRLF. A CRLF shebang (`#!/bin/bash\r`) makes
+# the kernel look for an interpreter named "/bin/bash\r" → "not found" at boot.
+# Strip CRs before making it executable so startup is deterministic.
+RUN sed -i 's/\r$//' bindings.sh && chmod +x bindings.sh
 
 # Runtime secrets — injected via Fly.io secrets, NOT baked in:
 # QHUB_HMAC_SECRET, QHUB_LEDGER_INGEST_URL,
