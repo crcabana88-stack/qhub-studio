@@ -19,7 +19,10 @@ README.md
 **/*.log
 **/node_modules
 **/dist
+# Pre-built artifacts are included for Fly.io deployment (see Dockerfile).
+# build/ at root is intentionally kept; nested build/ dirs are excluded.
 **/build
+!build
 **/.cache
 logs
 dist-ssr

@@ -15,37 +15,26 @@ COPY package.json pnpm-lock.yaml ./
 RUN --mount=type=cache,id=pnpm,target=/pnpm/store \
     pnpm install --frozen-lockfile
 
-# ── Build ─────────────────────────────────────────────────────────────────────
-FROM base AS build
-WORKDIR /app
-COPY --from=deps /app/node_modules ./node_modules
-COPY . .
-
-# Build-time env (non-secret, safe to bake)
-ARG VITE_LOG_LEVEL=warn
-ARG NODE_ENV=production
-ENV NODE_ENV=$NODE_ENV
-ENV VITE_LOG_LEVEL=$VITE_LOG_LEVEL
-# Vite's chunk-rendering phase is memory-hungry on this large codebase.
-# 4 GB gives it enough headroom to complete without OOM.
-ENV NODE_OPTIONS="--max-old-space-size=4096"
-
-RUN pnpm run build
-
 # ── Runtime ───────────────────────────────────────────────────────────────────
+# NOTE: The Vite/Remix build runs LOCALLY (not inside Docker) because the
+# Depot builder is memory-constrained and kills the Node process during
+# chunk rendering (exit 137). Run `pnpm run build` on your local machine
+# before deploying. The local build/ directory is included via .dockerignore
+# negation (!build) and copied here.
 FROM base AS runtime
 WORKDIR /app
 ENV NODE_ENV=production
 
-COPY --from=build /app/build ./build
-COPY --from=build /app/public ./public
-# functions/ contains the Cloudflare Pages Functions entry point (functions/[[path]].ts
-# compiled output). wrangler pages dev reads this directory at runtime to register
-# server-side routes (POST /api/governance, POST /api/chat, etc.).
-# WITHOUT this copy, all Remix server routes return 404 on Fly.io. CRITICAL.
-COPY --from=build /app/functions ./functions
-COPY --from=build /app/node_modules ./node_modules
+# Install production dependencies inside Docker (no build step)
+COPY package.json pnpm-lock.yaml ./
+RUN --mount=type=cache,id=pnpm,target=/pnpm/store \
+    pnpm install --frozen-lockfile
+
+# Copy pre-built client + server artifacts from the local build
+COPY build ./build
+COPY public ./public
 COPY package.json ./
+COPY bindings.sh ./
 
 # Runtime secrets — injected via AWS App Runner / Fly.io secrets, NOT baked in
 # QHUB_API_BASE, QHUB_HMAC_SECRET, SUPABASE_URL, SUPABASE_ANON_KEY,
