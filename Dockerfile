@@ -21,11 +21,13 @@ FROM base AS runtime
 WORKDIR /app
 ENV NODE_ENV=production
 
-# Install deps (--ignore-scripts skips the `prepare` husky hook that
-# fails when devDependencies are absent in a production install)
+# Install deps. --prod=false forces devDependencies to be installed even
+# though NODE_ENV=production: the runtime start command is
+# `wrangler pages dev ./build/client`, and wrangler is a devDependency.
+# --ignore-scripts skips the `prepare` husky hook (no .git in the image).
 COPY package.json pnpm-lock.yaml ./
 RUN --mount=type=cache,id=pnpm,target=/pnpm/store \
-    pnpm install --frozen-lockfile --ignore-scripts
+    pnpm install --frozen-lockfile --ignore-scripts --prod=false
 
 # Copy pre-built client + server artifacts (built locally before deploy)
 # .dockerignore has !build to allow the root build/ into the context.
