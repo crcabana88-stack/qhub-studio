@@ -19,4 +19,17 @@ interface Env {
   XAI_API_KEY: string;
   PERPLEXITY_API_KEY: string;
   AWS_BEDROCK_CONFIG: string;
+
+  // ── QHUB governance + Supabase auth ──────────────────────────────────────
+  // These MUST be declared here: bindings.sh extracts the env-var names from
+  // this interface and forwards them to `wrangler pages dev` as --binding
+  // flags. Without a binding, the value never reaches the worker's ctx.env,
+  // so getSession() falls back to the dev session and GovernanceService sees
+  // no HMAC secret (events skipped, gate returns UNKNOWN).
+  QHUB_LEDGER_INGEST_URL: string;
+  QHUB_API_BASE: string;
+  QHUB_HMAC_SECRET: string;
+  SUPABASE_URL: string;
+  SUPABASE_ANON_KEY: string;
+  SUPABASE_SERVICE_ROLE_KEY: string;
 }
