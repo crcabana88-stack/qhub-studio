@@ -5,7 +5,7 @@ import { useAnimate } from 'framer-motion';
 import { memo, useCallback, useEffect, useRef, useState } from 'react';
 import { toast } from 'react-toastify';
 import { useMessageParser, usePromptEnhancer, useShortcuts } from '~/lib/hooks';
-import { description, useChatHistory } from '~/lib/persistence';
+import { description, useChatHistory, chatId } from '~/lib/persistence';
 import { chatStore } from '~/lib/stores/chat';
 import { workbenchStore } from '~/lib/stores/workbench';
 import { DEFAULT_MODEL, DEFAULT_PROVIDER, PROMPT_COOKIE_KEY, PROVIDER_LIST } from '~/utils/constants';
@@ -16,7 +16,9 @@ import Cookies from 'js-cookie';
 import { debounce } from '~/utils/debounce';
 import { useSettings } from '~/lib/hooks/useSettings';
 import type { ProviderInfo } from '~/types/model';
-import { useSearchParams } from '@remix-run/react';
+import { useSearchParams, useRouteLoaderData } from '@remix-run/react';
+import { useQHubPromptSeed } from '~/lib/hooks/useQHubPromptSeed';
+import { postGovernanceEvent } from '~/lib/qhub/messenger';
 import { createSampler } from '~/utils/sampler';
 import { getTemplates, selectStarterTemplate } from '~/utils/selectStarterTemplate';
 import { logStore } from '~/lib/stores/logs';
@@ -34,7 +36,7 @@ const logger = createScopedLogger('Chat');
 export function Chat() {
   renderLogger.trace('Chat');
 
-  const { ready, initialMessages, storeMessageHistory, importChat, exportChat } = useChatHistory();
+  const { ready, initialMessages, urlId, storeMessageHistory, importChat, exportChat } = useChatHistory();
   const title = useStore(description);
   useEffect(() => {
     workbenchStore.setReloadedMessages(initialMessages.map((m) => m.id));
@@ -49,6 +51,7 @@ export function Chat() {
           exportChat={exportChat}
           storeMessageHistory={storeMessageHistory}
           importChat={importChat}
+          urlId={urlId}
         />
       )}
     </>
@@ -79,10 +82,12 @@ interface ChatProps {
   importChat: (description: string, messages: Message[]) => Promise<void>;
   exportChat: () => void;
   description?: string;
+  /** QHUB: stable URL-based project identifier from chat persistence (urlId). */
+  urlId?: string;
 }
 
 export const ChatImpl = memo(
-  ({ description, initialMessages, storeMessageHistory, importChat, exportChat }: ChatProps) => {
+  ({ description, initialMessages, storeMessageHistory, importChat, exportChat, urlId }: ChatProps) => {
     useShortcuts();
 
     const textareaRef = useRef<HTMLTextAreaElement>(null);
@@ -103,11 +108,21 @@ export const ChatImpl = memo(
     const { activeProviders, promptId, autoSelectTemplate, contextOptimizationEnabled } = useSettings();
     const [llmErrorAlert, setLlmErrorAlert] = useState<LlmErrorAlertType | undefined>(undefined);
     const [model, setModel] = useState(() => {
+      const savedProvider = Cookies.get('selectedProvider');
       const savedModel = Cookies.get('selectedModel');
+      // If the saved provider was AmazonBedrock, the saved model is also a Bedrock ID — reset it
+      if (!savedProvider || savedProvider === 'AmazonBedrock') {
+        return DEFAULT_MODEL;
+      }
       return savedModel || DEFAULT_MODEL;
     });
     const [provider, setProvider] = useState(() => {
       const savedProvider = Cookies.get('selectedProvider');
+      // QHUB Studio is Anthropic-first — don't restore AmazonBedrock from a stale cookie
+      const QHUB_DEFAULT = 'Anthropic';
+      if (!savedProvider || savedProvider === 'AmazonBedrock') {
+        return (PROVIDER_LIST.find((p) => p.name === QHUB_DEFAULT) || DEFAULT_PROVIDER) as ProviderInfo;
+      }
       return (PROVIDER_LIST.find((p) => p.name === savedProvider) || DEFAULT_PROVIDER) as ProviderInfo;
     });
     const { showChat } = useStore(chatStore);
@@ -176,20 +191,48 @@ export const ChatImpl = memo(
       initialMessages,
       initialInput: Cookies.get(PROMPT_COOKIE_KEY) || '',
     });
+    // Seed prompt from ?prompt= URL param (set by quantex-tech.com landing page hero).
+    // When ?source=landing is also present the prompt is wrapped with the QHUB
+    // governance preamble so the LLM enters compliance-build mode from message 1.
+    const { seededPrompt, wasSeeded } = useQHubPromptSeed();
+
     useEffect(() => {
-      const prompt = searchParams.get('prompt');
+      if (!wasSeeded || !seededPrompt) return;
 
-      // console.log(prompt, searchParams, model, provider);
+      runAnimation();
+      append({
+        role: 'user',
+        content: `[Model: ${model}]\n\n[Provider: ${provider.name}]\n\n${seededPrompt}`,
+      });
+      // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [wasSeeded]);
 
-      if (prompt) {
-        setSearchParams({});
-        runAnimation();
-        append({
-          role: 'user',
-          content: `[Model: ${model}]\n\n[Provider: ${provider.name}]\n\n${prompt}`,
-        });
+    // ── QHUB Hook: wire workbenchStore session for deployment gate ──────────────
+    // root loader returns { session: { userId, orgId, email, role } } for authenticated users.
+    // conversationId = first user message ID — same stable anchor used by api.chat.ts.
+    // appId = urlId (stable project slug) → chatId (numeric) → conversationId (fallback).
+    const rootData = useRouteLoaderData<{ session?: { userId: string; orgId: string } }>('root');
+    const qhubRootSession = rootData?.session;
+
+    useEffect(() => {
+      if (!qhubRootSession) {
+        workbenchStore.setQhubSession(null);
+        return;
       }
-    }, [model, provider, searchParams]);
+      const conversationId = messages.find((m) => m.role === 'user')?.id;
+
+      if (!conversationId) {
+        // No first user message yet — clear session until conversation starts
+        workbenchStore.setQhubSession(null);
+        return;
+      }
+
+      // Prefer urlId (stable project slug set when first artifact is created),
+      // fall back to chatId (numeric IndexedDB key), then conversationId.
+      const appId = urlId ?? chatId.get() ?? conversationId;
+      workbenchStore.setQhubSession({ conversationId, appId });
+    }, [qhubRootSession, messages, urlId]);
+    // ── End QHUB Hook ──────────────────────────────────────────────────────────
 
     const { enhancingPrompt, promptEnhanced, enhancePrompt, resetEnhancer } = usePromptEnhancer();
     const { parsedMessages, parseMessages } = useMessageParser();
@@ -397,6 +440,9 @@ export const ChatImpl = memo(
         abort();
         return;
       }
+
+      // QHUB: Notify parent frame of an AI call (AI Bill of Materials event)
+      postGovernanceEvent('AI_BOM', { provider: provider.name, model });
 
       let finalMessageContent = messageContent;
 

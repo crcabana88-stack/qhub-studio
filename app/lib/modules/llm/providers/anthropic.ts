@@ -13,31 +13,28 @@ export default class AnthropicProvider extends BaseProvider {
   };
 
   staticModels: ModelInfo[] = [
-    /*
-     * Essential fallback models - only the most stable/reliable ones
-     * Claude 3.5 Sonnet: 200k context, excellent for complex reasoning and coding
-     */
+    // Claude Sonnet 5: 200k context, 64k output (latest fast model)
     {
-      name: 'claude-3-5-sonnet-20241022',
-      label: 'Claude 3.5 Sonnet',
+      name: 'claude-sonnet-5',
+      label: 'Claude Sonnet 5',
       provider: 'Anthropic',
       maxTokenAllowed: 200000,
-      maxCompletionTokens: 128000,
+      maxCompletionTokens: 64000,
     },
 
-    // Claude 3 Haiku: 200k context, fastest and most cost-effective
+    // Claude Haiku 4.5: 200k context, 16k output, fastest/cheapest
     {
-      name: 'claude-3-haiku-20240307',
-      label: 'Claude 3 Haiku',
+      name: 'claude-haiku-4-5-20251001',
+      label: 'Claude Haiku 4.5',
       provider: 'Anthropic',
       maxTokenAllowed: 200000,
-      maxCompletionTokens: 128000,
+      maxCompletionTokens: 16000,
     },
 
-    // Claude Opus 4: 200k context, 32k output limit (latest flagship model)
+    // Claude Opus 4.8: 200k context, 32k output (flagship)
     {
-      name: 'claude-opus-4-20250514',
-      label: 'Claude 4 Opus',
+      name: 'claude-opus-4-8',
+      label: 'Claude Opus 4.8',
       provider: 'Anthropic',
       maxTokenAllowed: 200000,
       maxCompletionTokens: 32000,
@@ -127,7 +124,6 @@ export default class AnthropicProvider extends BaseProvider {
     });
     const anthropic = createAnthropic({
       apiKey,
-      headers: { 'anthropic-beta': 'output-128k-2025-02-19' },
     });
 
     return anthropic(model);

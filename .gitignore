@@ -46,3 +46,9 @@ docs/instructions/Roadmap.md
 .cursorrules
 *.md
 .qodo
+
+# QHUB security — NEVER commit these
+PRODUCTION-CREDENTIALS.md
+QHUB-ROTATION-RUNBOOK.md
+*-CREDENTIALS.md
+*-SECRETS.md

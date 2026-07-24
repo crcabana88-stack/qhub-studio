@@ -258,6 +258,8 @@ ${value.content}
   return {
     ready: !mixedId || ready,
     initialMessages,
+    /** Stable URL-based project identifier. Set once the first artifact is created. */
+    urlId,
     updateChatMestaData: async (metadata: IChatMetadata) => {
       const id = chatId.get();
 

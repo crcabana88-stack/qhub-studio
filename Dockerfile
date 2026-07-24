@@ -11,6 +11,9 @@
 FROM node:20-slim AS base
 ENV PNPM_HOME="/pnpm"
 ENV PATH="$PNPM_HOME:$PATH"
+# Install bash (node:20-slim is Debian Bookworm slim — bash not included by default,
+# but bindings.sh requires it via #!/bin/bash shebang)
+RUN apt-get update && apt-get install -y bash && rm -rf /var/lib/apt/lists/*
 RUN corepack enable
 
 # ── Runtime ───────────────────────────────────────────────────────────────────
@@ -29,6 +32,10 @@ RUN --mount=type=cache,id=pnpm,target=/pnpm/store \
 COPY build ./build
 COPY public ./public
 COPY bindings.sh ./
+# worker-configuration.d.ts lists the env var names that bindings.sh
+# reads from process.env and forwards to wrangler as --binding flags.
+COPY worker-configuration.d.ts ./
+RUN chmod +x bindings.sh
 
 # Runtime secrets — injected via Fly.io secrets, NOT baked in:
 # QHUB_HMAC_SECRET, QHUB_LEDGER_INGEST_URL,
@@ -39,4 +46,5 @@ EXPOSE 5173
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
   CMD node -e "require('http').get('http://localhost:5173/', r => process.exit(r.statusCode === 200 ? 0 : 1))"
 
-CMD ["pnpm", "run", "start"]
+# dockerstart binds to 0.0.0.0:5173 (required for Fly.io proxy to reach it)
+CMD ["pnpm", "run", "dockerstart"]

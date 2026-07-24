@@ -65,6 +65,10 @@ export default defineConfig((config) => {
       'LMSTUDIO_API_BASE_URL',
       'TOGETHER_API_BASE_URL',
     ],
+    server: {
+      port: 5173,
+      strictPort: true, // fail instead of auto-incrementing — keeps STUDIO_URL predictable
+    },
     css: {
       preprocessorOptions: {
         scss: {
@@ -104,6 +108,12 @@ function chrome129IssuePlugin() {
             return;
           }
         }
+
+        // Cross-origin isolation headers required for SharedArrayBuffer / WebContainers
+        res.setHeader('Cross-Origin-Opener-Policy', 'same-origin');
+        res.setHeader('Cross-Origin-Embedder-Policy', 'credentialless');
+        // Allow the marketing site (different port) to embed this in an iframe
+        res.setHeader('Cross-Origin-Resource-Policy', 'cross-origin');
 
         next();
       });

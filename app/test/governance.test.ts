@@ -10,6 +10,60 @@
 
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 
+// ─── Module mocks ─────────────────────────────────────────────────────────────
+// Hoisted spies so the vi.mock factories (hoisted to top of file) can reference
+// them without a temporal-dead-zone error. These let us exercise GovernanceService
+// without a live Supabase (durable qhub_app_id layer) or a real session.
+
+const { mockGetSession, mockGetOrCreateQhubApp, mockPersistChainId, mockGetChainId } = vi.hoisted(
+  () => ({
+    mockGetSession: vi.fn(),
+    mockGetOrCreateQhubApp: vi.fn(),
+    mockPersistChainId: vi.fn(),
+    mockGetChainId: vi.fn(),
+  }),
+);
+
+vi.mock('~/lib/auth/session', () => ({
+  getSession: mockGetSession,
+  getHmacSecret: vi.fn().mockReturnValue('test-secret-32-chars-minimum-ok!'),
+}));
+
+// Mock the durable identity layer so the service reaches the signing/POST path.
+// GovernanceService imports these via a relative specifier ('./qhub-app.server'),
+// which resolves to the same module id as the '~/lib/qhub/qhub-app.server' alias.
+vi.mock('~/lib/qhub/qhub-app.server', () => ({
+  getOrCreateQhubApp: mockGetOrCreateQhubApp,
+  persistChainId: mockPersistChainId,
+  getChainId: mockGetChainId,
+}));
+
+/** A stable fake qhub_app record with no chain_id yet (genesis not fired). */
+function fakeAppRecord(overrides: Record<string, unknown> = {}) {
+  return {
+    qhub_app_id: 'qhub-app-11111111-2222-3333-4444-555555555555',
+    org_id: 'org-abc',
+    created_by: 'user-123',
+    builder_engine: 'bolt',
+    builder_project_id: null,
+    conversation_id: 'conv-001',
+    workspace_id: null,
+    chain_id: null,
+    risk_tier: 'UNCLASSIFIED',
+    governance_status: 'ACTIVE',
+    created_at: '2026-01-01T00:00:00.000Z',
+    updated_at: '2026-01-01T00:00:00.000Z',
+    ...overrides,
+  };
+}
+
+beforeEach(() => {
+  mockGetSession.mockReset();
+  mockGetOrCreateQhubApp.mockReset().mockResolvedValue(fakeAppRecord());
+  mockPersistChainId.mockReset().mockResolvedValue(undefined);
+  mockGetChainId.mockReset().mockResolvedValue(null);
+});
+
 // ─── Test 1: Browser hydration contains no HMAC secret ───────────────────────
 
 describe('TEST 1: Root loader response contains no HMAC secret', () => {
@@ -63,7 +117,10 @@ describe('TEST 2: GENESIS intent is handled server-side', () => {
   it('GovernanceService.handleIntent routes PROJECT_CREATED correctly', async () => {
     const { GovernanceService } = await import('~/lib/qhub/governance-service.server');
 
-    const mockFetch = vi.fn().mockResolvedValue(new Response('{"ok":true}', { status: 200 }));
+    // Lambda returns the chain_id it minted for CHAIN_GENESIS (seq=1).
+    const mockFetch = vi
+      .fn()
+      .mockResolvedValue(new Response('{"chain_id":"chain-genesis-uuid","seq":1}', { status: 200 }));
     vi.stubGlobal('fetch', mockFetch);
 
     const svc = new GovernanceService({
@@ -81,7 +138,9 @@ describe('TEST 2: GENESIS intent is handled server-side', () => {
 
     expect(result.ok).toBe(true);
 
-    // Verify a POST was made to /events (not /chains)
+    // Verify a POST was made to /events (not /chains).
+    // The durable identity lookup (getOrCreateQhubApp) is mocked, so the only
+    // network call is the CHAIN_GENESIS POST.
     expect(mockFetch).toHaveBeenCalledOnce();
     const [url, opts] = mockFetch.mock.calls[0] as [string, RequestInit];
     expect(url).toContain('/events');
@@ -90,10 +149,12 @@ describe('TEST 2: GENESIS intent is handled server-side', () => {
 
     // Verify the event body contains server-authoritative identity (not browser-supplied)
     const body = JSON.parse(opts.body as string);
-    expect(body.event_type).toBe('GENESIS');
-    expect(body.user_id).toBe('user-123');    // from server context
-    expect(body.org_id).toBe('org-abc');      // from server context
-    expect(body.timestamp).toBeTruthy();       // server timestamp
+    expect(body.event_type).toBe('CHAIN_GENESIS'); // Lambda v2.6 canonical genesis event
+    // Server-authoritative identity lives in actor.id / client_id (v2.6 schema).
+    // The Lambda computes timestamp/seq/hashes — the caller does not send them.
+    expect(body.actor.id).toBe('user-123');    // from server context
+    expect(body.client_id).toBe('org-abc');    // from server context
+    expect(body.actor.identity_provider).toBe('supabase');
 
     // Verify signature header is present
     expect((opts.headers as Record<string, string>)['X-QHUB-Signature']).toBeTruthy();
@@ -182,7 +243,7 @@ describe('TEST 3: AI_BOM hook is server-side only', () => {
     const [url, opts] = mockFetch.mock.calls[0] as [string, RequestInit];
     expect(url).toContain('/events');
     const body = JSON.parse(opts.body as string);
-    expect(body.event_type).toBe('AI_BOM');
+    expect(body.event_type).toBe('AI_MODEL_INVOKED'); // Lambda v2.6 canonical AI event
 
     vi.unstubAllGlobals();
   });
@@ -218,24 +279,21 @@ describe('TEST 4: Browser-supplied identity claims are ignored', () => {
     const [, opts] = mockFetch.mock.calls[0] as [string, RequestInit];
     const body = JSON.parse(opts.body as string);
 
-    // Server context identity wins — not browser-supplied fields
-    expect(body.user_id).toBe('real-server-user');
-    expect(body.org_id).toBe('real-server-org');
-    expect(body.user_id).not.toBe('attacker-user');
-    expect(body.org_id).not.toBe('attacker-org');
+    // Server context identity wins — not browser-supplied fields.
+    // Identity is carried in actor.id / client_id (v2.6 schema).
+    expect(body.actor.id).toBe('real-server-user');
+    expect(body.client_id).toBe('real-server-org');
+    expect(body.actor.id).not.toBe('attacker-user');
+    expect(body.client_id).not.toBe('attacker-org');
 
     vi.unstubAllGlobals();
   });
 
   it('api.governance route rejects unauthenticated requests with 401', async () => {
-    // Simulate the route handler with no session
-    const { action } = await import('~/routes/api.governance');
+    // getSession is mocked at module scope; make it return null (no session) here.
+    mockGetSession.mockResolvedValue(null);
 
-    const mockGetSession = vi.fn().mockResolvedValue(null); // no session
-    vi.mock('~/lib/auth/session', () => ({
-      getSession: mockGetSession,
-      getHmacSecret: vi.fn().mockReturnValue(''),
-    }));
+    const { action } = await import('~/routes/api.governance');
 
     const request = new Request('http://localhost/api/governance', {
       method: 'POST',
@@ -245,8 +303,6 @@ describe('TEST 4: Browser-supplied identity claims are ignored', () => {
 
     const response = await action({ request, context: {} as any, params: {} });
     expect(response.status).toBe(401);
-
-    vi.restoreAllMocks();
   });
 });
 
@@ -460,10 +516,11 @@ describe('TEST 10: No client bundle exposure of HMAC secret', () => {
     const rootPath = path.resolve(process.cwd(), 'app/root.tsx');
     const source = fs.readFileSync(rootPath, 'utf8');
 
-    // The loader return block should not include hmacSecret
-    // Find the return statement in the loader function
+    // The loader return block should not include hmacSecret as a returned field.
+    // Match only a code key/type usage (`hmacSecret:`) — a comment mentioning the
+    // word (e.g. "hmacSecret MUST NOT be included") is fine and must not trip this.
     const loaderSection = source.slice(source.indexOf('export async function loader'), source.indexOf('export const links'));
-    expect(loaderSection).not.toContain('hmacSecret');
+    expect(/hmacSecret\s*:/.test(loaderSection)).toBe(false);
   });
 
   it('governance-service.server.ts uses node:crypto (not Web Crypto)', async () => {
