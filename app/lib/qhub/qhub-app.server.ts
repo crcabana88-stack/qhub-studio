@@ -29,6 +29,26 @@ import { createHash } from 'node:crypto';
 import { createClient, type SupabaseClient } from '@supabase/supabase-js';
 import type { ClassificationResult, PersistedRiskTier } from './classification';
 import type { PolicyProfile, PolicyStatus } from './policy';
+import { isSchemaMissingError } from './schema-contract';
+
+/**
+ * Raised when a persistence call hits a MISSING schema object (table/column).
+ * This is the fail-closed replacement for the previous behaviour of logging
+ * "run the classification migration" and continuing — which masked a
+ * project/schema mismatch during Gate 03 live closure.
+ */
+export class SchemaMissingError extends Error {
+  readonly supabaseCode?: string;
+
+  constructor(operation: string, object: string, code?: string) {
+    super(
+      `[QhubApp] ${operation} failed closed: required schema object "${object}" is missing from the connected ` +
+        `Supabase project${code ? ` (${code})` : ''}. Apply the pending migration before serving governance traffic.`,
+    );
+    this.name = 'SchemaMissingError';
+    this.supabaseCode = code;
+  }
+}
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -286,8 +306,9 @@ export async function persistClassification(
   const sb = getSupabaseAdmin(env);
 
   /*
-   * Write the tier first (columns that always exist) so subsequent events get
-   * the real tier even if the classification JSONB column hasn't been migrated.
+   * Write the tier first (columns that always exist since 20260723) so
+   * subsequent events get the real tier. A schema-missing error here means the
+   * base table itself is absent — fail closed rather than continue.
    */
   const { error: tierErr } = await sb
     .from('qhub_applications')
@@ -295,16 +316,31 @@ export async function persistClassification(
     .eq('qhub_app_id', qhubAppId);
 
   if (tierErr) {
-    console.error(`[QhubApp] persistClassification tier write failed for ${qhubAppId}: ${tierErr.message}`);
+    if (isSchemaMissingError(tierErr)) {
+      throw new SchemaMissingError('persistClassification', 'qhub_applications', tierErr.code);
+    }
+
+    /*
+     * Non-schema (transient/permission) error — surface it; the snapshot below
+     * is what policy assignment reads, so a partial write must not look like success.
+     */
+    throw new Error(`[QhubApp] persistClassification tier write failed for ${qhubAppId}: ${tierErr.message}`);
   }
 
-  // Then the full snapshot (best-effort; requires the 20260725 migration).
+  /*
+   * Then the full snapshot (requires the 20260725_qhub_classification migration).
+   * FAIL CLOSED when the `classification` column is absent: the previous code
+   * logged "run the classification migration" and continued, which silently
+   * degraded the governance record and masked a project/schema mismatch.
+   */
   const { error: jsonErr } = await sb.from('qhub_applications').update({ classification }).eq('qhub_app_id', qhubAppId);
 
   if (jsonErr) {
-    console.error(
-      `[QhubApp] persistClassification snapshot write failed for ${qhubAppId} (run the classification migration): ${jsonErr.message}`,
-    );
+    if (isSchemaMissingError(jsonErr)) {
+      throw new SchemaMissingError('persistClassification', 'qhub_applications.classification', jsonErr.code);
+    }
+
+    throw new Error(`[QhubApp] persistClassification snapshot write failed for ${qhubAppId}: ${jsonErr.message}`);
   }
 
   // Invalidate cache so subsequent events read the new tier.
@@ -333,7 +369,18 @@ export async function getClassification(
     .maybeSingle();
 
   if (error) {
+    /*
+     * FAIL CLOSED when the `classification` column is absent. Returning null on
+     * a missing column would look identical to "not yet classified", letting
+     * policy assignment proceed against an unmigrated project. A genuine
+     * missing column must block the flow, not silently read as unclassified.
+     */
+    if (isSchemaMissingError(error)) {
+      throw new SchemaMissingError('getClassification', 'qhub_applications.classification', error.code);
+    }
+
     console.error(`[QhubApp] getClassification failed for ${qhubAppId}: ${error.message}`);
+
     return null;
   }
 

@@ -1,0 +1,193 @@
+#!/usr/bin/env node
+/**
+ * QHUB schema smoke check — scripts/schema-smoke-check.mjs
+ *
+ * Pre/post-deploy gate. Probes the TARGET Supabase project for the tables and
+ * columns the code requires and FAILS (exit 1) if any are missing — so a deploy
+ * can never go out against an unmigrated project (the Gate 03 live-closure bug).
+ *
+ * Wired into `npm run deploy` (see package.json). Run standalone anytime:
+ *     node scripts/schema-smoke-check.mjs
+ *
+ * Reads (never prints):
+ *     SUPABASE_URL
+ *     SUPABASE_SERVICE_ROLE_KEY
+ *   from process.env, falling back to .env.local / .env in the repo root.
+ *
+ * Overrides:
+ *     QHUB_SKIP_SCHEMA_CHECK=1   skip the gate (emergency escape hatch)
+ *
+ * Output is NON-SECRET: project ref (public) + host only, never keys.
+ *
+ * KEEP IN SYNC with app/lib/qhub/schema-contract.ts (REQUIRED_SCHEMA_OBJECTS,
+ * EXPECTED_SCHEMA_VERSION, SCHEMA_MISSING_CODES).
+ */
+
+import { readFileSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
+import { dirname, join } from 'node:path';
+
+const EXPECTED_SCHEMA_VERSION = '2026-07-25.gate03';
+
+/** @type {{table:string,column:string,migration:string}[]} */
+const REQUIRED_SCHEMA_OBJECTS = [
+  { table: 'qhub_applications', column: 'qhub_app_id', migration: '20260723_qhub_applications' },
+  { table: 'qhub_applications', column: 'classification', migration: '20260725_qhub_classification' },
+  { table: 'qhub_applications', column: 'policy_profile', migration: '20260725_gate03_policy' },
+  { table: 'qhub_classification_proposals', column: 'proposal_id', migration: '20260725_gate03_policy' },
+];
+
+const SCHEMA_MISSING_CODES = new Set(['PGRST205', 'PGRST204', '42P01', '42703']);
+
+// ─── Minimal .env loader (no dependency) ──────────────────────────────────────
+
+function loadDotenv() {
+  const here = dirname(fileURLToPath(import.meta.url));
+  const root = join(here, '..');
+
+  for (const file of ['.env.local', '.env']) {
+    try {
+      const text = readFileSync(join(root, file), 'utf8');
+
+      for (const line of text.split(/\r?\n/)) {
+        const trimmed = line.trim();
+
+        if (!trimmed || trimmed.startsWith('#')) {
+          continue;
+        }
+
+        const eq = trimmed.indexOf('=');
+
+        if (eq === -1) {
+          continue;
+        }
+
+        const key = trimmed.slice(0, eq).trim();
+        let value = trimmed.slice(eq + 1).trim();
+        value = value.replace(/^['"]|['"]$/g, '');
+
+        if (!(key in process.env)) {
+          process.env[key] = value;
+        }
+      }
+    } catch {
+      // file absent — fine
+    }
+  }
+}
+
+function projectRefFromUrl(url) {
+  try {
+    return new URL(url).host.split('.')[0] || null;
+  } catch {
+    return null;
+  }
+}
+
+function isSchemaMissing(status, body) {
+  if (body && body.code && SCHEMA_MISSING_CODES.has(body.code)) {
+    return true;
+  }
+
+  const haystack = `${body?.message ?? ''} ${body?.details ?? ''}`.toLowerCase();
+
+  return (
+    (status === 404 || status === 400) &&
+    (haystack.includes('does not exist') || haystack.includes('could not find') || haystack.includes('schema cache'))
+  );
+}
+
+async function probe(url, serviceKey, obj) {
+  const endpoint = `${url.replace(/\/$/, '')}/rest/v1/${obj.table}?select=${encodeURIComponent(obj.column)}&limit=1`;
+
+  try {
+    const res = await fetch(endpoint, {
+      method: 'GET',
+      headers: { apikey: serviceKey, Authorization: `Bearer ${serviceKey}`, Accept: 'application/json' },
+      signal: AbortSignal.timeout(8000),
+    });
+
+    if (res.ok) {
+      return { ...obj, state: 'present', httpStatus: res.status };
+    }
+
+    const body = await res.json().catch(() => null);
+
+    if (isSchemaMissing(res.status, body)) {
+      return { ...obj, state: 'missing', httpStatus: res.status, detail: body?.code ?? `HTTP ${res.status}` };
+    }
+
+    return { ...obj, state: 'unknown', httpStatus: res.status, detail: body?.code ?? `HTTP ${res.status}` };
+  } catch (err) {
+    return { ...obj, state: 'unknown', detail: err instanceof Error ? err.name : 'probe failed' };
+  }
+}
+
+async function main() {
+  loadDotenv();
+
+  if (process.env.QHUB_SKIP_SCHEMA_CHECK === '1') {
+    console.warn('[schema-smoke-check] SKIPPED via QHUB_SKIP_SCHEMA_CHECK=1');
+    process.exit(0);
+  }
+
+  const url = process.env.SUPABASE_URL ?? '';
+  const serviceKey = process.env.SUPABASE_SERVICE_ROLE_KEY ?? '';
+
+  if (!url || !serviceKey) {
+    console.error(
+      '[schema-smoke-check] FAIL: SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY are required to verify the target ' +
+        'project before deploy. Set them, or override with QHUB_SKIP_SCHEMA_CHECK=1 (not recommended).',
+    );
+    process.exit(1);
+  }
+
+  const projectRef = projectRefFromUrl(url);
+  let host = null;
+
+  try {
+    host = new URL(url).host;
+  } catch {
+    /* ignore */
+  }
+
+  console.log(
+    `[schema-smoke-check] expected=${EXPECTED_SCHEMA_VERSION} project=${projectRef ?? 'unknown'} host=${host ?? 'unknown'}`,
+  );
+
+  const results = await Promise.all(REQUIRED_SCHEMA_OBJECTS.map((o) => probe(url, serviceKey, o)));
+
+  for (const r of results) {
+    const mark = r.state === 'present' ? 'OK  ' : r.state === 'missing' ? 'MISS' : '??  ';
+    console.log(`  [${mark}] ${r.table}.${r.column}  (${r.migration})${r.detail ? `  — ${r.detail}` : ''}`);
+  }
+
+  const missing = results.filter((r) => r.state === 'missing');
+  const unknown = results.filter((r) => r.state === 'unknown');
+
+  if (missing.length > 0) {
+    console.error(
+      `[schema-smoke-check] FAIL: target project ${projectRef ?? '(unknown)'} is BEHIND the code — ` +
+        `${missing.length} object(s) missing: ${missing.map((m) => `${m.table}.${m.column}`).join(', ')}. ` +
+        'Apply the pending migrations to this project before deploying.',
+    );
+    process.exit(1);
+  }
+
+  if (unknown.length > 0) {
+    console.error(
+      `[schema-smoke-check] FAIL: could not verify ${unknown.length} object(s) ` +
+        `(${unknown.map((u) => `${u.table}.${u.column}`).join(', ')}). ` +
+        'Check SUPABASE_URL / service key and connectivity to the target project.',
+    );
+    process.exit(1);
+  }
+
+  console.log(`[schema-smoke-check] PASS: project ${projectRef ?? '(unknown)'} matches ${EXPECTED_SCHEMA_VERSION}.`);
+  process.exit(0);
+}
+
+main().catch((err) => {
+  console.error('[schema-smoke-check] FAIL: unexpected error:', err);
+  process.exit(1);
+});

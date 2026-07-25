@@ -43,6 +43,17 @@ vi.mock('~/lib/qhub/qhub-app.server', () => ({
   persistPolicyProfile: mockPersistPolicyProfile,
   getPolicyProfile: mockGetPolicyProfile,
   updatePolicyStatus: mockUpdatePolicyStatus,
+  SchemaMissingError: class SchemaMissingError extends Error {},
+}));
+
+/*
+ * The schema-readiness guard is orthogonal to the governance logic under test
+ * here — treat the connected project as migrated so these tests exercise the
+ * classification/policy path (schema drift is covered in schema-contract.test.ts).
+ */
+vi.mock('~/lib/qhub/schema-check.server', () => ({
+  assertGovernanceSchemaReady: vi.fn().mockResolvedValue(undefined),
+  SchemaNotReadyError: class SchemaNotReadyError extends Error {},
 }));
 
 function appRecord(overrides: Record<string, unknown> = {}) {

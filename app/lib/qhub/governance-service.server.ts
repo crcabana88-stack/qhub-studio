@@ -61,6 +61,8 @@ import {
 import { computeRiskFloor } from './classification-rules';
 import { buildPolicyProfile, canonicalPolicyString, type PolicyEngineInput } from './policy-engine';
 import type { PolicyProfile } from './policy';
+import { assertGovernanceSchemaReady, SchemaNotReadyError } from './schema-check.server';
+import { SchemaMissingError } from './qhub-app.server';
 
 // ─── Gate state machine ───────────────────────────────────────────────────────
 
@@ -215,6 +217,56 @@ export class GovernanceService {
   }
 
   /*
+   * ── Schema readiness guard ─────────────────────────────────────────────────
+   * Returns a fail-closed GovernanceResult when the connected Supabase project
+   * is behind the code (missing required tables/columns), or null when the
+   * schema is verified ready. Used to gate classification confirm & policy
+   * assign so governance never proceeds against an unmigrated database.
+   */
+  private async guardSchemaReady(): Promise<GovernanceResult | null> {
+    try {
+      await assertGovernanceSchemaReady(this.ctx.env);
+      return null;
+    } catch (err) {
+      return this.schemaFailClosedResult(err);
+    }
+  }
+
+  /** Map a schema-drift error to a browser-safe fail-closed result (no secrets). */
+  private schemaFailClosedResult(err: unknown): GovernanceResult {
+    if (err instanceof SchemaNotReadyError) {
+      const missing = err.report.missing.map((m) => `${m.table}.${m.column}`).join(', ');
+      console.error(
+        `[GovernanceService] BLOCKED — schema not ready (project=${err.report.projectRef ?? 'unknown'}, ` +
+          `expected=${err.report.expectedSchemaVersion}, missing=[${missing || 'unverified'}])`,
+      );
+
+      return {
+        ok: false,
+        gateState: 'BLOCKED',
+        error:
+          'Governance is unavailable: the connected database is behind this deployment. ' +
+          'Required schema objects are missing — apply the pending migrations and retry.',
+      };
+    }
+
+    if (err instanceof SchemaMissingError) {
+      console.error(`[GovernanceService] BLOCKED — ${err.message}`);
+      return {
+        ok: false,
+        gateState: 'BLOCKED',
+        error:
+          'Governance is unavailable: a required database object is missing. Apply the pending migrations and retry.',
+      };
+    }
+
+    // Unknown failure while checking readiness — fail closed.
+    console.error('[GovernanceService] schema readiness check errored:', err);
+
+    return { ok: false, gateState: 'BLOCKED', error: 'Governance is temporarily unavailable (schema check failed).' };
+  }
+
+  /*
    * ── CHAIN_GENESIS ──────────────────────────────────────────────────────────
    * Creates permanent QHUB app identity, fires genesis, persists chain_id.
    */
@@ -310,6 +362,17 @@ export class GovernanceService {
   private async recordClassification(
     intent: Extract<GovernanceIntent, { action: 'CLASSIFICATION_CONFIRMED' }>,
   ): Promise<GovernanceResult> {
+    /*
+     * Fail closed if the connected project is behind the code. Confirming a
+     * classification against an unmigrated database silently degraded the
+     * governance record during Gate 03 live closure — never again.
+     */
+    const schemaGuard = await this.guardSchemaReady();
+
+    if (schemaGuard) {
+      return schemaGuard;
+    }
+
     /*
      * Gate 03 Phase 0: authoritative signals come from the server-persisted
      * proposal, never from the browser. Confirming without a valid, live,
@@ -451,7 +514,16 @@ export class GovernanceService {
       return { ok: false, error: 'Lambda rejected CLASSIFICATION_ASSIGNED', qhubAppId: appRecord.qhub_app_id };
     }
 
-    await persistClassification(appRecord.qhub_app_id, finalClassification, this.ctx.env);
+    try {
+      await persistClassification(appRecord.qhub_app_id, finalClassification, this.ctx.env);
+    } catch (err) {
+      /*
+       * The ledger event committed, but the snapshot write failed closed
+       * (e.g. schema drift racing the readiness cache). Surface it, don't mask it.
+       */
+      return this.schemaFailClosedResult(err);
+    }
+
     await markProposalConsumed(intent.proposalId, this.ctx.env); // single-use
 
     console.log(
@@ -473,6 +545,13 @@ export class GovernanceService {
   private async recordPolicyProfile(
     intent: Extract<GovernanceIntent, { action: 'POLICY_ASSIGN' }>,
   ): Promise<GovernanceResult> {
+    // Fail closed if the connected project is behind the code (missing policy_* / classification columns).
+    const schemaGuard = await this.guardSchemaReady();
+
+    if (schemaGuard) {
+      return schemaGuard;
+    }
+
     let appRecord;
 
     try {
