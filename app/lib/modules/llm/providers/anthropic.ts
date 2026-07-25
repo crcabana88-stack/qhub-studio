@@ -13,31 +13,26 @@ export default class AnthropicProvider extends BaseProvider {
   };
 
   staticModels: ModelInfo[] = [
-    // Claude Sonnet 5: 200k context, 64k output (latest fast model)
+    // Claude Sonnet 4.6 — verified working with the installed @ai-sdk/anthropic
+    // (0.0.39). The 2025 "…-5 / …-4-8" IDs reject the default temperature this
+    // old SDK sends ("temperature is deprecated for this model"), so they are NOT
+    // used as static defaults. The full current model list still comes from
+    // getDynamicModels() for users who want to pick a specific model.
     {
-      name: 'claude-sonnet-5',
-      label: 'Claude Sonnet 5',
-      provider: 'Anthropic',
-      maxTokenAllowed: 200000,
-      maxCompletionTokens: 64000,
-    },
-
-    // Claude Haiku 4.5: 200k context, 16k output, fastest/cheapest
-    {
-      name: 'claude-haiku-4-5-20251001',
-      label: 'Claude Haiku 4.5',
-      provider: 'Anthropic',
-      maxTokenAllowed: 200000,
-      maxCompletionTokens: 16000,
-    },
-
-    // Claude Opus 4.8: 200k context, 32k output (flagship)
-    {
-      name: 'claude-opus-4-8',
-      label: 'Claude Opus 4.8',
+      name: 'claude-sonnet-4-6',
+      label: 'Claude Sonnet 4.6',
       provider: 'Anthropic',
       maxTokenAllowed: 200000,
       maxCompletionTokens: 32000,
+    },
+
+    // Stable fallback, also SDK-compatible.
+    {
+      name: 'claude-3-5-sonnet-20241022',
+      label: 'Claude 3.5 Sonnet',
+      provider: 'Anthropic',
+      maxTokenAllowed: 200000,
+      maxCompletionTokens: 8192,
     },
   ];
 
