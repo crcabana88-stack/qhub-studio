@@ -31,6 +31,27 @@ export async function action({ request, context }: ActionFunctionArgs) {
     cookies: createCookieMethods(cookieHeader, responseHeaders),
   });
 
+  const formData = await request.formData();
+
+  // ── Email/password sign-in (staging: no external OAuth provider needed) ──────
+  if (formData.get('intent') === 'password') {
+    const email = String(formData.get('email') ?? '').trim();
+    const password = String(formData.get('password') ?? '');
+
+    if (!email || !password) {
+      return { error: 'Email and password are required.' };
+    }
+
+    const { error } = await supabase.auth.signInWithPassword({ email, password });
+
+    if (error) {
+      return { error: error.message };
+    }
+
+    return redirect('/', { headers: responseHeaders });
+  }
+
+  // ── Google OAuth (default) ───────────────────────────────────────────────────
   const siteUrl =
     env.SITE_URL ??
     process.env.SITE_URL ??
@@ -182,6 +203,75 @@ export default function LoginPage() {
               />
             </svg>
             Continue with Google
+          </button>
+        </Form>
+
+        {/* Divider */}
+        <div style={{ display: 'flex', alignItems: 'center', gap: 12, margin: '24px 0' }}>
+          <div style={{ flex: 1, height: 1, background: 'rgba(255,255,255,0.10)' }} />
+          <span style={{ fontSize: 12, color: 'rgba(255,255,255,0.35)' }}>or</span>
+          <div style={{ flex: 1, height: 1, background: 'rgba(255,255,255,0.10)' }} />
+        </div>
+
+        {/* Email / password sign-in */}
+        <Form method="post">
+          <input type="hidden" name="intent" value="password" />
+          <input
+            type="email"
+            name="email"
+            placeholder="Email"
+            autoComplete="username"
+            required
+            style={{
+              width: '100%',
+              boxSizing: 'border-box',
+              background: 'rgba(255,255,255,0.06)',
+              border: '1px solid rgba(255,255,255,0.12)',
+              borderRadius: 10,
+              padding: '12px 14px',
+              fontSize: 14,
+              color: '#fff',
+              marginBottom: 12,
+              outline: 'none',
+            }}
+          />
+          <input
+            type="password"
+            name="password"
+            placeholder="Password"
+            autoComplete="current-password"
+            required
+            style={{
+              width: '100%',
+              boxSizing: 'border-box',
+              background: 'rgba(255,255,255,0.06)',
+              border: '1px solid rgba(255,255,255,0.12)',
+              borderRadius: 10,
+              padding: '12px 14px',
+              fontSize: 14,
+              color: '#fff',
+              marginBottom: 16,
+              outline: 'none',
+            }}
+          />
+          <button
+            type="submit"
+            style={{
+              width: '100%',
+              background: '#1D9E75',
+              color: '#fff',
+              border: 'none',
+              borderRadius: 10,
+              padding: '13px 24px',
+              fontSize: 15,
+              fontWeight: 600,
+              cursor: 'pointer',
+              transition: 'opacity 0.15s',
+            }}
+            onMouseOver={(e) => ((e.currentTarget as HTMLButtonElement).style.opacity = '0.9')}
+            onMouseOut={(e) => ((e.currentTarget as HTMLButtonElement).style.opacity = '1')}
+          >
+            Sign in with email
           </button>
         </Form>
 
