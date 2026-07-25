@@ -683,6 +683,11 @@ export class GovernanceService {
     // Gate 02: stamp the REAL persisted tier (UNCLASSIFIED until classification confirmed).
     const riskTier = await getPersistedRiskTier(params.conversationId, this.ctx.orgId, this.ctx.env);
 
+    // Gate 03: reference the assigned policy profile so every AI invocation is
+    // provably bound to the controls in force at the time. Null before policy
+    // assignment; present (with hash) once POLICY_PROFILE_ASSIGNED has committed.
+    const policy = await getPolicyProfile(appRecord.qhub_app_id, this.ctx.env);
+
     const body: LambdaEventBody = {
       ...(chainId ? { chain_id: chainId } : {}),
       event_type: 'AI_MODEL_INVOKED',
@@ -698,6 +703,14 @@ export class GovernanceService {
         model: params.model,
         conversation_id: params.conversationId,
         builder_project_id: params.builderProjectId ?? null,
+        ...(policy
+          ? {
+              policy_profile_id: policy.policy_profile_id,
+              policy_profile_version: policy.policy_profile_version,
+              policy_profile_hash: policy.policy_profile_hash,
+              policy_catalog_version: policy.policy_catalog_version,
+            }
+          : {}),
         session_id: this.ctx.sessionId,
         source: 'qhub-studio',
       },

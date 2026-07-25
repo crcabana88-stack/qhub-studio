@@ -23,6 +23,7 @@ const {
   mockGetPersistedRiskTier,
   mockPersistClassification,
   mockGetClassification,
+  mockGetPolicyProfile,
 } = vi.hoisted(() => ({
   mockGetSession: vi.fn(),
   mockGetOrCreateQhubApp: vi.fn(),
@@ -31,6 +32,7 @@ const {
   mockGetPersistedRiskTier: vi.fn(),
   mockPersistClassification: vi.fn(),
   mockGetClassification: vi.fn(),
+  mockGetPolicyProfile: vi.fn(),
 }));
 
 vi.mock('~/lib/auth/session', () => ({
@@ -48,6 +50,7 @@ vi.mock('~/lib/qhub/qhub-app.server', () => ({
   getPersistedRiskTier: mockGetPersistedRiskTier,
   persistClassification: mockPersistClassification,
   getClassification: mockGetClassification,
+  getPolicyProfile: mockGetPolicyProfile,
 }));
 
 /** A stable fake qhub_app record with no chain_id yet (genesis not fired). */
@@ -79,6 +82,7 @@ beforeEach(() => {
   mockGetPersistedRiskTier.mockReset().mockResolvedValue('T2');
   mockPersistClassification.mockReset().mockResolvedValue(undefined);
   mockGetClassification.mockReset().mockResolvedValue(null);
+  mockGetPolicyProfile.mockReset().mockResolvedValue(null);
 });
 
 // ─── Test 1: Browser hydration contains no HMAC secret ───────────────────────
