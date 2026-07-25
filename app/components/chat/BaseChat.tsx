@@ -42,6 +42,8 @@ interface BaseChatProps {
   scrollRef?: RefCallback<HTMLDivElement> | undefined;
   showChat?: boolean;
   chatStarted?: boolean;
+  /** QHUB Gate 02: classification card rendered above the input while pending. */
+  classificationSlot?: React.ReactNode;
   isStreaming?: boolean;
   onStreamingChange?: (streaming: boolean) => void;
   messages?: Message[];
@@ -90,6 +92,7 @@ export const BaseChat = React.forwardRef<HTMLDivElement, BaseChatProps>(
       textareaRef,
       showChat = true,
       chatStarted = false,
+      classificationSlot,
       isStreaming = false,
       onStreamingChange,
       model,
@@ -393,6 +396,7 @@ export const BaseChat = React.forwardRef<HTMLDivElement, BaseChatProps>(
                 })}
               >
                 <div className="flex flex-col gap-2">
+                  {classificationSlot}
                   {deployAlert && (
                     <DeployChatAlert
                       alert={deployAlert}

@@ -19,6 +19,9 @@ import type { ProviderInfo } from '~/types/model';
 import { useSearchParams, useRouteLoaderData } from '@remix-run/react';
 import { useQHubPromptSeed } from '~/lib/hooks/useQHubPromptSeed';
 import { postGovernanceEvent } from '~/lib/qhub/messenger';
+import { requestClassification, confirmClassification } from '~/lib/qhub/governance-client';
+import { ClassificationCard } from './ClassificationCard';
+import type { ClassificationResult, RiskTier } from '~/lib/qhub/classification';
 import { createSampler } from '~/utils/sampler';
 import { getTemplates, selectStarterTemplate } from '~/utils/selectStarterTemplate';
 import { logStore } from '~/lib/stores/logs';
@@ -107,6 +110,14 @@ export const ChatImpl = memo(
     const supabaseAlert = useStore(workbenchStore.supabaseAlert);
     const { activeProviders, promptId, autoSelectTemplate, contextOptimizationEnabled } = useSettings();
     const [llmErrorAlert, setLlmErrorAlert] = useState<LlmErrorAlertType | undefined>(undefined);
+
+    // ── QHUB Gate 02: classification state ─────────────────────────────────────
+    const [proposedClassification, setProposedClassification] = useState<ClassificationResult | null>(null);
+    const [classificationConfirmed, setClassificationConfirmed] = useState(false);
+    const [classifyBusy, setClassifyBusy] = useState(false);
+    const pendingBuildRef = useRef<{ firstMsgId: string; attachments?: any } | null>(null);
+    const classifyDescriptionRef = useRef<string>('');
+
     const [model, setModel] = useState(() => {
       const savedProvider = Cookies.get('selectedProvider');
       const savedModel = Cookies.get('selectedModel');
@@ -429,6 +440,40 @@ export const ChatImpl = memo(
       return attachments;
     };
 
+    // ── QHUB Gate 02: confirm the classification, then start the build ─────────
+    const handleConfirmClassification = async (tier: RiskTier) => {
+      const pending = pendingBuildRef.current;
+      const classification = proposedClassification;
+
+      if (!classification || !pending) {
+        return;
+      }
+
+      setClassifyBusy(true);
+      try {
+        await confirmClassification({
+          conversationId: pending.firstMsgId,
+          classification,
+          confirmedTier: tier,
+          projectTitle: classifyDescriptionRef.current.slice(0, 80),
+          builderProjectId: urlId,
+        });
+      } catch (err) {
+        console.error('[QHUB] confirm classification failed', err);
+        toast.error('Failed to record classification. Please try again.');
+        setClassifyBusy(false);
+
+        return;
+      }
+
+      setClassificationConfirmed(true);
+      setProposedClassification(null);
+      setClassifyBusy(false);
+
+      // Proceed to generation using the already-set first user message.
+      reload(pending.attachments ? { experimental_attachments: pending.attachments } : undefined);
+    };
+
     const sendMessage = async (_event: React.UIEvent, messageInput?: string) => {
       const messageContent = messageInput || input;
 
@@ -456,6 +501,45 @@ export const ChatImpl = memo(
       runAnimation();
 
       if (!chatStarted) {
+        // ── QHUB Gate 02: CLASSIFY before building (authenticated projects) ────
+        // Runs once per new project: analyze the description, show the
+        // classification card, and wait for confirmation before generation.
+        if (qhubRootSession && !classificationConfirmed) {
+          const firstMsgId = `${Date.now()}`;
+          const userMessageText = `[Model: ${model}]\n\n[Provider: ${provider.name}]\n\n${finalMessageContent}`;
+          const classifyAttachments = uploadedFiles.length > 0 ? await filesToAttachments(uploadedFiles) : undefined;
+
+          setMessages([
+            {
+              id: firstMsgId,
+              role: 'user',
+              content: userMessageText,
+              parts: createMessageParts(userMessageText, imageDataList),
+              experimental_attachments: classifyAttachments,
+            },
+          ]);
+          setInput('');
+          Cookies.remove(PROMPT_COOKIE_KEY);
+          setUploadedFiles([]);
+          setImageDataList([]);
+          resetEnhancer();
+          textareaRef.current?.blur();
+
+          pendingBuildRef.current = { firstMsgId, attachments: classifyAttachments };
+          classifyDescriptionRef.current = finalMessageContent;
+          setClassifyBusy(true);
+          try {
+            const proposed = await requestClassification(finalMessageContent, firstMsgId);
+            setProposedClassification(proposed);
+          } catch (err) {
+            console.error('[QHUB] classification failed', err);
+            toast.error('Governance classification failed. Please try again.');
+          }
+          setClassifyBusy(false);
+
+          return; // wait for confirmation — ClassificationCard renders above the input
+        }
+
         setFakeLoading(true);
 
         if (autoSelectTemplate) {
@@ -661,6 +745,27 @@ export const ChatImpl = memo(
         input={input}
         showChat={showChat}
         chatStarted={chatStarted}
+        classificationSlot={
+          proposedClassification ? (
+            <ClassificationCard
+              classification={proposedClassification}
+              onConfirm={handleConfirmClassification}
+              busy={classifyBusy}
+            />
+          ) : classifyBusy ? (
+            <div
+              style={{
+                border: '1px solid rgba(36,71,240,0.35)',
+                borderRadius: 12,
+                padding: '14px 18px',
+                fontSize: 13.5,
+                color: 'var(--bolt-elements-textSecondary, rgba(120,130,141,1))',
+              }}
+            >
+              <strong>01 · Classify</strong> — analyzing your app for regulatory domain and risk tier…
+            </div>
+          ) : null
+        }
         isStreaming={isLoading || fakeLoading}
         onStreamingChange={(streaming) => {
           streamingState.set(streaming);

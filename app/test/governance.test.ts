@@ -15,14 +15,23 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 // them without a temporal-dead-zone error. These let us exercise GovernanceService
 // without a live Supabase (durable qhub_app_id layer) or a real session.
 
-const { mockGetSession, mockGetOrCreateQhubApp, mockPersistChainId, mockGetChainId } = vi.hoisted(
-  () => ({
-    mockGetSession: vi.fn(),
-    mockGetOrCreateQhubApp: vi.fn(),
-    mockPersistChainId: vi.fn(),
-    mockGetChainId: vi.fn(),
-  }),
-);
+const {
+  mockGetSession,
+  mockGetOrCreateQhubApp,
+  mockPersistChainId,
+  mockGetChainId,
+  mockGetPersistedRiskTier,
+  mockPersistClassification,
+  mockGetClassification,
+} = vi.hoisted(() => ({
+  mockGetSession: vi.fn(),
+  mockGetOrCreateQhubApp: vi.fn(),
+  mockPersistChainId: vi.fn(),
+  mockGetChainId: vi.fn(),
+  mockGetPersistedRiskTier: vi.fn(),
+  mockPersistClassification: vi.fn(),
+  mockGetClassification: vi.fn(),
+}));
 
 vi.mock('~/lib/auth/session', () => ({
   getSession: mockGetSession,
@@ -36,6 +45,9 @@ vi.mock('~/lib/qhub/qhub-app.server', () => ({
   getOrCreateQhubApp: mockGetOrCreateQhubApp,
   persistChainId: mockPersistChainId,
   getChainId: mockGetChainId,
+  getPersistedRiskTier: mockGetPersistedRiskTier,
+  persistClassification: mockPersistClassification,
+  getClassification: mockGetClassification,
 }));
 
 /** A stable fake qhub_app record with no chain_id yet (genesis not fired). */
@@ -62,6 +74,11 @@ beforeEach(() => {
   mockGetOrCreateQhubApp.mockReset().mockResolvedValue(fakeAppRecord());
   mockPersistChainId.mockReset().mockResolvedValue(undefined);
   mockGetChainId.mockReset().mockResolvedValue(null);
+  // Gate 02: default to a classified tier so gate tests exercise attestation
+  // logic (UNCLASSIFIED would block unconditionally).
+  mockGetPersistedRiskTier.mockReset().mockResolvedValue('T2');
+  mockPersistClassification.mockReset().mockResolvedValue(undefined);
+  mockGetClassification.mockReset().mockResolvedValue(null);
 });
 
 // ─── Test 1: Browser hydration contains no HMAC secret ───────────────────────

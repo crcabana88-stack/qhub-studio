@@ -42,7 +42,18 @@ import {
   getOrCreateQhubApp,
   persistChainId,
   getChainId,
+  persistClassification,
+  getClassification,
+  getPersistedRiskTier,
 } from './qhub-app.server';
+import {
+  maxTier,
+  tierRank,
+  type ClassificationResult,
+  type ClassificationSignals,
+  type RiskTier,
+} from './classification';
+import { computeRiskFloor } from './classification-rules';
 
 // ─── Gate state machine ───────────────────────────────────────────────────────
 
@@ -58,7 +69,15 @@ export type GateState = 'APPROVED' | 'BLOCKED' | 'UNKNOWN' | 'ERROR';
 export type GovernanceIntent =
   | { action: 'PROJECT_CREATED'; conversationId: string; projectTitle: string; builderProjectId?: string }
   | { action: 'AI_MODEL_USED'; conversationId: string; provider: string; model: string; builderProjectId?: string }
-  | { action: 'DEPLOYMENT_GATE_CHECK'; conversationId: string; builderProjectId?: string };
+  | { action: 'DEPLOYMENT_GATE_CHECK'; conversationId: string; builderProjectId?: string }
+  | {
+      action: 'CLASSIFICATION_CONFIRMED';
+      conversationId: string;
+      projectTitle?: string;
+      classification: ClassificationResult;
+      confirmedTier: RiskTier;
+      builderProjectId?: string;
+    };
 
 // ─── Lambda v2.6 caller event body ───────────────────────────────────────────
 // These are exactly the 7 fields the caller sends. No more, no less.
@@ -80,7 +99,8 @@ type LambdaEventType =
   | 'EXCEPTION_DENIED'
   | 'AUDIT_EXPORTED';
 
-type RiskTier = 'UNCLASSIFIED' | 'T0' | 'T1' | 'T2' | 'T3';
+/** Ledger risk_tier field allows UNCLASSIFIED; the classification RiskTier does not. */
+type LedgerRiskTier = 'UNCLASSIFIED' | RiskTier;
 
 interface LambdaEventBody {
   chain_id?: string;
@@ -94,7 +114,7 @@ interface LambdaEventBody {
     // display_name omitted when absent (v2.4 Option A: null ≡ absent)
   };
   payload: Record<string, unknown>;
-  risk_tier: RiskTier;
+  risk_tier: LedgerRiskTier;
 }
 
 interface LambdaIngestResponse {
@@ -119,6 +139,8 @@ export interface GovernanceResult {
   gateState?: GateState;
   chainId?: string;
   qhubAppId?: string;
+  riskTier?: RiskTier;
+  riskFloor?: RiskTier;
   error?: string;
 }
 
@@ -160,6 +182,8 @@ export class GovernanceService {
         return this.recordAiModelInvoked(intent);
       case 'DEPLOYMENT_GATE_CHECK':
         return this.checkDeploymentGate(intent);
+      case 'CLASSIFICATION_CONFIRMED':
+        return this.recordClassification(intent);
       default:
         return { ok: false, error: 'Unknown governance intent' };
     }
@@ -241,6 +265,128 @@ export class GovernanceService {
     return { ok: true, chainId, qhubAppId: appRecord.qhub_app_id };
   }
 
+  // ── CLASSIFICATION_ASSIGNED (Gate 02) ──────────────────────────────────────
+  // Emits the classification onto the app chain. The deterministic floor is
+  // ALWAYS re-computed server-side from the signals — the confirmed tier can
+  // raise it but never lower it below the floor (downgrade blocked, spec §8).
+  // Genesis is guaranteed first: CLASSIFY is lifecycle stage 01, so it also
+  // opens the chain if the build hasn't already.
+
+  private async recordClassification(
+    intent: Extract<GovernanceIntent, { action: 'CLASSIFICATION_CONFIRMED' }>,
+  ): Promise<GovernanceResult> {
+    let appRecord;
+    try {
+      appRecord = await getOrCreateQhubApp(
+        {
+          orgId: this.ctx.orgId,
+          userId: this.ctx.userId,
+          conversationId: intent.conversationId,
+          builderProjectId: intent.builderProjectId,
+        },
+        this.ctx.env,
+      );
+    } catch (err) {
+      console.error('[GovernanceService] classification: app lookup failed:', err);
+      return { ok: false, error: 'Could not establish QHUB app identity' };
+    }
+
+    // Ensure the chain exists (genesis is seq=1; classification attaches after).
+    let chainId = appRecord.chain_id ?? (await getChainId(intent.conversationId, this.ctx.orgId, this.ctx.env));
+    if (!chainId) {
+      const genesis = await this.recordGenesis({
+        action: 'PROJECT_CREATED',
+        conversationId: intent.conversationId,
+        projectTitle: intent.projectTitle ?? 'Untitled project',
+        builderProjectId: intent.builderProjectId,
+      });
+      if (!genesis.ok || !genesis.chainId) {
+        return { ok: false, error: 'Genesis failed before classification' };
+      }
+      chainId = genesis.chainId;
+    }
+
+    // Re-derive the deterministic floor from the submitted signals. Never trust
+    // a browser-supplied floor. Final tier can only be >= floor.
+    const signals: ClassificationSignals = {
+      data_classes: intent.classification.data_classes,
+      integration_types: intent.classification.integration_types,
+      ai_behavior: intent.classification.ai_behavior,
+      autonomy_level: intent.classification.autonomy_level,
+      deployment_surface: intent.classification.deployment_surface,
+      regulatory_domains: intent.classification.regulatory_domains,
+    };
+    const { floor } = computeRiskFloor(signals);
+    const confirmedTier = intent.confirmedTier ?? intent.classification.risk_tier;
+    const downgradeBlocked = tierRank(confirmedTier) < tierRank(floor);
+    const finalTier = maxTier(floor, confirmedTier); // >= floor, always
+
+    // Versioning: a correction/reclassification is a new immutable version.
+    const existing = await getClassification(appRecord.qhub_app_id, this.ctx.env);
+    const version = (existing?.classification_version ?? 0) + 1;
+
+    const method: ClassificationResult['classification_method'] =
+      finalTier === intent.classification.ai_proposed_tier ? 'HUMAN_CONFIRMED' : 'HUMAN_CORRECTED';
+
+    const finalClassification: ClassificationResult = {
+      ...intent.classification,
+      classification_version: version,
+      risk_tier: finalTier,
+      risk_floor: floor,
+      classification_method: method,
+      confirmed_by: this.ctx.userId, // server-authoritative
+      confirmed_at: new Date().toISOString(),
+    };
+
+    const body: LambdaEventBody = {
+      chain_id: chainId,
+      event_type: 'CLASSIFICATION_ASSIGNED',
+      app_id: appRecord.qhub_app_id,
+      client_id: this.ctx.orgId,
+      actor: {
+        id: this.ctx.userId,
+        type: 'human',
+        identity_provider: 'supabase',
+      },
+      payload: {
+        classification_version: version,
+        risk_tier: finalTier,
+        risk_floor: floor,
+        ai_proposed_tier: intent.classification.ai_proposed_tier,
+        classification_method: method,
+        regulatory_domains: finalClassification.regulatory_domains,
+        data_classes: finalClassification.data_classes,
+        integration_types: finalClassification.integration_types,
+        ai_behavior: finalClassification.ai_behavior,
+        autonomy_level: finalClassification.autonomy_level,
+        deployment_surface: finalClassification.deployment_surface,
+        rationale: finalClassification.rationale,
+        floor_reasons: finalClassification.floor_reasons,
+        confidence: finalClassification.confidence,
+        confirmed_by: this.ctx.userId,
+        confirmed_at: finalClassification.confirmed_at,
+        classifier_version: finalClassification.classifier_version,
+        downgrade_below_floor_blocked: downgradeBlocked,
+        session_id: this.ctx.sessionId,
+        source: 'qhub-studio',
+      },
+      risk_tier: finalTier,
+    };
+
+    const result = await this.postEvent(body);
+    if (!result.ok) {
+      return { ok: false, error: 'Lambda rejected CLASSIFICATION_ASSIGNED', qhubAppId: appRecord.qhub_app_id };
+    }
+
+    await persistClassification(appRecord.qhub_app_id, finalClassification, this.ctx.env);
+
+    console.log(
+      `[GovernanceService] CLASSIFICATION_ASSIGNED committed — qhub_app_id=${appRecord.qhub_app_id} risk_tier=${finalTier} floor=${floor} v=${version}${downgradeBlocked ? ' (below-floor downgrade blocked)' : ''}`,
+    );
+
+    return { ok: true, qhubAppId: appRecord.qhub_app_id, riskTier: finalTier, riskFloor: floor };
+  }
+
   // ── AI_MODEL_INVOKED ───────────────────────────────────────────────────────
   // v2.6 canonical event type for AI/LLM invocations during code generation.
   // NOT APP_SUBMITTED. See event-schema-v2.6.md.
@@ -276,6 +422,9 @@ export class GovernanceService {
     const chainId = appRecord.chain_id ??
       await getChainId(params.conversationId, this.ctx.orgId, this.ctx.env);
 
+    // Gate 02: stamp the REAL persisted tier (UNCLASSIFIED until classification confirmed).
+    const riskTier = await getPersistedRiskTier(params.conversationId, this.ctx.orgId, this.ctx.env);
+
     const body: LambdaEventBody = {
       ...(chainId ? { chain_id: chainId } : {}),
       event_type: 'AI_MODEL_INVOKED',
@@ -294,7 +443,7 @@ export class GovernanceService {
         session_id: this.ctx.sessionId,
         source: 'qhub-studio',
       },
-      risk_tier: 'UNCLASSIFIED',
+      risk_tier: riskTier,
     };
 
     const result = await this.postEvent(body);
@@ -333,9 +482,35 @@ export class GovernanceService {
       return { ok: false, gateState: 'UNKNOWN' };
     }
 
-    const gateState = await this.queryGateState(appRecord.qhub_app_id);
+    const attestationState = await this.queryGateState(appRecord.qhub_app_id);
     const chainId = appRecord.chain_id ??
       await getChainId(intent.conversationId, this.ctx.orgId, this.ctx.env);
+    const riskTier = await getPersistedRiskTier(intent.conversationId, this.ctx.orgId, this.ctx.env);
+
+    // Gate 02 tier consequences (§8 — minimal; the full Policy Engine is Gate 03):
+    //   UNCLASSIFIED → blocked (must classify first)
+    //   T0/T1        → permitted under baseline controls once classified
+    //   T2           → production requires owner attestation
+    //   T3           → production requires authorized governance/compliance approval
+    let gateState: GateState;
+    let reason: string | undefined;
+    if (riskTier === 'UNCLASSIFIED') {
+      gateState = 'BLOCKED';
+      reason = 'Classification required before deployment (Gate 02 CLASSIFY not completed).';
+    } else if (riskTier === 'T0' || riskTier === 'T1') {
+      gateState = 'APPROVED';
+    } else if (riskTier === 'T2') {
+      gateState = attestationState === 'APPROVED' ? 'APPROVED' : 'BLOCKED';
+      if (gateState !== 'APPROVED') {
+        reason = 'T2 Elevated: production deployment requires owner attestation.';
+      }
+    } else {
+      gateState = attestationState === 'APPROVED' ? 'APPROVED' : 'BLOCKED';
+      if (gateState !== 'APPROVED') {
+        reason =
+          'T3 High: production deployment requires authorized governance/compliance/security approval; builds are limited to isolated preview.';
+      }
+    }
 
     const eventType: LambdaEventType = gateState === 'APPROVED' ? 'GATE_PASSED' : 'GATE_FAILED';
 
@@ -353,16 +528,23 @@ export class GovernanceService {
         gate_id: 'studio-deploy-gate',
         gate_name: 'QHUB Studio Deployment Gate',
         gate_state: gateState,
+        risk_tier: riskTier,
+        attestation_state: attestationState,
         conversation_id: intent.conversationId,
         session_id: this.ctx.sessionId,
         source: 'qhub-studio',
-        ...(gateState !== 'APPROVED' ? { reason: 'Governance attestation not yet confirmed' } : {}),
+        ...(reason ? { reason } : {}),
       },
-      risk_tier: 'UNCLASSIFIED',
+      risk_tier: riskTier,
     };
 
     const result = await this.postEvent(body);
-    return { ok: result.ok, gateState, qhubAppId: appRecord.qhub_app_id };
+    return {
+      ok: result.ok,
+      gateState,
+      qhubAppId: appRecord.qhub_app_id,
+      riskTier: riskTier === 'UNCLASSIFIED' ? undefined : riskTier,
+    };
   }
 
   // ── Gate state query ───────────────────────────────────────────────────────

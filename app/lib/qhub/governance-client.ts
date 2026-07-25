@@ -125,3 +125,61 @@ export async function assertDeploymentGate(intent: GateCheckIntent): Promise<Gat
   // Only explicit APPROVED passes — everything else blocks
   return result.gateState === 'APPROVED' ? 'APPROVED' : (result.gateState ?? 'ERROR');
 }
+
+// ─── Gate 02: Classification ─────────────────────────────────────────────────
+
+import type { ClassificationResult, RiskTier } from './classification';
+
+/**
+ * Ask the server to analyze the app description and PROPOSE a classification
+ * (deterministic floor + AI). Does NOT write to the ledger.
+ * Throws on failure so the caller can block the build until classification runs.
+ */
+export async function requestClassification(
+  description: string,
+  conversationId: string,
+): Promise<ClassificationResult> {
+  const res = await fetch('/api/classify', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ description, conversationId }),
+  });
+
+  if (!res.ok) {
+    throw new Error(`Classification request failed (${res.status})`);
+  }
+
+  const data = (await res.json()) as { ok: boolean; classification?: ClassificationResult; error?: string };
+  if (!data.ok || !data.classification) {
+    throw new Error(data.error ?? 'Classification failed');
+  }
+
+  return data.classification;
+}
+
+export interface ConfirmClassificationResult {
+  ok: boolean;
+  riskTier?: RiskTier;
+  error?: string;
+}
+
+/**
+ * Confirm (or correct) a proposed classification. The server re-derives the
+ * deterministic floor and emits the CLASSIFICATION_ASSIGNED ledger event with
+ * server-authoritative identity. The confirmed tier can raise but never lower
+ * below the floor.
+ */
+export async function confirmClassification(intent: {
+  conversationId: string;
+  classification: ClassificationResult;
+  confirmedTier: RiskTier;
+  projectTitle?: string;
+  builderProjectId?: string;
+}): Promise<ConfirmClassificationResult> {
+  const result = (await postIntent({
+    action: 'CLASSIFICATION_CONFIRMED',
+    ...intent,
+  })) as ConfirmClassificationResult & { gateState?: GateState };
+
+  return { ok: result.ok, riskTier: result.riskTier, error: result.error };
+}

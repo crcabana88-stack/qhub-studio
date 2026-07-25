@@ -60,6 +60,7 @@ export async function action({ request, context }: ActionFunctionArgs) {
     'PROJECT_CREATED',
     'AI_MODEL_USED',
     'DEPLOYMENT_GATE_CHECK',
+    'CLASSIFICATION_CONFIRMED',
   ];
   if (!allowedActions.includes(intent.action)) {
     return json({ ok: false, error: `Unknown action: ${intent.action}` }, { status: 400 });

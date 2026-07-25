@@ -26,6 +26,7 @@
  */
 
 import { createClient, type SupabaseClient } from '@supabase/supabase-js';
+import type { ClassificationResult, PersistedRiskTier } from './classification';
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -39,6 +40,7 @@ export interface QhubAppRecord {
   workspace_id: string | null;
   chain_id: string | null;
   risk_tier: string;
+  classification: ClassificationResult | null;
   governance_status: string;
   created_at: string;
   updated_at: string;
@@ -258,4 +260,106 @@ export async function updateBuilderProjectId(
     // Invalidate cache
     appCache.delete(conversationId);
   }
+}
+
+// ─── Gate 02: classification persistence ──────────────────────────────────────
+
+/**
+ * Persist the current classification and its risk tier on the app record.
+ * The immutable ledger (CLASSIFICATION_ASSIGNED events) remains the authoritative
+ * history; this row holds only the CURRENT classification for fast reads.
+ * Marks governance_status = 'classified'.
+ */
+export async function persistClassification(
+  qhubAppId: string,
+  classification: ClassificationResult,
+  env: Record<string, string | undefined>,
+): Promise<void> {
+  const sb = getSupabaseAdmin(env);
+
+  // Write the tier first (columns that always exist) so subsequent events get
+  // the real tier even if the classification JSONB column hasn't been migrated.
+  const { error: tierErr } = await sb
+    .from('qhub_applications')
+    .update({ risk_tier: classification.risk_tier, governance_status: 'classified' })
+    .eq('qhub_app_id', qhubAppId);
+
+  if (tierErr) {
+    console.error(`[QhubApp] persistClassification tier write failed for ${qhubAppId}: ${tierErr.message}`);
+  }
+
+  // Then the full snapshot (best-effort; requires the 20260725 migration).
+  const { error: jsonErr } = await sb
+    .from('qhub_applications')
+    .update({ classification })
+    .eq('qhub_app_id', qhubAppId);
+
+  if (jsonErr) {
+    console.error(
+      `[QhubApp] persistClassification snapshot write failed for ${qhubAppId} (run the classification migration): ${jsonErr.message}`,
+    );
+  }
+
+  // Invalidate cache so subsequent events read the new tier.
+  for (const [convId, record] of appCache.entries()) {
+    if (record.qhub_app_id === qhubAppId) {
+      appCache.delete(convId);
+      break;
+    }
+  }
+
+  console.log(
+    `[QhubApp] classification persisted qhub_app_id=${qhubAppId} risk_tier=${classification.risk_tier} v=${classification.classification_version}`,
+  );
+}
+
+/** Read the current persisted classification (for versioning / gate checks). */
+export async function getClassification(
+  qhubAppId: string,
+  env: Record<string, string | undefined>,
+): Promise<ClassificationResult | null> {
+  const sb = getSupabaseAdmin(env);
+  const { data, error } = await sb
+    .from('qhub_applications')
+    .select('classification')
+    .eq('qhub_app_id', qhubAppId)
+    .maybeSingle();
+
+  if (error) {
+    console.error(`[QhubApp] getClassification failed for ${qhubAppId}: ${error.message}`);
+    return null;
+  }
+
+  return (data?.classification as ClassificationResult | null) ?? null;
+}
+
+/**
+ * Read the persisted risk tier for the app of a given conversation.
+ * Returns 'UNCLASSIFIED' until a classification has been confirmed.
+ * Used so genesis / AI_MODEL_INVOKED / gate events carry the REAL tier.
+ */
+export async function getPersistedRiskTier(
+  conversationId: string,
+  orgId: string,
+  env: Record<string, string | undefined>,
+): Promise<PersistedRiskTier> {
+  const cached = appCache.get(conversationId);
+  if (cached?.risk_tier) {
+    return (cached.risk_tier as PersistedRiskTier) ?? 'UNCLASSIFIED';
+  }
+
+  const sb = getSupabaseAdmin(env);
+  const { data, error } = await sb
+    .from('qhub_applications')
+    .select('risk_tier')
+    .eq('conversation_id', conversationId)
+    .eq('org_id', orgId)
+    .maybeSingle();
+
+  if (error) {
+    console.error(`[QhubApp] getPersistedRiskTier failed: ${error.message}`);
+    return 'UNCLASSIFIED';
+  }
+
+  return ((data?.risk_tier as PersistedRiskTier) ?? 'UNCLASSIFIED') || 'UNCLASSIFIED';
 }
