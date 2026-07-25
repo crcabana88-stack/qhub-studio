@@ -22,7 +22,8 @@ primary_region = "iad"   # us-east (IAD) — closest to NY financial clients
 [http_service]
   internal_port = 5173
   force_https = true
-  auto_stop_machines = true
+  # Keep the machine always-on: auto-stop caused ~40s cold-start 503s mid-session.
+  auto_stop_machines = false
   auto_start_machines = true
   min_machines_running = 1
 
@@ -33,7 +34,9 @@ primary_region = "iad"   # us-east (IAD) — closest to NY financial clients
 
 [[vm]]
   size = "shared-cpu-2x"
-  memory = "1gb"
+  # 1gb was too tight for wrangler pages dev serving the heavy Studio SSR bundle
+  # (instability / restarts under load). 2gb gives headroom.
+  memory = "2gb"
 
 [checks]
   [checks.alive]
