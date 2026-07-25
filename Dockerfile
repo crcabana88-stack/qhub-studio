@@ -11,15 +11,26 @@
 FROM node:20-slim AS base
 ENV PNPM_HOME="/pnpm"
 ENV PATH="$PNPM_HOME:$PATH"
-# Install bash (node:20-slim is Debian Bookworm slim — bash not included by default,
-# but bindings.sh requires it via #!/bin/bash shebang)
-RUN apt-get update && apt-get install -y bash && rm -rf /var/lib/apt/lists/*
+# Install bash (bindings.sh needs #!/bin/bash) and ca-certificates.
+# ca-certificates is REQUIRED: `wrangler pages dev` runs the worker in
+# self-hosted workerd, whose outbound fetch() TLS uses the system CA store.
+# Without it, HTTPS to Supabase/AWS fails with
+# "unable to get local issuer certificate" and every auth/ledger call errors.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends bash ca-certificates \
+    && update-ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
 RUN corepack enable
 
 # ── Runtime ───────────────────────────────────────────────────────────────────
 FROM base AS runtime
 WORKDIR /app
 ENV NODE_ENV=production
+# Point OpenSSL/workerd and Node at the installed CA bundle so outbound
+# HTTPS (Supabase auth, AWS ledger) can verify certificate chains.
+ENV SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt
+ENV SSL_CERT_DIR=/etc/ssl/certs
+ENV NODE_EXTRA_CA_CERTS=/etc/ssl/certs/ca-certificates.crt
 
 # Install deps. --prod=false forces devDependencies to be installed even
 # though NODE_ENV=production: the runtime start command is
