@@ -1,11 +1,15 @@
 /**
  * QHUB health check — app/routes/api.health.ts
  *
- * Liveness + schema readiness. Returns 503 when the connected Supabase project
- * is behind the code, so orchestrators / smoke checks refuse to treat a
- * schema-drifted deployment as healthy (the failure mode from Gate 03 closure).
+ * PUBLIC liveness + readiness. Returns a GENERIC status only:
+ *   200 { status: 'healthy' }   when the connected schema is ready
+ *   503 { status: 'degraded' }  when the project is behind the code
  *
- * All fields are NON-SECRET: project ref and Supabase host only — never keys.
+ * It deliberately exposes NO internal schema detail (no project ref, host,
+ * expected version, or missing-object names) — anyone can call it. The detailed
+ * expected-vs-current diff lives behind authentication at
+ * /api/system/schema-check. Drift is still logged loudly server-side by
+ * getSchemaReadiness().
  */
 
 import { json, type LoaderFunctionArgs } from '@remix-run/cloudflare';
@@ -16,19 +20,12 @@ export const loader = async ({ context }: LoaderFunctionArgs) => {
 
   const schema = await getSchemaReadiness(env);
 
-  const body = {
-    status: schema.ready ? 'healthy' : 'degraded',
-    timestamp: new Date().toISOString(),
-    schema: {
-      ready: schema.ready,
-      expectedSchemaVersion: schema.expectedSchemaVersion,
-      projectRef: schema.projectRef,
-      supabaseHost: schema.supabaseHost,
-      missing: schema.missing.map((m) => ({ table: m.table, column: m.column, migration: m.migration })),
-      ...(schema.error ? { error: schema.error } : {}),
+  // Generic body only — never leak schema internals on the public endpoint.
+  return json(
+    {
+      status: schema.ready ? 'healthy' : 'degraded',
+      timestamp: new Date().toISOString(),
     },
-  };
-
-  // 200 when ready, 503 when the project is behind the code — loudly not-healthy.
-  return json(body, { status: schema.ready ? 200 : 503 });
+    { status: schema.ready ? 200 : 503 },
+  );
 };

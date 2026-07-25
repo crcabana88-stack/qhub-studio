@@ -39,6 +39,32 @@ const REQUIRED_SCHEMA_OBJECTS = [
 
 const SCHEMA_MISSING_CODES = new Set(['PGRST205', 'PGRST204', '42P01', '42703']);
 
+/**
+ * Staging-only predeploy bypass. Mirror of isDeployBypassAuthorized() in
+ * app/lib/qhub/schema-contract.ts — KEEP IN SYNC. Requires the skip flag AND a
+ * staging marker; an explicit production marker always refuses.
+ * @param {Record<string,string|undefined>} env
+ * @returns {{allowed:boolean, reason:string}}
+ */
+function deployBypassDecision(env) {
+  if (env.QHUB_SKIP_SCHEMA_CHECK !== '1') {
+    return { allowed: false, reason: 'no-skip-flag' };
+  }
+
+  const deployEnv = (env.QHUB_DEPLOY_ENV ?? '').toLowerCase();
+  const flyApp = (env.FLY_APP_NAME ?? '').toLowerCase();
+
+  if (deployEnv === 'production' || deployEnv === 'prod' || flyApp.includes('prod')) {
+    return { allowed: false, reason: 'production-never-bypasses' };
+  }
+
+  if (deployEnv === 'staging' || deployEnv === 'preview' || flyApp.includes('staging')) {
+    return { allowed: true, reason: 'authorized-staging-bypass' };
+  }
+
+  return { allowed: false, reason: 'no-staging-marker' };
+}
+
 // ─── Minimal .env loader (no dependency) ──────────────────────────────────────
 
 function loadDotenv() {
@@ -127,8 +153,22 @@ async function main() {
   loadDotenv();
 
   if (process.env.QHUB_SKIP_SCHEMA_CHECK === '1') {
-    console.warn('[schema-smoke-check] SKIPPED via QHUB_SKIP_SCHEMA_CHECK=1');
-    process.exit(0);
+    const decision = deployBypassDecision(process.env);
+
+    if (decision.allowed) {
+      console.warn(
+        `[schema-smoke-check] SKIPPED — authorized staging bypass (QHUB_DEPLOY_ENV=${process.env.QHUB_DEPLOY_ENV ?? ''} FLY_APP_NAME=${process.env.FLY_APP_NAME ?? ''}). Runtime enforcement is unaffected.`,
+      );
+      process.exit(0);
+    }
+
+    console.error(
+      `[schema-smoke-check] FAIL: QHUB_SKIP_SCHEMA_CHECK=1 refused (${decision.reason}). ` +
+        'The predeploy bypass is honored ONLY in an authorized staging context ' +
+        '(set QHUB_DEPLOY_ENV=staging, or a FLY_APP_NAME containing "staging"). ' +
+        'Production deploys can never skip the schema check.',
+    );
+    process.exit(1);
   }
 
   const url = process.env.SUPABASE_URL ?? '';
@@ -137,7 +177,7 @@ async function main() {
   if (!url || !serviceKey) {
     console.error(
       '[schema-smoke-check] FAIL: SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY are required to verify the target ' +
-        'project before deploy. Set them, or override with QHUB_SKIP_SCHEMA_CHECK=1 (not recommended).',
+        'project before deploy. Set them, or (staging only) skip with QHUB_SKIP_SCHEMA_CHECK=1 + QHUB_DEPLOY_ENV=staging.',
     );
     process.exit(1);
   }

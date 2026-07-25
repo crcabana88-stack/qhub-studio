@@ -150,3 +150,55 @@ export function projectRefFromUrl(url: string | undefined | null): string | null
     return null;
   }
 }
+
+// ─── Deployment-bypass authorization (staging-only) ───────────────────────────
+
+/** Env inputs that decide whether the predeploy schema check may be skipped. */
+export interface DeployBypassEnv {
+  QHUB_SKIP_SCHEMA_CHECK?: string;
+  QHUB_DEPLOY_ENV?: string;
+  FLY_APP_NAME?: string;
+}
+
+export interface DeployBypassDecision {
+  allowed: boolean;
+  reason: 'no-skip-flag' | 'production-never-bypasses' | 'no-staging-marker' | 'authorized-staging-bypass';
+}
+
+/**
+ * The predeploy schema smoke check (`scripts/schema-smoke-check.mjs`) may be
+ * skipped ONLY in an authorized **staging** context — never in production, and
+ * never merely because the flag is set. Bypass requires BOTH:
+ *   1. `QHUB_SKIP_SCHEMA_CHECK=1`, and
+ *   2. a recognized staging marker (`QHUB_DEPLOY_ENV=staging|preview`, or a
+ *      `FLY_APP_NAME` containing "staging").
+ * An explicit production marker (`QHUB_DEPLOY_ENV=production|prod`, or a
+ * `FLY_APP_NAME` containing "prod") always refuses the bypass.
+ *
+ * NOTE: this governs only the PREDEPLOY convenience skip. Runtime enforcement
+ * (governance guards, /api/health) is independent and never bypassable.
+ *
+ * KEEP IN SYNC with scripts/schema-smoke-check.mjs.
+ */
+export function isDeployBypassAuthorized(env: DeployBypassEnv): DeployBypassDecision {
+  if (env.QHUB_SKIP_SCHEMA_CHECK !== '1') {
+    return { allowed: false, reason: 'no-skip-flag' };
+  }
+
+  const deployEnv = (env.QHUB_DEPLOY_ENV ?? '').toLowerCase();
+  const flyApp = (env.FLY_APP_NAME ?? '').toLowerCase();
+
+  const isProduction = deployEnv === 'production' || deployEnv === 'prod' || flyApp.includes('prod');
+
+  if (isProduction) {
+    return { allowed: false, reason: 'production-never-bypasses' };
+  }
+
+  const isStaging = deployEnv === 'staging' || deployEnv === 'preview' || flyApp.includes('staging');
+
+  if (!isStaging) {
+    return { allowed: false, reason: 'no-staging-marker' };
+  }
+
+  return { allowed: true, reason: 'authorized-staging-bypass' };
+}

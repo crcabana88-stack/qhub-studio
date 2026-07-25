@@ -45,9 +45,9 @@ architecture was modified.
 | `app/lib/qhub/schema-check.server.ts` | server-only | REST probe of each required object (`GET /rest/v1/<table>?select=<col>&limit=1`); cached `getSchemaReadiness()`; `assertGovernanceSchemaReady()` guard + `SchemaNotReadyError`. Reads the service key to authenticate the probe; **never returns/logs it**. |
 | `app/lib/qhub/qhub-app.server.ts` | server-only | `persistClassification` / `getClassification` now **fail closed** (throw `SchemaMissingError`) when the `classification` column is absent, instead of logging and continuing. |
 | `app/lib/qhub/governance-service.server.ts` | server-only | `recordClassification` and `recordPolicyProfile` call the schema guard first; drift → browser-safe `{ ok:false, gateState:'BLOCKED' }`. |
-| `app/routes/api.health.ts` | route (server) | Liveness **+** schema readiness. Returns **503** when the project is behind the code. |
-| `app/routes/api.system.schema-check.ts` | route (server) | Non-secret **expected-vs-current** diagnostic (`?force=1` bypasses cache). 200 ready / 503 behind. |
-| `scripts/schema-smoke-check.mjs` | build/deploy | Probes the **target** project before deploy; exits non-zero if any object is missing/unverifiable. Wired into `npm run deploy`. |
+| `app/routes/api.health.ts` | route (server) | **Public, generic** liveness + readiness: `200 {status:'healthy'}` / `503 {status:'degraded'}`. Leaks **no** schema internals. |
+| `app/routes/api.system.schema-check.ts` | route (server) | **Authenticated** non-secret expected-vs-current diagnostic (`401` if unauthenticated; `?force=1` bypasses cache). 200 ready / 503 behind. |
+| `scripts/schema-smoke-check.mjs` | build/deploy | Probes the **target** project before deploy; exits non-zero if any object is missing/unverifiable. Wired into `npm run deploy`. Bypass is **staging-only** (`isDeployBypassAuthorized`). |
 
 ## Fail-closed layers (defense in depth)
 
@@ -57,16 +57,23 @@ architecture was modified.
 2. **Governance path** — `assertGovernanceSchemaReady()` runs before classification
    confirm and policy assign. Drift returns `gateState: 'BLOCKED'` with a
    builder-readable message — no ledger event is emitted against an unmigrated DB.
-3. **Running server** — `GET /api/health` returns **503 `degraded`** when the
-   connected project is behind the code, so orchestrators/smoke checks refuse to
-   treat a drifted deployment as healthy. A one-time `console.error` logs the drift
-   (project ref, expected version, missing objects) per isolate.
-4. **Diagnostic** — `GET /api/system/schema-check` returns the full
-   expected-vs-current diff (project ref + host only). This is the check that would
-   have caught the Gate 03 mismatch in seconds.
+3. **Running server (public, generic)** — `GET /api/health` returns **503
+   `degraded`** when the connected project is behind the code, so
+   orchestrators/smoke checks refuse to treat a drifted deployment as healthy.
+   The public body is **generic** (`{status, timestamp}`) — it never leaks project
+   ref, host, expected version, or missing-object names. A one-time `console.error`
+   still logs the full drift server-side per isolate.
+4. **Diagnostic (authenticated)** — `GET /api/system/schema-check` requires an
+   authenticated QHUB session (`401` otherwise) and returns the full
+   expected-vs-current diff (project ref + host only, never keys). This is the
+   operator check that would have caught the Gate 03 mismatch in seconds.
 5. **Deploy gate** — `npm run deploy` runs `schema:check` first; a target project
-   missing any required object **fails the deploy**. Escape hatch:
-   `QHUB_SKIP_SCHEMA_CHECK=1` (logged, not recommended).
+   missing any required object **fails the deploy**. The bypass
+   (`QHUB_SKIP_SCHEMA_CHECK=1`) is **staging-only**: it is honored solely with a
+   staging marker (`QHUB_DEPLOY_ENV=staging|preview` or a `FLY_APP_NAME` containing
+   "staging") and is **always refused in production**
+   (`isDeployBypassAuthorized`). It governs only the predeploy convenience skip —
+   runtime enforcement (layers 1–3) is independent and never bypassable.
 
 ## Trust & secret discipline
 
@@ -85,10 +92,16 @@ route.
 ## Verification
 
 - `tsc --noEmit` — 0 errors.
-- `vitest --run` — 116 passing, including `app/test/schema-contract.test.ts`
-  (classifier codes, the exact Gate-03 closure messages, transient-error
-  exclusion, required-object coverage) and the existing governance/policy suites
-  (unchanged behaviour; the schema guard is mocked ready there — drift is covered
-  by the contract test).
-- `scripts/schema-smoke-check.mjs` — verified fail-closed on missing creds,
-  unreachable project, and honoured the skip override; prints no secrets.
+- `vitest --run` — 127 passing, including:
+  - `app/test/schema-contract.test.ts` — classifier codes, the exact Gate-03
+    closure messages, transient-error exclusion, required-object coverage.
+  - `app/test/schema-routes.test.ts` — **route-level fail-closed**: `/api/health`
+    generic (200/503, no leak), `/api/system/schema-check` authorization
+    (401 unauthenticated / 200 authenticated / 503 behind), governance
+    classification-confirm & policy-assign **BLOCKED** with no ledger event when
+    the schema is behind, and the **staging-only** deploy-bypass matrix.
+  - the existing governance/policy suites (Gate 03 regression — unchanged
+    behaviour; the schema guard is mocked ready there).
+- `scripts/schema-smoke-check.mjs` — verified fail-closed on missing creds and
+  unreachable project; the bypass is refused without a staging marker and in
+  production, honoured only for an authorized staging context; prints no secrets.
