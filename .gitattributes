@@ -1,3 +1,28 @@
+# Normalize line endings to LF in the repo and force LF in the working tree,
+# overriding core.autocrlf=true on Windows checkouts. The ESLint config enforces
+# 'linebreak-style: unix' and prettier/prettier defaults to LF, so a CRLF working
+# copy makes every source file fail lint. Keeping the working tree LF lets the
+# husky pre-commit hook (typecheck + eslint) run cleanly on Windows.
+
+# Source
+*.ts    text eol=lf
+*.tsx   text eol=lf
+*.js    text eol=lf
+*.jsx   text eol=lf
+*.mjs   text eol=lf
+*.cjs   text eol=lf
+
+# Config / data / docs
+*.json  text eol=lf
+*.jsonc text eol=lf
+*.md    text eol=lf
+*.mdx   text eol=lf
+*.css   text eol=lf
+*.scss  text eol=lf
+*.html  text eol=lf
+*.yml   text eol=lf
+*.yaml  text eol=lf
+
 # Shell scripts MUST use LF regardless of the checkout platform.
 # On Windows (core.autocrlf=true) a CRLF shebang breaks execution in Docker/Linux.
 *.sh text eol=lf
