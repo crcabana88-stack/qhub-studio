@@ -37,7 +37,7 @@
  *   SUPABASE_SERVICE_ROLE_KEY   Service role key (bypasses RLS) — server only
  */
 
-import { createHmac } from 'node:crypto';
+import { createHmac, createHash, randomUUID } from 'node:crypto';
 import {
   getOrCreateQhubApp,
   persistChainId,
@@ -45,6 +45,11 @@ import {
   persistClassification,
   getClassification,
   getPersistedRiskTier,
+  getProposal,
+  markProposalConsumed,
+  persistPolicyProfile,
+  getPolicyProfile,
+  updatePolicyStatus,
 } from './qhub-app.server';
 import {
   maxTier,
@@ -54,6 +59,8 @@ import {
   type RiskTier,
 } from './classification';
 import { computeRiskFloor } from './classification-rules';
+import { buildPolicyProfile, canonicalPolicyString, type PolicyEngineInput } from './policy-engine';
+import type { PolicyProfile } from './policy';
 
 // ─── Gate state machine ───────────────────────────────────────────────────────
 
@@ -74,20 +81,32 @@ export type GovernanceIntent =
       action: 'CLASSIFICATION_CONFIRMED';
       conversationId: string;
       projectTitle?: string;
-      classification: ClassificationResult;
+
+      /**
+       * Opaque id of a server-persisted classification proposal. The server
+       * reloads the authoritative signals from this id — the browser cannot
+       * rewrite them. `confirmedTier` is the only classification input the
+       * browser supplies, and it can only RAISE the tier above the floor.
+       */
+      proposalId: string;
       confirmedTier: RiskTier;
       builderProjectId?: string;
-    };
+    }
+  | { action: 'POLICY_ASSIGN'; conversationId: string; builderProjectId?: string }
+  | { action: 'POLICY_ACKNOWLEDGE'; conversationId: string; builderProjectId?: string };
 
-// ─── Lambda v2.6 caller event body ───────────────────────────────────────────
-// These are exactly the 7 fields the caller sends. No more, no less.
-// Lambda computes: spec_version, event_id, seq, prev_event_hash, event_hash, timestamp.
+/*
+ * ─── Lambda v2.6 caller event body ───────────────────────────────────────────
+ * These are exactly the 7 fields the caller sends. No more, no less.
+ * Lambda computes: spec_version, event_id, seq, prev_event_hash, event_hash, timestamp.
+ */
 
 type LambdaEventType =
   | 'CHAIN_GENESIS'
   | 'APP_SUBMITTED'
-  | 'AI_MODEL_INVOKED'         // v2.6 — AI/LLM model invoked during development
+  | 'AI_MODEL_INVOKED' // v2.6 — AI/LLM model invoked during development
   | 'CLASSIFICATION_ASSIGNED'
+  | 'POLICY_PROFILE_ASSIGNED' // Gate 03 — deterministic policy profile bound to the app
   | 'GATE_PASSED'
   | 'GATE_FAILED'
   | 'ATTESTATION_SIGNED'
@@ -105,12 +124,13 @@ type LedgerRiskTier = 'UNCLASSIFIED' | RiskTier;
 interface LambdaEventBody {
   chain_id?: string;
   event_type: LambdaEventType;
-  app_id: string;        // qhub_app_id (Quantex-owned UUID)
-  client_id: string;     // orgId (tenant)
+  app_id: string; // qhub_app_id (Quantex-owned UUID)
+  client_id: string; // orgId (tenant)
   actor: {
     id: string;
     type: 'human' | 'system';
     identity_provider: string;
+
     // display_name omitted when absent (v2.4 Option A: null ≡ absent)
   };
   payload: Record<string, unknown>;
@@ -141,6 +161,10 @@ export interface GovernanceResult {
   qhubAppId?: string;
   riskTier?: RiskTier;
   riskFloor?: RiskTier;
+
+  /** Present for POLICY_ASSIGN / POLICY_ACKNOWLEDGE — browser-safe, no secrets. */
+  policyProfile?: PolicyProfile;
+  policyStatus?: string;
   error?: string;
 }
 
@@ -160,10 +184,7 @@ export class GovernanceService {
       process.env.QHUB_API_BASE ??
       'https://api.quantex-tech.com';
 
-    this.apiBase =
-      ctx.env.QHUB_API_BASE ??
-      process.env.QHUB_API_BASE ??
-      this.ingestUrl;
+    this.apiBase = ctx.env.QHUB_API_BASE ?? process.env.QHUB_API_BASE ?? this.ingestUrl;
 
     // DO NOT log this value.
     this.hmacSecret = ctx.env.QHUB_HMAC_SECRET ?? process.env.QHUB_HMAC_SECRET ?? '';
@@ -184,19 +205,26 @@ export class GovernanceService {
         return this.checkDeploymentGate(intent);
       case 'CLASSIFICATION_CONFIRMED':
         return this.recordClassification(intent);
+      case 'POLICY_ASSIGN':
+        return this.recordPolicyProfile(intent);
+      case 'POLICY_ACKNOWLEDGE':
+        return this.acknowledgePolicy(intent);
       default:
         return { ok: false, error: 'Unknown governance intent' };
     }
   }
 
-  // ── CHAIN_GENESIS ──────────────────────────────────────────────────────────
-  // Creates permanent QHUB app identity, fires genesis, persists chain_id.
+  /*
+   * ── CHAIN_GENESIS ──────────────────────────────────────────────────────────
+   * Creates permanent QHUB app identity, fires genesis, persists chain_id.
+   */
 
   private async recordGenesis(
     intent: Extract<GovernanceIntent, { action: 'PROJECT_CREATED' }>,
   ): Promise<GovernanceResult> {
     // Step 1: Get or create permanent QHUB app identity
     let appRecord;
+
     try {
       appRecord = await getOrCreateQhubApp(
         {
@@ -209,17 +237,20 @@ export class GovernanceService {
       );
     } catch (err) {
       console.error('[GovernanceService] Failed to get/create app record:', err);
-      // If Supabase is unavailable, we cannot safely fire genesis without
-      // a stable qhub_app_id. Return error — do not use a transient ID.
+
+      /*
+       * If Supabase is unavailable, we cannot safely fire genesis without
+       * a stable qhub_app_id. Return error — do not use a transient ID.
+       */
       return { ok: false, error: 'Could not establish QHUB app identity' };
     }
 
-    // If genesis was already committed for this app, return the existing chain_id.
-    // This makes recordGenesis idempotent on replay/retry.
+    /*
+     * If genesis was already committed for this app, return the existing chain_id.
+     * This makes recordGenesis idempotent on replay/retry.
+     */
     if (appRecord.chain_id) {
-      console.log(
-        `[GovernanceService] Genesis already committed for qhub_app_id=${appRecord.qhub_app_id}`,
-      );
+      console.log(`[GovernanceService] Genesis already committed for qhub_app_id=${appRecord.qhub_app_id}`);
       return { ok: true, chainId: appRecord.chain_id, qhubAppId: appRecord.qhub_app_id };
     }
 
@@ -227,7 +258,7 @@ export class GovernanceService {
     const body: LambdaEventBody = {
       // chain_id intentionally omitted — Lambda generates UUID, seq=1
       event_type: 'CHAIN_GENESIS',
-      app_id: appRecord.qhub_app_id,   // Quantex-owned stable UUID
+      app_id: appRecord.qhub_app_id, // Quantex-owned stable UUID
       client_id: this.ctx.orgId,
       actor: {
         id: this.ctx.userId,
@@ -245,11 +276,13 @@ export class GovernanceService {
     };
 
     const result = await this.postEvent(body);
+
     if (!result.ok || !result.data) {
       return { ok: false, error: 'Lambda rejected CHAIN_GENESIS', qhubAppId: appRecord.qhub_app_id };
     }
 
     const chainId = result.data.chain_id;
+
     if (!chainId) {
       console.error('[GovernanceService] Lambda response missing chain_id');
       return { ok: false, error: 'Lambda did not return chain_id', qhubAppId: appRecord.qhub_app_id };
@@ -265,17 +298,51 @@ export class GovernanceService {
     return { ok: true, chainId, qhubAppId: appRecord.qhub_app_id };
   }
 
-  // ── CLASSIFICATION_ASSIGNED (Gate 02) ──────────────────────────────────────
-  // Emits the classification onto the app chain. The deterministic floor is
-  // ALWAYS re-computed server-side from the signals — the confirmed tier can
-  // raise it but never lower it below the floor (downgrade blocked, spec §8).
-  // Genesis is guaranteed first: CLASSIFY is lifecycle stage 01, so it also
-  // opens the chain if the build hasn't already.
+  /*
+   * ── CLASSIFICATION_ASSIGNED (Gate 02) ──────────────────────────────────────
+   * Emits the classification onto the app chain. The deterministic floor is
+   * ALWAYS re-computed server-side from the signals — the confirmed tier can
+   * raise it but never lower it below the floor (downgrade blocked, spec §8).
+   * Genesis is guaranteed first: CLASSIFY is lifecycle stage 01, so it also
+   * opens the chain if the build hasn't already.
+   */
 
   private async recordClassification(
     intent: Extract<GovernanceIntent, { action: 'CLASSIFICATION_CONFIRMED' }>,
   ): Promise<GovernanceResult> {
+    /*
+     * Gate 03 Phase 0: authoritative signals come from the server-persisted
+     * proposal, never from the browser. Confirming without a valid, live,
+     * single-use proposal fails closed.
+     */
+    if (!intent.proposalId) {
+      return { ok: false, error: 'Missing classification proposal reference' };
+    }
+
+    const proposal = await getProposal(intent.proposalId, this.ctx.env);
+
+    if (!proposal) {
+      return { ok: false, error: 'Classification proposal not found or expired' };
+    }
+
+    if (proposal.org_id !== this.ctx.orgId) {
+      // Proposal belongs to another tenant — refuse.
+      console.error('[GovernanceService] classification: proposal org mismatch');
+      return { ok: false, error: 'Classification proposal not valid for this tenant' };
+    }
+
+    if (proposal.status !== 'PENDING') {
+      return { ok: false, error: 'Classification proposal already consumed' };
+    }
+
+    if (new Date(proposal.expires_at).getTime() < Date.now()) {
+      return { ok: false, error: 'Classification proposal expired — please re-run classification' };
+    }
+
+    const provisional = proposal.provisional; // authoritative ClassificationResult
+
     let appRecord;
+
     try {
       appRecord = await getOrCreateQhubApp(
         {
@@ -293,6 +360,7 @@ export class GovernanceService {
 
     // Ensure the chain exists (genesis is seq=1; classification attaches after).
     let chainId = appRecord.chain_id ?? (await getChainId(intent.conversationId, this.ctx.orgId, this.ctx.env));
+
     if (!chainId) {
       const genesis = await this.recordGenesis({
         action: 'PROJECT_CREATED',
@@ -300,24 +368,28 @@ export class GovernanceService {
         projectTitle: intent.projectTitle ?? 'Untitled project',
         builderProjectId: intent.builderProjectId,
       });
+
       if (!genesis.ok || !genesis.chainId) {
         return { ok: false, error: 'Genesis failed before classification' };
       }
+
       chainId = genesis.chainId;
     }
 
-    // Re-derive the deterministic floor from the submitted signals. Never trust
-    // a browser-supplied floor. Final tier can only be >= floor.
+    /*
+     * Re-derive the deterministic floor from the AUTHORITATIVE proposal signals.
+     * Never trust a browser-supplied floor or signals. Final tier can only be >= floor.
+     */
     const signals: ClassificationSignals = {
-      data_classes: intent.classification.data_classes,
-      integration_types: intent.classification.integration_types,
-      ai_behavior: intent.classification.ai_behavior,
-      autonomy_level: intent.classification.autonomy_level,
-      deployment_surface: intent.classification.deployment_surface,
-      regulatory_domains: intent.classification.regulatory_domains,
+      data_classes: provisional.data_classes,
+      integration_types: provisional.integration_types,
+      ai_behavior: provisional.ai_behavior,
+      autonomy_level: provisional.autonomy_level,
+      deployment_surface: provisional.deployment_surface,
+      regulatory_domains: provisional.regulatory_domains,
     };
     const { floor } = computeRiskFloor(signals);
-    const confirmedTier = intent.confirmedTier ?? intent.classification.risk_tier;
+    const confirmedTier = intent.confirmedTier ?? provisional.risk_tier;
     const downgradeBlocked = tierRank(confirmedTier) < tierRank(floor);
     const finalTier = maxTier(floor, confirmedTier); // >= floor, always
 
@@ -326,10 +398,10 @@ export class GovernanceService {
     const version = (existing?.classification_version ?? 0) + 1;
 
     const method: ClassificationResult['classification_method'] =
-      finalTier === intent.classification.ai_proposed_tier ? 'HUMAN_CONFIRMED' : 'HUMAN_CORRECTED';
+      finalTier === provisional.ai_proposed_tier ? 'HUMAN_CONFIRMED' : 'HUMAN_CORRECTED';
 
     const finalClassification: ClassificationResult = {
-      ...intent.classification,
+      ...provisional,
       classification_version: version,
       risk_tier: finalTier,
       risk_floor: floor,
@@ -352,7 +424,7 @@ export class GovernanceService {
         classification_version: version,
         risk_tier: finalTier,
         risk_floor: floor,
-        ai_proposed_tier: intent.classification.ai_proposed_tier,
+        ai_proposed_tier: provisional.ai_proposed_tier,
         classification_method: method,
         regulatory_domains: finalClassification.regulatory_domains,
         data_classes: finalClassification.data_classes,
@@ -374,11 +446,13 @@ export class GovernanceService {
     };
 
     const result = await this.postEvent(body);
+
     if (!result.ok) {
       return { ok: false, error: 'Lambda rejected CLASSIFICATION_ASSIGNED', qhubAppId: appRecord.qhub_app_id };
     }
 
     await persistClassification(appRecord.qhub_app_id, finalClassification, this.ctx.env);
+    await markProposalConsumed(intent.proposalId, this.ctx.env); // single-use
 
     console.log(
       `[GovernanceService] CLASSIFICATION_ASSIGNED committed — qhub_app_id=${appRecord.qhub_app_id} risk_tier=${finalTier} floor=${floor} v=${version}${downgradeBlocked ? ' (below-floor downgrade blocked)' : ''}`,
@@ -387,9 +461,193 @@ export class GovernanceService {
     return { ok: true, qhubAppId: appRecord.qhub_app_id, riskTier: finalTier, riskFloor: floor };
   }
 
-  // ── AI_MODEL_INVOKED ───────────────────────────────────────────────────────
-  // v2.6 canonical event type for AI/LLM invocations during code generation.
-  // NOT APP_SUBMITTED. See event-schema-v2.6.md.
+  /*
+   * ── POLICY_PROFILE_ASSIGNED (Gate 03) ──────────────────────────────────────
+   * Given the CONFIRMED classification (loaded server-side — never from the
+   * browser), the deterministic engine produces the policy profile from the
+   * versioned catalog. The full profile is persisted as the operational
+   * snapshot; a COMPACT event (ids/hash/counts, not the whole document) is
+   * written to the immutable chain.
+   */
+
+  private async recordPolicyProfile(
+    intent: Extract<GovernanceIntent, { action: 'POLICY_ASSIGN' }>,
+  ): Promise<GovernanceResult> {
+    let appRecord;
+
+    try {
+      appRecord = await getOrCreateQhubApp(
+        {
+          orgId: this.ctx.orgId,
+          userId: this.ctx.userId,
+          conversationId: intent.conversationId,
+          builderProjectId: intent.builderProjectId,
+        },
+        this.ctx.env,
+      );
+    } catch (err) {
+      console.error('[GovernanceService] policy: app lookup failed:', err);
+      return { ok: false, error: 'Could not establish QHUB app identity' };
+    }
+
+    // Policy REQUIRES a confirmed classification. Load it server-side.
+    const classification = await getClassification(appRecord.qhub_app_id, this.ctx.env);
+
+    if (!classification || classification.risk_tier == null) {
+      return { ok: false, error: 'Classification required before policy assignment (Gate 02 not complete).' };
+    }
+
+    const chainId = appRecord.chain_id ?? (await getChainId(intent.conversationId, this.ctx.orgId, this.ctx.env));
+
+    if (!chainId) {
+      return { ok: false, error: 'No governance chain — classification must be committed first.' };
+    }
+
+    // Idempotency: if a profile is already bound to this classification version, return it.
+    const existingProfile = await getPolicyProfile(appRecord.qhub_app_id, this.ctx.env);
+
+    if (
+      existingProfile &&
+      existingProfile.classification_version === classification.classification_version &&
+      existingProfile.policy_catalog_version // sanity
+    ) {
+      return {
+        ok: true,
+        qhubAppId: appRecord.qhub_app_id,
+        policyProfile: existingProfile,
+        policyStatus: existingProfile.status,
+        riskTier: classification.risk_tier,
+      };
+    }
+
+    // Determine the next profile version (a reclassification supersedes prior policy).
+    const nextVersion = (existingProfile?.policy_profile_version ?? 0) + 1;
+
+    const engineInput: PolicyEngineInput = {
+      qhub_app_id: appRecord.qhub_app_id,
+      classification_version: classification.classification_version,
+      classification_reference: chainId,
+      risk_tier: classification.risk_tier,
+      regulatory_domains: classification.regulatory_domains,
+      signals: {
+        data_classes: classification.data_classes,
+        integration_types: classification.integration_types,
+        ai_behavior: classification.ai_behavior,
+        autonomy_level: classification.autonomy_level,
+        deployment_surface: classification.deployment_surface,
+        regulatory_domains: classification.regulatory_domains,
+      },
+      policy_profile_version: nextVersion,
+      generated_by: this.ctx.userId,
+    };
+
+    const profile = buildPolicyProfile(engineInput);
+
+    // Server-only stamping: id, hash, timestamp, status.
+    profile.policy_profile_id = randomUUID();
+    profile.generated_at = new Date().toISOString();
+    profile.policy_profile_hash = createHash('sha256').update(canonicalPolicyString(profile)).digest('hex');
+    profile.status = 'ASSIGNED';
+
+    // COMPACT ledger payload — ids, hash, counts, and mandatory summary only.
+    const body: LambdaEventBody = {
+      chain_id: chainId,
+      event_type: 'POLICY_PROFILE_ASSIGNED',
+      app_id: appRecord.qhub_app_id,
+      client_id: this.ctx.orgId,
+      actor: { id: this.ctx.userId, type: 'human', identity_provider: 'supabase' },
+      payload: {
+        policy_profile_id: profile.policy_profile_id,
+        policy_profile_version: profile.policy_profile_version,
+        policy_catalog_version: profile.policy_catalog_version,
+        policy_profile_hash: profile.policy_profile_hash,
+        classification_version: profile.classification_version,
+        risk_tier: profile.risk_tier,
+        regulatory_domains: profile.regulatory_domains,
+        required_control_ids: profile.required_controls.map((c) => c.control_id),
+        conditional_control_count: profile.conditional_controls.length,
+        advisory_control_count: profile.advisory_controls.length,
+        required_attestations: profile.required_attestations,
+        session_id: this.ctx.sessionId,
+        source: 'qhub-studio',
+      },
+      risk_tier: profile.risk_tier,
+    };
+
+    const result = await this.postEvent(body);
+
+    if (!result.ok) {
+      return { ok: false, error: 'Lambda rejected POLICY_PROFILE_ASSIGNED', qhubAppId: appRecord.qhub_app_id };
+    }
+
+    await persistPolicyProfile(appRecord.qhub_app_id, profile, this.ctx.env);
+
+    console.log(
+      `[GovernanceService] POLICY_PROFILE_ASSIGNED committed — qhub_app_id=${appRecord.qhub_app_id} tier=${profile.risk_tier} v=${profile.policy_profile_version} required=${profile.required_controls.length} hash=${profile.policy_profile_hash.slice(0, 12)}…`,
+    );
+
+    return {
+      ok: true,
+      qhubAppId: appRecord.qhub_app_id,
+      policyProfile: profile,
+      policyStatus: profile.status,
+      riskTier: profile.risk_tier,
+    };
+  }
+
+  /*
+   * ── POLICY ACKNOWLEDGE ─────────────────────────────────────────────────────
+   * The builder acknowledges the assigned controls. This flips the operational
+   * status ASSIGNED → ACKNOWLEDGED, which the build gate requires before code
+   * generation. No new chain event type is minted (the assignment is already
+   * on-chain); acknowledgement is an operational state transition.
+   */
+
+  private async acknowledgePolicy(
+    intent: Extract<GovernanceIntent, { action: 'POLICY_ACKNOWLEDGE' }>,
+  ): Promise<GovernanceResult> {
+    let appRecord;
+
+    try {
+      appRecord = await getOrCreateQhubApp(
+        {
+          orgId: this.ctx.orgId,
+          userId: this.ctx.userId,
+          conversationId: intent.conversationId,
+          builderProjectId: intent.builderProjectId,
+        },
+        this.ctx.env,
+      );
+    } catch (err) {
+      console.error('[GovernanceService] policy ack: app lookup failed:', err);
+      return { ok: false, error: 'Could not establish QHUB app identity' };
+    }
+
+    const profile = await getPolicyProfile(appRecord.qhub_app_id, this.ctx.env);
+
+    if (!profile) {
+      return { ok: false, error: 'No policy profile to acknowledge.' };
+    }
+
+    if (profile.status === 'ACKNOWLEDGED') {
+      return { ok: true, qhubAppId: appRecord.qhub_app_id, policyProfile: profile, policyStatus: 'ACKNOWLEDGED' };
+    }
+
+    await updatePolicyStatus(appRecord.qhub_app_id, 'ACKNOWLEDGED', this.ctx.env);
+    profile.status = 'ACKNOWLEDGED';
+
+    console.log(
+      `[GovernanceService] policy ACKNOWLEDGED — qhub_app_id=${appRecord.qhub_app_id} v=${profile.policy_profile_version}`,
+    );
+
+    return { ok: true, qhubAppId: appRecord.qhub_app_id, policyProfile: profile, policyStatus: 'ACKNOWLEDGED' };
+  }
+
+  /*
+   * ── AI_MODEL_INVOKED ───────────────────────────────────────────────────────
+   * v2.6 canonical event type for AI/LLM invocations during code generation.
+   * NOT APP_SUBMITTED. See event-schema-v2.6.md.
+   */
 
   async recordAiModelInvokedDirect(params: {
     conversationId: string;
@@ -403,6 +661,7 @@ export class GovernanceService {
     }
 
     let appRecord;
+
     try {
       appRecord = await getOrCreateQhubApp(
         {
@@ -419,8 +678,7 @@ export class GovernanceService {
     }
 
     // chain_id may be null if genesis hasn't fired yet (e.g. AI call before project save)
-    const chainId = appRecord.chain_id ??
-      await getChainId(params.conversationId, this.ctx.orgId, this.ctx.env);
+    const chainId = appRecord.chain_id ?? (await getChainId(params.conversationId, this.ctx.orgId, this.ctx.env));
 
     // Gate 02: stamp the REAL persisted tier (UNCLASSIFIED until classification confirmed).
     const riskTier = await getPersistedRiskTier(params.conversationId, this.ctx.orgId, this.ctx.env);
@@ -447,6 +705,7 @@ export class GovernanceService {
     };
 
     const result = await this.postEvent(body);
+
     return { ok: result.ok, qhubAppId: appRecord.qhub_app_id };
   }
 
@@ -467,6 +726,7 @@ export class GovernanceService {
     intent: Extract<GovernanceIntent, { action: 'DEPLOYMENT_GATE_CHECK' }>,
   ): Promise<GovernanceResult> {
     let appRecord;
+
     try {
       appRecord = await getOrCreateQhubApp(
         {
@@ -483,17 +743,19 @@ export class GovernanceService {
     }
 
     const attestationState = await this.queryGateState(appRecord.qhub_app_id);
-    const chainId = appRecord.chain_id ??
-      await getChainId(intent.conversationId, this.ctx.orgId, this.ctx.env);
+    const chainId = appRecord.chain_id ?? (await getChainId(intent.conversationId, this.ctx.orgId, this.ctx.env));
     const riskTier = await getPersistedRiskTier(intent.conversationId, this.ctx.orgId, this.ctx.env);
 
-    // Gate 02 tier consequences (§8 — minimal; the full Policy Engine is Gate 03):
-    //   UNCLASSIFIED → blocked (must classify first)
-    //   T0/T1        → permitted under baseline controls once classified
-    //   T2           → production requires owner attestation
-    //   T3           → production requires authorized governance/compliance approval
+    /*
+     * Gate 02 tier consequences (§8 — minimal; the full Policy Engine is Gate 03):
+     *   UNCLASSIFIED → blocked (must classify first)
+     *   T0/T1        → permitted under baseline controls once classified
+     *   T2           → production requires owner attestation
+     *   T3           → production requires authorized governance/compliance approval
+     */
     let gateState: GateState;
     let reason: string | undefined;
+
     if (riskTier === 'UNCLASSIFIED') {
       gateState = 'BLOCKED';
       reason = 'Classification required before deployment (Gate 02 CLASSIFY not completed).';
@@ -501,11 +763,13 @@ export class GovernanceService {
       gateState = 'APPROVED';
     } else if (riskTier === 'T2') {
       gateState = attestationState === 'APPROVED' ? 'APPROVED' : 'BLOCKED';
+
       if (gateState !== 'APPROVED') {
         reason = 'T2 Elevated: production deployment requires owner attestation.';
       }
     } else {
       gateState = attestationState === 'APPROVED' ? 'APPROVED' : 'BLOCKED';
+
       if (gateState !== 'APPROVED') {
         reason =
           'T3 High: production deployment requires authorized governance/compliance/security approval; builds are limited to isolated preview.';
@@ -539,6 +803,7 @@ export class GovernanceService {
     };
 
     const result = await this.postEvent(body);
+
     return {
       ok: result.ok,
       gateState,
@@ -568,6 +833,7 @@ export class GovernanceService {
       if (data.gate_passed === true || data.attestation_status === 'ATTESTED') {
         return 'APPROVED';
       }
+
       return 'BLOCKED';
     } catch (err) {
       console.error('[GovernanceService] gate query failed:', err);
@@ -591,9 +857,7 @@ export class GovernanceService {
    * Uses QHUB_LEDGER_INGEST_URL (server-to-server only).
    * Returns { ok, data } — data contains chain_id, event_id, seq, event_hash.
    */
-  private async postEvent(
-    body: LambdaEventBody,
-  ): Promise<{ ok: boolean; data?: LambdaIngestResponse }> {
+  private async postEvent(body: LambdaEventBody): Promise<{ ok: boolean; data?: LambdaIngestResponse }> {
     const payload = JSON.stringify(body);
     const signature = this.sign(payload);
 
@@ -611,10 +875,12 @@ export class GovernanceService {
       if (!res.ok) {
         const text = await res.text();
         console.error(`[GovernanceService] POST /events → ${res.status}: ${text}`);
+
         return { ok: false };
       }
 
       const data = (await res.json()) as LambdaIngestResponse;
+
       return { ok: true, data };
     } catch (err) {
       console.error('[GovernanceService] POST /events network error:', err);

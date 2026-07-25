@@ -46,10 +46,11 @@ async function postIntent(body: Record<string, unknown>): Promise<GovernanceResp
     if (!res.ok) {
       const text = await res.text().catch(() => '');
       console.error(`[QHUB] Governance: server error ${res.status}`, text);
+
       return { ok: false, gateState: 'ERROR', error: `Server error ${res.status}` };
     }
 
-    return await res.json() as GovernanceResponse;
+    return (await res.json()) as GovernanceResponse;
   } catch (err) {
     console.error('[QHUB] Governance: network error', err);
     return { ok: false, gateState: 'ERROR', error: 'Network error' };
@@ -129,16 +130,26 @@ export async function assertDeploymentGate(intent: GateCheckIntent): Promise<Gat
 // ─── Gate 02: Classification ─────────────────────────────────────────────────
 
 import type { ClassificationResult, RiskTier } from './classification';
+import type { PolicyProfile } from './policy';
+
+export interface ClassificationProposal {
+  classification: ClassificationResult;
+
+  /** Opaque server reference; must be passed back on confirm (Gate 03 Phase 0). */
+  proposalId: string | null;
+}
 
 /**
  * Ask the server to analyze the app description and PROPOSE a classification
- * (deterministic floor + AI). Does NOT write to the ledger.
+ * (deterministic floor + AI). Does NOT write to the ledger. The server persists
+ * the provisional result and returns an opaque proposalId; confirmation binds to
+ * that id so the browser can never rewrite the authoritative signals.
  * Throws on failure so the caller can block the build until classification runs.
  */
 export async function requestClassification(
   description: string,
   conversationId: string,
-): Promise<ClassificationResult> {
+): Promise<ClassificationProposal> {
   const res = await fetch('/api/classify', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -149,12 +160,18 @@ export async function requestClassification(
     throw new Error(`Classification request failed (${res.status})`);
   }
 
-  const data = (await res.json()) as { ok: boolean; classification?: ClassificationResult; error?: string };
+  const data = (await res.json()) as {
+    ok: boolean;
+    classification?: ClassificationResult;
+    proposalId?: string | null;
+    error?: string;
+  };
+
   if (!data.ok || !data.classification) {
     throw new Error(data.error ?? 'Classification failed');
   }
 
-  return data.classification;
+  return { classification: data.classification, proposalId: data.proposalId ?? null };
 }
 
 export interface ConfirmClassificationResult {
@@ -164,14 +181,15 @@ export interface ConfirmClassificationResult {
 }
 
 /**
- * Confirm (or correct) a proposed classification. The server re-derives the
- * deterministic floor and emits the CLASSIFICATION_ASSIGNED ledger event with
+ * Confirm (or correct) a proposed classification. The server reloads the
+ * authoritative signals from the persisted proposal, re-derives the
+ * deterministic floor, and emits the CLASSIFICATION_ASSIGNED ledger event with
  * server-authoritative identity. The confirmed tier can raise but never lower
  * below the floor.
  */
 export async function confirmClassification(intent: {
   conversationId: string;
-  classification: ClassificationResult;
+  proposalId: string;
   confirmedTier: RiskTier;
   projectTitle?: string;
   builderProjectId?: string;
@@ -182,4 +200,48 @@ export async function confirmClassification(intent: {
   })) as ConfirmClassificationResult & { gateState?: GateState };
 
   return { ok: result.ok, riskTier: result.riskTier, error: result.error };
+}
+
+// ─── Gate 03: Policy ─────────────────────────────────────────────────────────
+
+export interface PolicyAssignResult {
+  ok: boolean;
+  policyProfile?: PolicyProfile;
+  policyStatus?: string;
+  riskTier?: RiskTier;
+  error?: string;
+}
+
+/**
+ * Assign the deterministic policy profile for the confirmed classification.
+ * The server builds it from the versioned catalog (never the browser), writes a
+ * compact POLICY_PROFILE_ASSIGNED event to the chain, and persists the full
+ * profile snapshot. Returns the browser-safe profile for display.
+ */
+export async function assignPolicy(intent: {
+  conversationId: string;
+  builderProjectId?: string;
+}): Promise<PolicyAssignResult> {
+  const result = (await postIntent({
+    action: 'POLICY_ASSIGN',
+    ...intent,
+  })) as PolicyAssignResult;
+
+  return result;
+}
+
+/**
+ * Acknowledge the assigned policy controls. Flips ASSIGNED → ACKNOWLEDGED,
+ * which the build gate requires before code generation.
+ */
+export async function acknowledgePolicy(intent: {
+  conversationId: string;
+  builderProjectId?: string;
+}): Promise<PolicyAssignResult> {
+  const result = (await postIntent({
+    action: 'POLICY_ACKNOWLEDGE',
+    ...intent,
+  })) as PolicyAssignResult;
+
+  return result;
 }

@@ -44,6 +44,7 @@ export async function action({ request, context }: ActionFunctionArgs) {
 
   // ── 2. Parse intent ─────────────────────────────────────────────────────────
   let intent: GovernanceIntent;
+
   try {
     intent = await request.json<GovernanceIntent>();
   } catch {
@@ -61,18 +62,23 @@ export async function action({ request, context }: ActionFunctionArgs) {
     'AI_MODEL_USED',
     'DEPLOYMENT_GATE_CHECK',
     'CLASSIFICATION_CONFIRMED',
+    'POLICY_ASSIGN',
+    'POLICY_ACKNOWLEDGE',
   ];
+
   if (!allowedActions.includes(intent.action)) {
     return json({ ok: false, error: `Unknown action: ${intent.action}` }, { status: 400 });
   }
 
-  // ── 3. Build server-authoritative context ──────────────────────────────────
-  // Actor identity comes from the verified server session — not from the browser intent.
+  /*
+   * ── 3. Build server-authoritative context ──────────────────────────────────
+   * Actor identity comes from the verified server session — not from the browser intent.
+   */
   const sessionId = generateStableSessionId(session.userId, intent.conversationId);
 
   const svc = createGovernanceService({
-    userId: session.userId,   // Server-authoritative: from Supabase JWT
-    orgId: session.orgId,     // Server-authoritative: from Supabase user_metadata
+    userId: session.userId, // Server-authoritative: from Supabase JWT
+    orgId: session.orgId, // Server-authoritative: from Supabase user_metadata
     sessionId,
     env,
   });

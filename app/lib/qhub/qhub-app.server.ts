@@ -25,8 +25,10 @@
  *   SUPABASE_SERVICE_ROLE_KEY Service role key — bypasses RLS, never expose to browser
  */
 
+import { createHash } from 'node:crypto';
 import { createClient, type SupabaseClient } from '@supabase/supabase-js';
 import type { ClassificationResult, PersistedRiskTier } from './classification';
+import type { PolicyProfile, PolicyStatus } from './policy';
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -50,13 +52,16 @@ export interface CreateQhubAppParams {
   orgId: string;
   userId: string;
   conversationId: string;
+
   /** bolt.diy urlId — may be null initially, filled in once first artifact is created */
   builderProjectId?: string;
 }
 
-// ─── In-memory cache (optimization — DB is authoritative) ─────────────────────
-// Keyed by conversationId → QhubAppRecord
-// Invalidated on chain_id write and updated_at change.
+/*
+ * ─── In-memory cache (optimization — DB is authoritative) ─────────────────────
+ * Keyed by conversationId → QhubAppRecord
+ * Invalidated on chain_id write and updated_at change.
+ */
 
 const appCache = new Map<string, QhubAppRecord>();
 
@@ -64,13 +69,10 @@ const appCache = new Map<string, QhubAppRecord>();
 
 function getSupabaseAdmin(env: Record<string, string | undefined>): SupabaseClient {
   const url = env.SUPABASE_URL ?? process.env.SUPABASE_URL ?? '';
-  const serviceKey =
-    env.SUPABASE_SERVICE_ROLE_KEY ?? process.env.SUPABASE_SERVICE_ROLE_KEY ?? '';
+  const serviceKey = env.SUPABASE_SERVICE_ROLE_KEY ?? process.env.SUPABASE_SERVICE_ROLE_KEY ?? '';
 
   if (!url || !serviceKey) {
-    throw new Error(
-      '[QhubApp] SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY are required for durable persistence.',
-    );
+    throw new Error('[QhubApp] SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY are required for durable persistence.');
   }
 
   return createClient(url, serviceKey, {
@@ -96,7 +98,10 @@ export async function getOrCreateQhubApp(
 
   // 1. Hot cache hit
   const cached = appCache.get(conversationId);
-  if (cached) return cached;
+
+  if (cached) {
+    return cached;
+  }
 
   const sb = getSupabaseAdmin(env);
 
@@ -124,10 +129,12 @@ export async function getOrCreateQhubApp(
 
       const record = (updated ?? existing) as QhubAppRecord;
       appCache.set(conversationId, record);
+
       return record;
     }
 
     appCache.set(conversationId, existing as QhubAppRecord);
+
     return existing as QhubAppRecord;
   }
 
@@ -152,9 +159,7 @@ export async function getOrCreateQhubApp(
   const record = created as QhubAppRecord;
   appCache.set(conversationId, record);
 
-  console.log(
-    `[QhubApp] Created app record qhub_app_id=${record.qhub_app_id} for conversation=${conversationId}`,
-  );
+  console.log(`[QhubApp] Created app record qhub_app_id=${record.qhub_app_id} for conversation=${conversationId}`);
 
   return record;
 }
@@ -182,11 +187,11 @@ export async function persistChainId(
     .is('chain_id', null); // Only write once — chain_id is immutable after genesis
 
   if (error) {
-    // Log but do not throw — the event was already written to Lambda/DynamoDB.
-    // The chain is intact; only our local record is incomplete.
-    console.error(
-      `[QhubApp] Failed to persist chain_id for qhub_app_id=${qhubAppId}: ${error.message}`,
-    );
+    /*
+     * Log but do not throw — the event was already written to Lambda/DynamoDB.
+     * The chain is intact; only our local record is incomplete.
+     */
+    console.error(`[QhubApp] Failed to persist chain_id for qhub_app_id=${qhubAppId}: ${error.message}`);
     return;
   }
 
@@ -216,7 +221,10 @@ export async function getChainId(
 ): Promise<string | null> {
   // Cache hit
   const cached = appCache.get(conversationId);
-  if (cached) return cached.chain_id;
+
+  if (cached) {
+    return cached.chain_id;
+  }
 
   // DB read
   const sb = getSupabaseAdmin(env);
@@ -277,8 +285,10 @@ export async function persistClassification(
 ): Promise<void> {
   const sb = getSupabaseAdmin(env);
 
-  // Write the tier first (columns that always exist) so subsequent events get
-  // the real tier even if the classification JSONB column hasn't been migrated.
+  /*
+   * Write the tier first (columns that always exist) so subsequent events get
+   * the real tier even if the classification JSONB column hasn't been migrated.
+   */
   const { error: tierErr } = await sb
     .from('qhub_applications')
     .update({ risk_tier: classification.risk_tier, governance_status: 'classified' })
@@ -289,10 +299,7 @@ export async function persistClassification(
   }
 
   // Then the full snapshot (best-effort; requires the 20260725 migration).
-  const { error: jsonErr } = await sb
-    .from('qhub_applications')
-    .update({ classification })
-    .eq('qhub_app_id', qhubAppId);
+  const { error: jsonErr } = await sb.from('qhub_applications').update({ classification }).eq('qhub_app_id', qhubAppId);
 
   if (jsonErr) {
     console.error(
@@ -344,6 +351,7 @@ export async function getPersistedRiskTier(
   env: Record<string, string | undefined>,
 ): Promise<PersistedRiskTier> {
   const cached = appCache.get(conversationId);
+
   if (cached?.risk_tier) {
     return (cached.risk_tier as PersistedRiskTier) ?? 'UNCLASSIFIED';
   }
@@ -362,4 +370,228 @@ export async function getPersistedRiskTier(
   }
 
   return ((data?.risk_tier as PersistedRiskTier) ?? 'UNCLASSIFIED') || 'UNCLASSIFIED';
+}
+
+// ─── Gate 03 Phase 0: classification proposals (server-authoritative) ─────────
+
+export interface ClassificationProposal {
+  proposal_id: string;
+  org_id: string;
+  conversation_id: string | null;
+  qhub_app_id: string | null;
+  description_hash: string;
+  provisional: ClassificationResult;
+  risk_floor: string;
+  ai_proposed_tier: string;
+  classifier_version: string;
+  created_by: string;
+  created_at: string;
+  expires_at: string;
+  status: 'PENDING' | 'CONSUMED' | 'EXPIRED';
+}
+
+const PROPOSAL_TTL_MIN = 30;
+
+/**
+ * Persist a provisional classification and return its proposal_id.
+ * The browser never sees the authoritative signals again — only the id.
+ */
+export async function persistProposal(
+  params: {
+    orgId: string;
+    conversationId: string;
+    description: string;
+    provisional: ClassificationResult;
+    createdBy: string;
+  },
+  env: Record<string, string | undefined>,
+): Promise<string> {
+  const sb = getSupabaseAdmin(env);
+  const description_hash = createHash('sha256').update(params.description).digest('hex');
+  const expires_at = new Date(Date.now() + PROPOSAL_TTL_MIN * 60_000).toISOString();
+
+  const { data, error } = await sb
+    .from('qhub_classification_proposals')
+    .insert({
+      org_id: params.orgId,
+      conversation_id: params.conversationId,
+      description_hash,
+      provisional: params.provisional,
+      risk_floor: params.provisional.risk_floor,
+      ai_proposed_tier: params.provisional.ai_proposed_tier,
+      classifier_version: params.provisional.classifier_version,
+      created_by: params.createdBy,
+      expires_at,
+    })
+    .select('proposal_id')
+    .single();
+
+  if (error || !data) {
+    throw new Error(`[QhubApp] persistProposal failed: ${error?.message ?? 'no id'}`);
+  }
+
+  return data.proposal_id as string;
+}
+
+/** Load a proposal (server-authoritative). Returns null if not found. */
+export async function getProposal(
+  proposalId: string,
+  env: Record<string, string | undefined>,
+): Promise<ClassificationProposal | null> {
+  const sb = getSupabaseAdmin(env);
+  const { data, error } = await sb
+    .from('qhub_classification_proposals')
+    .select('*')
+    .eq('proposal_id', proposalId)
+    .maybeSingle();
+
+  if (error) {
+    console.error(`[QhubApp] getProposal failed: ${error.message}`);
+    return null;
+  }
+
+  return (data as ClassificationProposal | null) ?? null;
+}
+
+/** Mark a proposal consumed (single-use). Returns true if it transitioned. */
+export async function markProposalConsumed(proposalId: string, env: Record<string, string | undefined>): Promise<void> {
+  const sb = getSupabaseAdmin(env);
+  const { error } = await sb
+    .from('qhub_classification_proposals')
+    .update({ status: 'CONSUMED' })
+    .eq('proposal_id', proposalId)
+    .eq('status', 'PENDING');
+
+  if (error) {
+    console.error(`[QhubApp] markProposalConsumed failed: ${error.message}`);
+  }
+}
+
+// ─── Gate 03: policy snapshot persistence ─────────────────────────────────────
+
+/** Atomically persist the current policy profile snapshot on the app record. */
+export async function persistPolicyProfile(
+  qhubAppId: string,
+  profile: PolicyProfile,
+  env: Record<string, string | undefined>,
+): Promise<void> {
+  const sb = getSupabaseAdmin(env);
+  const { error } = await sb
+    .from('qhub_applications')
+    .update({
+      policy_profile_id: profile.policy_profile_id,
+      policy_profile_version: profile.policy_profile_version,
+      policy_catalog_version: profile.policy_catalog_version,
+      policy_profile: profile,
+      policy_profile_hash: profile.policy_profile_hash,
+      policy_status: profile.status,
+      policy_assigned_at: profile.generated_at,
+      policy_assigned_by: profile.generated_by,
+    })
+    .eq('qhub_app_id', qhubAppId);
+
+  if (error) {
+    console.error(`[QhubApp] persistPolicyProfile failed for ${qhubAppId}: ${error.message}`);
+    return;
+  }
+
+  for (const [convId, record] of appCache.entries()) {
+    if (record.qhub_app_id === qhubAppId) {
+      appCache.delete(convId);
+      break;
+    }
+  }
+  console.log(
+    `[QhubApp] policy profile persisted qhub_app_id=${qhubAppId} tier=${profile.risk_tier} v=${profile.policy_profile_version} status=${profile.status}`,
+  );
+}
+
+/** Read the full persisted policy profile for a conversation's app (null until assigned). */
+export async function getPolicyProfileByConversation(
+  conversationId: string,
+  orgId: string,
+  env: Record<string, string | undefined>,
+): Promise<PolicyProfile | null> {
+  const sb = getSupabaseAdmin(env);
+  const { data, error } = await sb
+    .from('qhub_applications')
+    .select('policy_profile')
+    .eq('conversation_id', conversationId)
+    .eq('org_id', orgId)
+    .maybeSingle();
+
+  if (error) {
+    console.error(`[QhubApp] getPolicyProfileByConversation failed: ${error.message}`);
+    return null;
+  }
+
+  return (data?.policy_profile as PolicyProfile | null) ?? null;
+}
+
+/** Read the current persisted policy profile (null until assigned). */
+export async function getPolicyProfile(
+  qhubAppId: string,
+  env: Record<string, string | undefined>,
+): Promise<PolicyProfile | null> {
+  const sb = getSupabaseAdmin(env);
+  const { data, error } = await sb
+    .from('qhub_applications')
+    .select('policy_profile')
+    .eq('qhub_app_id', qhubAppId)
+    .maybeSingle();
+
+  if (error) {
+    console.error(`[QhubApp] getPolicyProfile failed for ${qhubAppId}: ${error.message}`);
+    return null;
+  }
+
+  return (data?.policy_profile as PolicyProfile | null) ?? null;
+}
+
+/** Read the current policy profile + status for a conversation's app. */
+export async function getPolicySnapshot(
+  conversationId: string,
+  orgId: string,
+  env: Record<string, string | undefined>,
+): Promise<{
+  policy_profile_id: string | null;
+  policy_profile_version: number | null;
+  policy_profile_hash: string | null;
+  policy_status: PolicyStatus | null;
+} | null> {
+  const sb = getSupabaseAdmin(env);
+  const { data, error } = await sb
+    .from('qhub_applications')
+    .select('policy_profile_id, policy_profile_version, policy_profile_hash, policy_status')
+    .eq('conversation_id', conversationId)
+    .eq('org_id', orgId)
+    .maybeSingle();
+
+  if (error) {
+    console.error(`[QhubApp] getPolicySnapshot failed: ${error.message}`);
+    return null;
+  }
+
+  return (data as any) ?? null;
+}
+
+/** Update just the policy status (e.g. ACKNOWLEDGED). */
+export async function updatePolicyStatus(
+  qhubAppId: string,
+  status: PolicyStatus,
+  env: Record<string, string | undefined>,
+): Promise<void> {
+  const sb = getSupabaseAdmin(env);
+  const { error } = await sb.from('qhub_applications').update({ policy_status: status }).eq('qhub_app_id', qhubAppId);
+
+  if (error) {
+    console.error(`[QhubApp] updatePolicyStatus failed for ${qhubAppId}: ${error.message}`);
+  } else {
+    for (const [convId, record] of appCache.entries()) {
+      if (record.qhub_app_id === qhubAppId) {
+        appCache.delete(convId);
+        break;
+      }
+    }
+  }
 }

@@ -19,9 +19,16 @@ import type { ProviderInfo } from '~/types/model';
 import { useSearchParams, useRouteLoaderData } from '@remix-run/react';
 import { useQHubPromptSeed } from '~/lib/hooks/useQHubPromptSeed';
 import { postGovernanceEvent } from '~/lib/qhub/messenger';
-import { requestClassification, confirmClassification } from '~/lib/qhub/governance-client';
+import {
+  requestClassification,
+  confirmClassification,
+  assignPolicy,
+  acknowledgePolicy,
+} from '~/lib/qhub/governance-client';
 import { ClassificationCard } from './ClassificationCard';
+import { PolicyCard } from './PolicyCard';
 import type { ClassificationResult, RiskTier } from '~/lib/qhub/classification';
+import type { PolicyProfile } from '~/lib/qhub/policy';
 import { createSampler } from '~/utils/sampler';
 import { getTemplates, selectStarterTemplate } from '~/utils/selectStarterTemplate';
 import { logStore } from '~/lib/stores/logs';
@@ -85,6 +92,7 @@ interface ChatProps {
   importChat: (description: string, messages: Message[]) => Promise<void>;
   exportChat: () => void;
   description?: string;
+
   /** QHUB: stable URL-based project identifier from chat persistence (urlId). */
   urlId?: string;
 }
@@ -117,23 +125,33 @@ export const ChatImpl = memo(
     const [classifyBusy, setClassifyBusy] = useState(false);
     const pendingBuildRef = useRef<{ firstMsgId: string; attachments?: any } | null>(null);
     const classifyDescriptionRef = useRef<string>('');
+    const proposalIdRef = useRef<string | null>(null);
+
+    // ── QHUB Gate 03: policy state ─────────────────────────────────────────────
+    const [assignedPolicy, setAssignedPolicy] = useState<PolicyProfile | null>(null);
+    const [policyBusy, setPolicyBusy] = useState(false);
 
     const [model, setModel] = useState(() => {
       const savedProvider = Cookies.get('selectedProvider');
       const savedModel = Cookies.get('selectedModel');
+
       // If the saved provider was AmazonBedrock, the saved model is also a Bedrock ID — reset it
       if (!savedProvider || savedProvider === 'AmazonBedrock') {
         return DEFAULT_MODEL;
       }
+
       return savedModel || DEFAULT_MODEL;
     });
     const [provider, setProvider] = useState(() => {
       const savedProvider = Cookies.get('selectedProvider');
+
       // QHUB Studio is Anthropic-first — don't restore AmazonBedrock from a stale cookie
       const QHUB_DEFAULT = 'Anthropic';
+
       if (!savedProvider || savedProvider === 'AmazonBedrock') {
         return (PROVIDER_LIST.find((p) => p.name === QHUB_DEFAULT) || DEFAULT_PROVIDER) as ProviderInfo;
       }
+
       return (PROVIDER_LIST.find((p) => p.name === savedProvider) || DEFAULT_PROVIDER) as ProviderInfo;
     });
     const { showChat } = useStore(chatStore);
@@ -202,13 +220,18 @@ export const ChatImpl = memo(
       initialMessages,
       initialInput: Cookies.get(PROMPT_COOKIE_KEY) || '',
     });
-    // Seed prompt from ?prompt= URL param (set by quantex-tech.com landing page hero).
-    // When ?source=landing is also present the prompt is wrapped with the QHUB
-    // governance preamble so the LLM enters compliance-build mode from message 1.
+
+    /*
+     * Seed prompt from ?prompt= URL param (set by quantex-tech.com landing page hero).
+     * When ?source=landing is also present the prompt is wrapped with the QHUB
+     * governance preamble so the LLM enters compliance-build mode from message 1.
+     */
     const { seededPrompt, wasSeeded } = useQHubPromptSeed();
 
     useEffect(() => {
-      if (!wasSeeded || !seededPrompt) return;
+      if (!wasSeeded || !seededPrompt) {
+        return;
+      }
 
       runAnimation();
       append({
@@ -218,10 +241,12 @@ export const ChatImpl = memo(
       // eslint-disable-next-line react-hooks/exhaustive-deps
     }, [wasSeeded]);
 
-    // ── QHUB Hook: wire workbenchStore session for deployment gate ──────────────
-    // root loader returns { session: { userId, orgId, email, role } } for authenticated users.
-    // conversationId = first user message ID — same stable anchor used by api.chat.ts.
-    // appId = urlId (stable project slug) → chatId (numeric) → conversationId (fallback).
+    /*
+     * ── QHUB Hook: wire workbenchStore session for deployment gate ──────────────
+     * root loader returns { session: { userId, orgId, email, role } } for authenticated users.
+     * conversationId = first user message ID — same stable anchor used by api.chat.ts.
+     * appId = urlId (stable project slug) → chatId (numeric) → conversationId (fallback).
+     */
     const rootData = useRouteLoaderData<{ session?: { userId: string; orgId: string } }>('root');
     const qhubRootSession = rootData?.session;
 
@@ -230,6 +255,7 @@ export const ChatImpl = memo(
         workbenchStore.setQhubSession(null);
         return;
       }
+
       const conversationId = messages.find((m) => m.role === 'user')?.id;
 
       if (!conversationId) {
@@ -238,11 +264,14 @@ export const ChatImpl = memo(
         return;
       }
 
-      // Prefer urlId (stable project slug set when first artifact is created),
-      // fall back to chatId (numeric IndexedDB key), then conversationId.
+      /*
+       * Prefer urlId (stable project slug set when first artifact is created),
+       * fall back to chatId (numeric IndexedDB key), then conversationId.
+       */
       const appId = urlId ?? chatId.get() ?? conversationId;
       workbenchStore.setQhubSession({ conversationId, appId });
     }, [qhubRootSession, messages, urlId]);
+
     // ── End QHUB Hook ──────────────────────────────────────────────────────────
 
     const { enhancingPrompt, promptEnhanced, enhancePrompt, resetEnhancer } = usePromptEnhancer();
@@ -440,24 +469,34 @@ export const ChatImpl = memo(
       return attachments;
     };
 
-    // ── QHUB Gate 02: confirm the classification, then start the build ─────────
+    // ── QHUB Gate 02→03: confirm classification, then assign policy ────────────
     const handleConfirmClassification = async (tier: RiskTier) => {
       const pending = pendingBuildRef.current;
-      const classification = proposedClassification;
+      const proposalId = proposalIdRef.current;
 
-      if (!classification || !pending) {
+      if (!proposedClassification || !pending) {
+        return;
+      }
+
+      if (!proposalId) {
+        toast.error('Classification session expired. Please re-run classification.');
         return;
       }
 
       setClassifyBusy(true);
+
       try {
-        await confirmClassification({
+        const confirmed = await confirmClassification({
           conversationId: pending.firstMsgId,
-          classification,
+          proposalId,
           confirmedTier: tier,
           projectTitle: classifyDescriptionRef.current.slice(0, 80),
           builderProjectId: urlId,
         });
+
+        if (!confirmed.ok) {
+          throw new Error(confirmed.error ?? 'Classification rejected');
+        }
       } catch (err) {
         console.error('[QHUB] confirm classification failed', err);
         toast.error('Failed to record classification. Please try again.');
@@ -468,7 +507,61 @@ export const ChatImpl = memo(
 
       setClassificationConfirmed(true);
       setProposedClassification(null);
-      setClassifyBusy(false);
+
+      // ── Gate 03: assign the deterministic policy profile ──────────────────
+      setPolicyBusy(true);
+
+      try {
+        const assigned = await assignPolicy({
+          conversationId: pending.firstMsgId,
+          builderProjectId: urlId,
+        });
+
+        if (!assigned.ok || !assigned.policyProfile) {
+          throw new Error(assigned.error ?? 'Policy assignment failed');
+        }
+
+        setAssignedPolicy(assigned.policyProfile);
+      } catch (err) {
+        console.error('[QHUB] policy assignment failed', err);
+        toast.error('Failed to assign the governance policy. Please try again.');
+      } finally {
+        setPolicyBusy(false);
+        setClassifyBusy(false);
+      }
+
+      // Wait for policy acknowledgement — PolicyCard renders above the input.
+    };
+
+    // ── QHUB Gate 03: acknowledge the policy, then start the build ─────────────
+    const handleAcknowledgePolicy = async () => {
+      const pending = pendingBuildRef.current;
+
+      if (!pending) {
+        return;
+      }
+
+      setPolicyBusy(true);
+
+      try {
+        const acked = await acknowledgePolicy({
+          conversationId: pending.firstMsgId,
+          builderProjectId: urlId,
+        });
+
+        if (!acked.ok) {
+          throw new Error(acked.error ?? 'Acknowledgement failed');
+        }
+      } catch (err) {
+        console.error('[QHUB] policy acknowledgement failed', err);
+        toast.error('Failed to acknowledge the policy. Please try again.');
+        setPolicyBusy(false);
+
+        return;
+      }
+
+      setAssignedPolicy(null);
+      setPolicyBusy(false);
 
       // Proceed to generation using the already-set first user message.
       reload(pending.attachments ? { experimental_attachments: pending.attachments } : undefined);
@@ -501,9 +594,11 @@ export const ChatImpl = memo(
       runAnimation();
 
       if (!chatStarted) {
-        // ── QHUB Gate 02: CLASSIFY before building (authenticated projects) ────
-        // Runs once per new project: analyze the description, show the
-        // classification card, and wait for confirmation before generation.
+        /*
+         * ── QHUB Gate 02: CLASSIFY before building (authenticated projects) ────
+         * Runs once per new project: analyze the description, show the
+         * classification card, and wait for confirmation before generation.
+         */
         if (qhubRootSession && !classificationConfirmed) {
           const firstMsgId = `${Date.now()}`;
           const userMessageText = `[Model: ${model}]\n\n[Provider: ${provider.name}]\n\n${finalMessageContent}`;
@@ -528,9 +623,11 @@ export const ChatImpl = memo(
           pendingBuildRef.current = { firstMsgId, attachments: classifyAttachments };
           classifyDescriptionRef.current = finalMessageContent;
           setClassifyBusy(true);
+
           try {
             const proposed = await requestClassification(finalMessageContent, firstMsgId);
-            setProposedClassification(proposed);
+            proposalIdRef.current = proposed.proposalId;
+            setProposedClassification(proposed.classification);
           } catch (err) {
             console.error('[QHUB] classification failed', err);
             toast.error('Governance classification failed. Please try again.');
@@ -746,7 +843,21 @@ export const ChatImpl = memo(
         showChat={showChat}
         chatStarted={chatStarted}
         classificationSlot={
-          proposedClassification ? (
+          assignedPolicy ? (
+            <PolicyCard profile={assignedPolicy} onAcknowledge={handleAcknowledgePolicy} busy={policyBusy} />
+          ) : policyBusy ? (
+            <div
+              style={{
+                border: '1px solid rgba(36,71,240,0.35)',
+                borderRadius: 12,
+                padding: '14px 18px',
+                fontSize: 13.5,
+                color: 'var(--bolt-elements-textSecondary, rgba(120,130,141,1))',
+              }}
+            >
+              <strong>02 · Policy</strong> — deriving the required controls for this risk tier…
+            </div>
+          ) : proposedClassification ? (
             <ClassificationCard
               classification={proposedClassification}
               onConfirm={handleConfirmClassification}

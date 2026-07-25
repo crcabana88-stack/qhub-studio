@@ -1,4 +1,5 @@
 import { convertToCoreMessages, streamText as _streamText, type Message } from 'ai';
+
 // QHUB: AI-BOM logging — server-side only via GovernanceService
 import { createGovernanceService } from '~/lib/qhub/governance-service.server';
 import { MAX_TOKENS, PROVIDER_COMPLETION_LIMITS, isReasoningModel, type FileMap } from './constants';
@@ -72,6 +73,7 @@ export async function streamText(props: {
     conversationId: string;
     userId: string;
     orgId: string;
+
     /** Server environment — GovernanceService reads QHUB_HMAC_SECRET from here */
     serverEnv: Record<string, string | undefined>;
   };
@@ -173,10 +175,12 @@ export async function streamText(props: {
       },
     }) ?? getSystemPrompt();
 
-  // QHUB: APPEND governance guidance to the full bolt.diy system prompt for
-  // authenticated users. Do NOT replace it — replacing drops the WebContainer
-  // build rules (use Vite, and emit <boltAction type="start"> to run the dev
-  // server), so the app is never started and the preview stays blank.
+  /*
+   * QHUB: APPEND governance guidance to the full bolt.diy system prompt for
+   * authenticated users. Do NOT replace it — replacing drops the WebContainer
+   * build rules (use Vite, and emit <boltAction type="start"> to run the dev
+   * server), so the app is never started and the preview stays blank.
+   */
   if (qhubContext?.userId && qhubContext.userId !== 'anonymous') {
     const { getQBotSystemPrompt } = await import('~/lib/common/prompts/qbot-prompt');
     const governanceGuidance = getQBotSystemPrompt({
@@ -184,6 +188,32 @@ export async function streamText(props: {
       orgId: qhubContext.orgId,
     } as any);
     systemPrompt = `${systemPrompt}\n\n---\n\n${governanceGuidance}`;
+
+    /*
+     * QHUB Gate 03: APPEND the deterministic policy constraints for this app, if a
+     * policy profile has been assigned. The build is bound to the controls the
+     * server derived from the confirmed classification — never browser-supplied.
+     */
+    try {
+      const [{ getPolicyProfileByConversation }, { formatBuildConstraintsForPrompt }] = await Promise.all([
+        import('~/lib/qhub/qhub-app.server'),
+        import('~/lib/qhub/policy-engine'),
+      ]);
+      const profile = await getPolicyProfileByConversation(
+        qhubContext.conversationId,
+        qhubContext.orgId,
+        qhubContext.serverEnv,
+      );
+
+      if (profile) {
+        systemPrompt = `${systemPrompt}\n\n---\n\n${formatBuildConstraintsForPrompt(profile)}`;
+        logger.info(
+          `QHUB policy constraints appended for conversation=${qhubContext.conversationId} tier=${profile.risk_tier} required=${profile.required_controls.length}`,
+        );
+      }
+    } catch (err) {
+      console.error('[stream-text] failed to append policy constraints:', err);
+    }
   }
 
   if (chatMode === 'build' && contextFiles && contextOptimization) {
@@ -331,10 +361,12 @@ export async function streamText(props: {
     ),
   );
 
-  // ── QHUB HOOK 2: AI-BOM ──────────────────────────────────────────────────
-  // Log every LLM invocation: provider, model, timestamp → QHUB ledger.
-  // Signing happens inside GovernanceService using Node.js crypto.
-  // The HMAC secret is read from serverEnv — never passed through qhubContext.
+  /*
+   * ── QHUB HOOK 2: AI-BOM ──────────────────────────────────────────────────
+   * Log every LLM invocation: provider, model, timestamp → QHUB ledger.
+   * Signing happens inside GovernanceService using Node.js crypto.
+   * The HMAC secret is read from serverEnv — never passed through qhubContext.
+   */
   if (qhubContext?.sessionId && qhubContext?.serverEnv) {
     const svc = createGovernanceService({
       userId: qhubContext.userId,
@@ -342,12 +374,15 @@ export async function streamText(props: {
       sessionId: qhubContext.sessionId,
       env: qhubContext.serverEnv,
     });
-    svc.recordAiModelInvokedDirect({
-      conversationId: qhubContext.conversationId,
-      provider: currentProvider,
-      model: currentModel,
-    }).catch((err: unknown) => console.error('[QHUB] AI-BOM log failed:', err));
+    svc
+      .recordAiModelInvokedDirect({
+        conversationId: qhubContext.conversationId,
+        provider: currentProvider,
+        model: currentModel,
+      })
+      .catch((err: unknown) => console.error('[QHUB] AI-BOM log failed:', err));
   }
+
   // ── END QHUB HOOK 2 ──────────────────────────────────────────────────────
 
   return await _streamText(streamParams);
