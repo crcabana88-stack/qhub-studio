@@ -16,7 +16,7 @@ import Cookies from 'js-cookie';
 import { debounce } from '~/utils/debounce';
 import { useSettings } from '~/lib/hooks/useSettings';
 import type { ProviderInfo } from '~/types/model';
-import { useSearchParams, useRouteLoaderData } from '@remix-run/react';
+import { useRouteLoaderData } from '@remix-run/react';
 import { useQHubPromptSeed } from '~/lib/hooks/useQHubPromptSeed';
 import { postGovernanceEvent } from '~/lib/qhub/messenger';
 import {
@@ -105,7 +105,6 @@ export const ChatImpl = memo(
     const [chatStarted, setChatStarted] = useState(initialMessages.length > 0);
     const [uploadedFiles, setUploadedFiles] = useState<File[]>([]);
     const [imageDataList, setImageDataList] = useState<string[]>([]);
-    const [searchParams, setSearchParams] = useSearchParams();
     const [fakeLoading, setFakeLoading] = useState(false);
     const files = useStore(workbenchStore.files);
     const [designScheme, setDesignScheme] = useState<DesignScheme>(defaultDesignScheme);
@@ -238,7 +237,6 @@ export const ChatImpl = memo(
         role: 'user',
         content: `[Model: ${model}]\n\n[Provider: ${provider.name}]\n\n${seededPrompt}`,
       });
-      // eslint-disable-next-line react-hooks/exhaustive-deps
     }, [wasSeeded]);
 
     /*
