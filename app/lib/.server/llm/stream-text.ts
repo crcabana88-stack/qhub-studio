@@ -173,13 +173,17 @@ export async function streamText(props: {
       },
     }) ?? getSystemPrompt();
 
-  // QHUB: Override with QBot governance prompt for authenticated users
+  // QHUB: APPEND governance guidance to the full bolt.diy system prompt for
+  // authenticated users. Do NOT replace it — replacing drops the WebContainer
+  // build rules (use Vite, and emit <boltAction type="start"> to run the dev
+  // server), so the app is never started and the preview stays blank.
   if (qhubContext?.userId && qhubContext.userId !== 'anonymous') {
     const { getQBotSystemPrompt } = await import('~/lib/common/prompts/qbot-prompt');
-    systemPrompt = getQBotSystemPrompt({
+    const governanceGuidance = getQBotSystemPrompt({
       userId: qhubContext.userId,
       orgId: qhubContext.orgId,
     } as any);
+    systemPrompt = `${systemPrompt}\n\n---\n\n${governanceGuidance}`;
   }
 
   if (chatMode === 'build' && contextFiles && contextOptimization) {
