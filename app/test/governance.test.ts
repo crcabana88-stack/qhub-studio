@@ -241,6 +241,18 @@ describe('TEST 3: AI_BOM hook is server-side only', () => {
     expect(source).not.toContain('logAiBom');
   });
 
+  it('stream-text delegates the provider call to enforcement before returning the stream handle', async () => {
+    const fs = await import('node:fs');
+    const path = await import('node:path');
+    const source = fs.readFileSync(path.resolve(process.cwd(), 'app/lib/.server/llm/stream-text.ts'), 'utf8');
+    const providerHook = source.indexOf('invoke: () => _streamText(streamParams)');
+    const governedReturn = source.indexOf('return decision.internal_execution_result');
+
+    expect(providerHook).toBeGreaterThan(-1);
+    expect(governedReturn).toBeGreaterThan(providerHook);
+    expect(source).not.toContain('ALLOW: AI_MODEL_INVOKED already emitted by the enforcement entry point.');
+  });
+
   it('AI_BOM event goes to POST /events via GovernanceService', async () => {
     const { GovernanceService } = await import('~/lib/qhub/governance-service.server');
 
@@ -265,6 +277,72 @@ describe('TEST 3: AI_BOM hook is server-side only', () => {
     expect(url).toContain('/events');
     const body = JSON.parse(opts.body as string);
     expect(body.event_type).toBe('AI_MODEL_INVOKED'); // Lambda v2.6 canonical AI event
+
+    vi.unstubAllGlobals();
+  });
+
+  it('GOVERNED_ACTION_RECEIPT_RECORDED sends only the canonical compact receipt payload', async () => {
+    const governanceModule = await import('~/lib/qhub/governance-service.server');
+    const mockFetch = vi.fn().mockResolvedValue(
+      new Response(JSON.stringify({ event_id: 'ledger-event-1', event_hash: 'f'.repeat(64), seq: 8 }), {
+        status: 201,
+      }),
+    );
+
+    vi.stubGlobal('fetch', mockFetch);
+
+    const svc = new governanceModule.GovernanceService({
+      userId: 'u',
+      orgId: 'client-smoke',
+      sessionId: 'session-not-in-receipt',
+      env: { QHUB_HMAC_SECRET: 'test-secret-32-chars-minimum-ok!', QHUB_API_BASE: 'https://test.example.com' },
+    });
+
+    const payload = {
+      receipt_id: '00000000-0000-4000-a000-000000000010',
+      evaluation_id: '00000000-0000-4000-a000-000000000011',
+      action_request_id: '00000000-0000-4000-a000-000000000012',
+      action_digest: 'a'.repeat(64),
+      action_type: 'EXTERNAL_DATA_TRANSMISSION',
+      adapter_id: 'qhub.staging.external-data-transmission.simulation',
+      adapter_version: '1.0.0',
+      execution_mode: 'SIMULATION',
+      execution_status: 'SIMULATED_SUCCESS',
+      adapter_executed: true,
+      external_effect_performed: false,
+      policy_profile_id: 'pp-1',
+      policy_profile_version: 1,
+      policy_profile_hash: 'b'.repeat(64),
+      enforcement_plan_id: 'ep-1',
+      enforcement_plan_version: 1,
+      enforcement_plan_hash: 'c'.repeat(64),
+      result_hash: 'd'.repeat(64),
+      safe_result_metadata: {
+        destination_alias: 'STAGING_SYNTHETIC_SINK',
+        payload_hash: 'e'.repeat(64),
+        synthetic_byte_count: 42,
+        content_type_category: 'STRUCTURED_DATA',
+      },
+      started_at: '2026-07-26T12:00:00.000Z',
+      completed_at: '2026-07-26T12:00:00.001Z',
+      receipt_schema_version: 'gate04-receipt-1.0.0',
+    };
+
+    const result = await svc.recordGovernedActionReceipt({
+      conversationId: 'gate04-r2-test',
+      chainId: 'chain-1',
+      riskTier: 'T2',
+      qhubAppId: 'app-1',
+      payload,
+    });
+
+    expect(result).toMatchObject({ ok: true, eventId: 'ledger-event-1', eventHash: 'f'.repeat(64), seq: 8 });
+
+    const body = JSON.parse(mockFetch.mock.calls[0][1].body as string);
+    expect(body.event_type).toBe('GOVERNED_ACTION_RECEIPT_RECORDED');
+    expect(body.payload).toEqual(payload);
+    expect(JSON.stringify(body.payload)).not.toContain('session-not-in-receipt');
+    expect(JSON.stringify(body.payload)).not.toContain('source');
 
     vi.unstubAllGlobals();
   });

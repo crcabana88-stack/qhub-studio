@@ -32,6 +32,8 @@ const H = vi.hoisted(() => ({
   markActionEvidence: vi.fn(),
   recordControlDecision: vi.fn(),
   recordAiModelInvokedDirect: vi.fn(),
+  recordGovernedActionReceipt: vi.fn(),
+  providerInvoke: vi.fn(),
 }));
 
 vi.mock('~/lib/qhub/qhub-app.server', () => ({
@@ -59,10 +61,19 @@ vi.mock('~/lib/qhub/governance-service.server', () => ({
   createGovernanceService: () => ({
     recordControlDecision: H.recordControlDecision,
     recordAiModelInvokedDirect: H.recordAiModelInvokedDirect,
+    recordGovernedActionReceipt: H.recordGovernedActionReceipt,
   }),
 }));
 
 const ENV = { QHUB_HMAC_SECRET: 'x', SUPABASE_URL: 'https://p.supabase.co', SUPABASE_SERVICE_ROLE_KEY: 'k' };
+const SIM_ENV = {
+  ...ENV,
+  QHUB_ENABLE_GATE04_SIMULATION_ADAPTERS: '1',
+  QHUB_DEPLOY_ENV: 'staging',
+  FLY_APP_NAME: 'qhub-studio',
+  QHUB_PUBLIC_HOSTNAME: 'qhub-studio.fly.dev',
+  SUPABASE_URL: 'https://jsjsanmaahvmynblmzkq.supabase.co',
+};
 
 function signals(o: Partial<ClassificationSignals> = {}): ClassificationSignals {
   return {
@@ -141,6 +152,10 @@ async function enforce(over: any = {}, tier: RiskTier = 'T0', s: Partial<Classif
     },
     sessionId: 's',
     env: ENV,
+    internalExecution: {
+      action_type: 'AI_MODEL_INVOCATION',
+      invoke: H.providerInvoke,
+    },
     ...over,
   });
 }
@@ -168,9 +183,11 @@ beforeEach(() => {
   H.insertEvaluation.mockResolvedValue({ ok: true });
   H.claimEvaluation.mockResolvedValue(true);
   H.consumeApprovals.mockResolvedValue(true);
-  H.markActionEvidence.mockResolvedValue(undefined);
+  H.markActionEvidence.mockResolvedValue(true);
   H.recordControlDecision.mockResolvedValue({ ok: true });
   H.recordAiModelInvokedDirect.mockResolvedValue({ ok: true, qhubAppId: 'app-1' });
+  H.recordGovernedActionReceipt.mockResolvedValue({ ok: true, eventId: 'event-1', eventHash: 'a'.repeat(64), seq: 4 });
+  H.providerInvoke.mockResolvedValue({ stream: true });
 });
 
 describe('fail-closed preconditions block (tests 19-22)', () => {
@@ -342,12 +359,42 @@ describe('ALLOW path emits AI event referencing the exact evaluation (test 15)',
     expect(r.decision).toBe('ALLOW');
     expect(H.recordControlDecision).toHaveBeenCalledOnce();
     expect(H.recordAiModelInvokedDirect).toHaveBeenCalledOnce();
+    expect(H.providerInvoke).toHaveBeenCalledOnce();
 
     const enfArg = H.recordAiModelInvokedDirect.mock.calls[0][0].enforcement;
     expect(enfArg.evaluation_id).toBe(r.evaluation_id);
     expect(enfArg.action_digest).toBe(r.action_digest);
     expect(enfArg.enforcement_plan_hash).toBe(r.enforcement_plan_hash);
     expect(r.side_effect_performed).toBe(true);
+    expect(r.internal_execution_result).toEqual({ stream: true });
+  });
+
+  it('does not emit AI_MODEL_INVOKED when the provider invocation fails', async () => {
+    H.providerInvoke.mockRejectedValue(new Error('provider unavailable'));
+
+    const r = await enforce();
+
+    expect(r.execution_status).toBe('FAILED');
+    expect(r.reason_codes).toContain('ADAPTER_EXECUTION_FAILED');
+    expect(H.recordAiModelInvokedDirect).not.toHaveBeenCalled();
+    expect(H.markActionEvidence).toHaveBeenCalledWith(expect.any(String), 'client-smoke', 'FAILED', ENV);
+  });
+
+  it('provider invocation precedes AI_MODEL_INVOKED evidence', async () => {
+    const order: string[] = [];
+    H.providerInvoke.mockImplementation(async () => {
+      order.push('provider');
+
+      return { stream: true };
+    });
+    H.recordAiModelInvokedDirect.mockImplementation(async () => {
+      order.push('event');
+
+      return { ok: true };
+    });
+
+    await enforce();
+    expect(order).toEqual(['provider', 'event']);
   });
 });
 
@@ -418,6 +465,207 @@ describe('single-use claim / replay (tests 2/13)', () => {
     expect(r.evaluation_id).toBe('e-prior');
     expect(r.reason_codes).toContain('REPLAY_DENIED');
     expect(H.recordAiModelInvokedDirect).not.toHaveBeenCalled();
+  });
+});
+
+describe('durable staging governed-action receipts', () => {
+  it('records exactly one external-transmission simulation receipt after claim', async () => {
+    const r = await enforce(
+      {
+        conversationId: 'gate04-r2-receipt-test',
+        env: SIM_ENV,
+        action: {
+          action_type: 'EXTERNAL_DATA_TRANSMISSION',
+          target_resource: 'https://commission-staging-noop.invalid/reconcile',
+          operation: 'write_simulation',
+          material_parameters: { synthetic: true, dataset: 'redacted', mode: 'no-op' },
+          environment: 'PREVIEW',
+          app_version_ref: 'gate04-r2-receipt-test',
+        },
+      },
+      'T0',
+      { integration_types: ['BUSINESS_SYSTEM_WRITE'] },
+    );
+
+    expect(r.decision).toBe('ALLOW');
+    expect(r.adapter_executed).toBe(true);
+    expect(r.external_effect_performed).toBe(false);
+    expect(r.side_effect_performed).toBe(false);
+    expect(r.execution_mode).toBe('SIMULATION');
+    expect(r.execution_status).toBe('SIMULATED_SUCCESS');
+    expect(r.receipt?.evaluation_id).toBe(r.evaluation_id);
+    expect(r.receipt?.action_request_id).toBe(r.action_request_id);
+    expect(r.receipt?.action_digest).toBe(r.action_digest);
+    expect(H.recordGovernedActionReceipt).toHaveBeenCalledOnce();
+    expect(H.markActionEvidence).toHaveBeenCalledWith(r.evaluation_id, 'client-smoke', 'COMMITTED', SIM_ENV);
+
+    const evidence = JSON.stringify(H.recordGovernedActionReceipt.mock.calls[0][0]);
+    expect(evidence).not.toContain('redacted');
+    expect(evidence).not.toContain('material_parameters');
+  });
+
+  it('receipt-ingest failure does not report success and preserves the single-use claim', async () => {
+    H.recordGovernedActionReceipt.mockResolvedValue({ ok: false });
+
+    const r = await enforce(
+      {
+        conversationId: 'gate04-r2-receipt-failure',
+        env: SIM_ENV,
+        action: {
+          action_type: 'EXTERNAL_DATA_TRANSMISSION',
+          target_resource: 'https://commission-staging-noop.invalid/reconcile',
+          operation: 'write_simulation',
+          material_parameters: { synthetic: true },
+          environment: 'PREVIEW',
+          app_version_ref: 'gate04-r2-receipt-failure',
+        },
+      },
+      'T0',
+      { integration_types: ['BUSINESS_SYSTEM_WRITE'] },
+    );
+
+    expect(r.reason_codes).toContain('RECEIPT_RECORD_FAILED');
+    expect(r.execution_status).toBe('FAILED');
+    expect(r.receipt).toBeNull();
+    expect(r.evidence_recorded).toBe(false);
+    expect(H.claimEvaluation).toHaveBeenCalledOnce();
+    expect(H.markActionEvidence).toHaveBeenCalledWith(r.evaluation_id, 'client-smoke', 'FAILED', SIM_ENV);
+  });
+
+  it('adapter failure does not report success or emit a receipt event', async () => {
+    const { getGovernedActionAdapter } = await import('~/lib/qhub/governed-action-adapters.server');
+    const adapter = getGovernedActionAdapter('EXTERNAL_DATA_TRANSMISSION')!;
+    const execute = vi.spyOn(adapter, 'execute').mockRejectedValueOnce(new Error('synthetic adapter failure'));
+
+    const r = await enforce(
+      {
+        conversationId: 'gate04-r2-adapter-failure',
+        env: SIM_ENV,
+        action: {
+          action_type: 'EXTERNAL_DATA_TRANSMISSION',
+          target_resource: 'https://commission-staging-noop.invalid/reconcile',
+          operation: 'write_simulation',
+          material_parameters: { synthetic: true },
+          environment: 'PREVIEW',
+          app_version_ref: 'gate04-r2-adapter-failure',
+        },
+      },
+      'T0',
+      { integration_types: ['BUSINESS_SYSTEM_WRITE'] },
+    );
+
+    expect(r.execution_status).toBe('FAILED');
+    expect(r.reason_codes).toContain('ADAPTER_EXECUTION_FAILED');
+    expect(r.receipt).toBeNull();
+    expect(r.side_effect_performed).toBe(false);
+    expect(H.recordGovernedActionReceipt).not.toHaveBeenCalled();
+    execute.mockRestore();
+  });
+
+  it('a failed COMMITTED transition does not return a successful receipt', async () => {
+    H.markActionEvidence.mockResolvedValueOnce(false).mockResolvedValueOnce(true);
+
+    const r = await enforce(
+      {
+        conversationId: 'gate04-r2-state-failure',
+        env: SIM_ENV,
+        action: {
+          action_type: 'EXTERNAL_DATA_TRANSMISSION',
+          target_resource: 'https://commission-staging-noop.invalid/reconcile',
+          operation: 'write_simulation',
+          material_parameters: { synthetic: true },
+          environment: 'PREVIEW',
+          app_version_ref: 'gate04-r2-state-failure',
+        },
+      },
+      'T0',
+      { integration_types: ['BUSINESS_SYSTEM_WRITE'] },
+    );
+
+    expect(H.recordGovernedActionReceipt).toHaveBeenCalledOnce();
+    expect(r.reason_codes).toContain('RECEIPT_RECORD_FAILED');
+    expect(r.execution_status).toBe('FAILED');
+    expect(r.receipt).toBeNull();
+    expect(r.evidence_recorded).toBe(false);
+  });
+
+  it('missing adapter converts a would-be ALLOW to DENY before the claim', async () => {
+    const r = await enforce({ internalExecution: undefined });
+
+    expect(r.decision).toBe('DENY');
+    expect(r.reason_codes).toEqual(['ADAPTER_NOT_CONFIGURED']);
+    expect(H.recordControlDecision).toHaveBeenCalledOnce();
+    expect(H.claimEvaluation).not.toHaveBeenCalled();
+    expect(H.recordAiModelInvokedDirect).not.toHaveBeenCalled();
+    expect(H.recordGovernedActionReceipt).not.toHaveBeenCalled();
+  });
+
+  it('a replay result never executes an adapter or records a second receipt', async () => {
+    H.getEvaluationByIdempotency.mockResolvedValue({
+      evaluation_id: 'e-prior',
+      action_request_id: 'r-prior',
+      decision: 'ALLOW',
+      reason_codes: ['ALLOWED_BASELINE'],
+      action_type: 'EXTERNAL_DATA_TRANSMISSION',
+      qhub_app_id: 'app-1',
+      action_digest: 'd',
+      control_results: [],
+    });
+
+    const r = await enforce({
+      idempotencyKey: 'duplicate',
+      conversationId: 'gate04-r2-replay',
+      env: SIM_ENV,
+      action: {
+        action_type: 'EXTERNAL_DATA_TRANSMISSION',
+        target_resource: 'https://commission-staging-noop.invalid/reconcile',
+        operation: 'write_simulation',
+        material_parameters: { synthetic: true },
+        environment: 'PREVIEW',
+        app_version_ref: 'gate04-r2-replay',
+      },
+    });
+
+    expect(r.reason_codes).toContain('REPLAY_DENIED');
+    expect(r.receipt).toBeNull();
+    expect(H.claimEvaluation).not.toHaveBeenCalled();
+    expect(H.recordGovernedActionReceipt).not.toHaveBeenCalled();
+  });
+
+  it('concurrent duplicate requests create at most one durable receipt', async () => {
+    let authoritative: any = null;
+    H.insertEvaluation.mockImplementation(async (row: any) => {
+      if (!authoritative) {
+        authoritative = row;
+
+        return { ok: true };
+      }
+
+      return { ok: false, duplicate: true, existing: authoritative };
+    });
+
+    const request = {
+      idempotencyKey: 'concurrent-duplicate',
+      conversationId: 'gate04-r2-concurrent',
+      env: SIM_ENV,
+      action: {
+        action_type: 'EXTERNAL_DATA_TRANSMISSION',
+        target_resource: 'https://commission-staging-noop.invalid/reconcile',
+        operation: 'write_simulation',
+        material_parameters: { synthetic: true },
+        environment: 'PREVIEW',
+        app_version_ref: 'gate04-r2-concurrent',
+      },
+    };
+
+    const [first, second] = await Promise.all([
+      enforce(request, 'T0', { integration_types: ['BUSINESS_SYSTEM_WRITE'] }),
+      enforce(request, 'T0', { integration_types: ['BUSINESS_SYSTEM_WRITE'] }),
+    ]);
+
+    expect([first, second].filter((result) => result.receipt)).toHaveLength(1);
+    expect(H.recordGovernedActionReceipt).toHaveBeenCalledOnce();
+    expect([first, second].some((result) => result.reason_codes.includes('REPLAY_DENIED'))).toBe(true);
   });
 });
 

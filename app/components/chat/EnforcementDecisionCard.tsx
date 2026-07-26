@@ -8,7 +8,7 @@
  * Shows NO sensitive parameters, internal rule detail, secrets, or model reasoning.
  */
 
-import type { Decision, ReasonCode } from '~/lib/qhub/enforcement';
+import type { Decision, GovernedExecutionMode, GovernedExecutionStatus, ReasonCode } from '~/lib/qhub/enforcement';
 
 const DECISION_COLOR: Record<Decision, string> = {
   ALLOW: '#1D9E75',
@@ -39,6 +39,9 @@ const REASON_TEXT: Partial<Record<ReasonCode, string>> = {
   REPLAY_DENIED: 'This authorization was already used; a fresh decision is required.',
   RBAC_DENIED: 'Your role is not authorized for this action.',
   TENANT_MISMATCH: 'This action is not valid for your tenant.',
+  ADAPTER_NOT_CONFIGURED: 'No authorized execution adapter is available; the action is blocked.',
+  ADAPTER_EXECUTION_FAILED: 'The authorized adapter failed; no success was reported.',
+  RECEIPT_RECORD_FAILED: 'The action receipt could not be committed; reconciliation is required.',
 };
 
 export interface EnforcementDecisionView {
@@ -51,6 +54,10 @@ export interface EnforcementDecisionView {
   policy_profile_version: number | null;
   evidence_recorded: boolean;
   side_effect_performed: boolean;
+  adapter_executed?: boolean | null;
+  external_effect_performed?: boolean | null;
+  execution_mode?: GovernedExecutionMode | null;
+  execution_status?: GovernedExecutionStatus | null;
 }
 
 export function EnforcementDecisionCard({ view }: { view: EnforcementDecisionView }) {
@@ -69,7 +76,9 @@ export function EnforcementDecisionCard({ view }: { view: EnforcementDecisionVie
       }}
     >
       <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 10 }}>
-        <span style={{ fontSize: 11, letterSpacing: '0.08em', textTransform: 'uppercase', color: 'rgba(120,130,141,0.9)' }}>
+        <span
+          style={{ fontSize: 11, letterSpacing: '0.08em', textTransform: 'uppercase', color: 'rgba(120,130,141,0.9)' }}
+        >
           Control enforcement
         </span>
         <span
@@ -90,16 +99,35 @@ export function EnforcementDecisionCard({ view }: { view: EnforcementDecisionVie
       <div style={{ fontSize: 14, fontWeight: 600, marginBottom: 4 }}>
         {(view.action_type ?? 'action').replaceAll('_', ' ').toLowerCase()}
       </div>
-      <p style={{ fontSize: 13, lineHeight: 1.5, margin: '0 0 12px 0', color: 'rgba(120,130,141,0.95)' }}>{primaryReason}</p>
+      <p style={{ fontSize: 13, lineHeight: 1.5, margin: '0 0 12px 0', color: 'rgba(120,130,141,0.95)' }}>
+        {primaryReason}
+      </p>
 
       {view.required_attestations.length > 0 && (
         <div style={{ marginBottom: 10 }}>
-          <div style={{ fontSize: 11, textTransform: 'uppercase', letterSpacing: '0.04em', color: 'rgba(120,130,141,0.9)', marginBottom: 4 }}>
+          <div
+            style={{
+              fontSize: 11,
+              textTransform: 'uppercase',
+              letterSpacing: '0.04em',
+              color: 'rgba(120,130,141,0.9)',
+              marginBottom: 4,
+            }}
+          >
             Approval needed
           </div>
           <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6 }}>
             {view.required_attestations.map((a) => (
-              <span key={a} style={{ fontSize: 12, padding: '2px 8px', borderRadius: 6, background: `${color}12`, border: `1px solid ${color}33` }}>
+              <span
+                key={a}
+                style={{
+                  fontSize: 12,
+                  padding: '2px 8px',
+                  borderRadius: 6,
+                  background: `${color}12`,
+                  border: `1px solid ${color}33`,
+                }}
+              >
                 {a.replaceAll('_', ' ').toLowerCase()}
               </span>
             ))}
@@ -109,14 +137,28 @@ export function EnforcementDecisionCard({ view }: { view: EnforcementDecisionVie
 
       {view.controls_involved.length > 0 && (
         <div style={{ marginBottom: 10 }}>
-          <div style={{ fontSize: 11, textTransform: 'uppercase', letterSpacing: '0.04em', color: 'rgba(120,130,141,0.9)', marginBottom: 4 }}>
+          <div
+            style={{
+              fontSize: 11,
+              textTransform: 'uppercase',
+              letterSpacing: '0.04em',
+              color: 'rgba(120,130,141,0.9)',
+              marginBottom: 4,
+            }}
+          >
             Controls evaluated
           </div>
           <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6 }}>
             {view.controls_involved.map((c) => (
               <span
                 key={c.control_id}
-                style={{ fontSize: 10.5, fontFamily: 'ui-monospace, monospace', padding: '1px 6px', borderRadius: 5, border: '1px solid rgba(120,130,141,0.25)' }}
+                style={{
+                  fontSize: 10.5,
+                  fontFamily: 'ui-monospace, monospace',
+                  padding: '1px 6px',
+                  borderRadius: 5,
+                  border: '1px solid rgba(120,130,141,0.25)',
+                }}
                 title={c.status}
               >
                 {c.control_id}
@@ -126,11 +168,28 @@ export function EnforcementDecisionCard({ view }: { view: EnforcementDecisionVie
         </div>
       )}
 
-      <div style={{ fontSize: 11, color: 'rgba(120,130,141,0.85)', borderTop: '1px solid rgba(120,130,141,0.18)', paddingTop: 8, display: 'flex', gap: '2px 14px', flexWrap: 'wrap' }}>
+      <div
+        style={{
+          fontSize: 11,
+          color: 'rgba(120,130,141,0.85)',
+          borderTop: '1px solid rgba(120,130,141,0.18)',
+          paddingTop: 8,
+          display: 'flex',
+          gap: '2px 14px',
+          flexWrap: 'wrap',
+        }}
+      >
         {view.policy_profile_version != null && <span>policy v{view.policy_profile_version}</span>}
         {view.enforcement_plan_version != null && <span>plan v{view.enforcement_plan_version}</span>}
         <span>{view.evidence_recorded ? 'evidence recorded' : 'evidence not recorded'}</span>
-        {view.decision === 'ALLOW' && <span>{view.side_effect_performed ? 'action executed' : 'not executed'}</span>}
+        {view.execution_mode === 'SIMULATION' && view.adapter_executed && (
+          <span>
+            {view.execution_status === 'SIMULATED_ACKNOWLEDGED' ? 'simulation acknowledged' : 'simulation completed'}
+          </span>
+        )}
+        {view.decision === 'ALLOW' && view.execution_mode !== 'SIMULATION' && (
+          <span>{view.side_effect_performed ? 'action executed' : 'not executed'}</span>
+        )}
       </div>
     </div>
   );

@@ -398,6 +398,10 @@ export async function streamText(props: {
         },
         sessionId: qhubContext.sessionId,
         env: qhubContext.serverEnv,
+        internalExecution: {
+          action_type: 'AI_MODEL_INVOCATION',
+          invoke: () => _streamText(streamParams),
+        },
       });
     } catch (err) {
       // Enforcement infrastructure error → fail closed for governed generation.
@@ -406,27 +410,43 @@ export async function streamText(props: {
     }
 
     const ungovernedFallback: string[] = ['POLICY_MISSING', 'CLASSIFICATION_MISSING', 'APP_NOT_FOUND'];
-    const isUngoverned = decision.decision !== 'ALLOW' && decision.reason_codes.every((r) => ungovernedFallback.includes(r));
+    const isUngoverned =
+      decision.decision !== 'ALLOW' && decision.reason_codes.every((r) => ungovernedFallback.includes(r));
 
     if (decision.decision !== 'ALLOW' && !isUngoverned) {
       logger.warn(`[QHUB] generation blocked by enforcement: ${decision.decision} ${decision.reason_codes.join(',')}`);
-      throw new Error(`QHUB governance blocked this action (${decision.decision}): ${decision.reason_codes.join(', ')}.`);
+      throw new Error(
+        `QHUB governance blocked this action (${decision.decision}): ${decision.reason_codes.join(', ')}.`,
+      );
     }
 
     if (isUngoverned) {
-      // Legacy/ungoverned conversation — preserve prior AI-BOM behavior.
+      /*
+       * Legacy/ungoverned conversation: invoke first. AI_MODEL_INVOKED may be
+       * emitted only after the provider SDK returns a valid stream handle.
+       */
+      const providerResult = await _streamText(streamParams);
       const svc = createGovernanceService({
         userId: qhubContext.userId,
         orgId: qhubContext.orgId,
         sessionId: qhubContext.sessionId,
         env: qhubContext.serverEnv,
       });
-      svc
-        .recordAiModelInvokedDirect({ conversationId: qhubContext.conversationId, provider: currentProvider, model: currentModel })
-        .catch((err: unknown) => console.error('[QHUB] AI-BOM log failed:', err));
+      await svc.recordAiModelInvokedDirect({
+        conversationId: qhubContext.conversationId,
+        provider: currentProvider,
+        model: currentModel,
+      });
+
+      return providerResult;
     }
 
-    // ALLOW: AI_MODEL_INVOKED already emitted by the enforcement entry point.
+    if (decision.execution_status !== 'SUCCEEDED' || !decision.internal_execution_result) {
+      throw new Error('QHUB governed provider invocation failed; generation blocked (fail-closed).');
+    }
+
+    // Governed ALLOW: provider returned a stream handle, then AI_MODEL_INVOKED committed.
+    return decision.internal_execution_result;
   }
 
   // ── END QHUB HOOK 2 ──────────────────────────────────────────────────────

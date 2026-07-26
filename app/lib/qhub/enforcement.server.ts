@@ -23,6 +23,11 @@ import {
 import { evaluate } from './enforcement-decision';
 import { assertGovernanceSchemaReady } from './schema-check.server';
 import { createGovernanceService } from './governance-service.server';
+import {
+  getGovernedActionAdapter,
+  type AdapterAvailability,
+  type GovernedAdapterPreflightInput,
+} from './governed-action-adapters.server';
 import * as store from './enforcement-store.server';
 import {
   ENFORCEMENT_EVALUATOR_VERSION,
@@ -30,7 +35,10 @@ import {
   type ControlResult,
   type Decision,
   type Environment,
+  type GovernedActionReceipt,
   type GovernedActionType,
+  type GovernedExecutionMode,
+  type GovernedExecutionStatus,
   type ReasonCode,
 } from './enforcement';
 
@@ -64,7 +72,7 @@ export interface EnforceActionInput {
   app_version_ref?: string | null;
 }
 
-export interface EnforceInput {
+export interface EnforceInput<TInternalResult = never> {
   session: { userId: string; orgId: string; role: string };
   conversationId: string;
   action: EnforceActionInput;
@@ -72,9 +80,13 @@ export interface EnforceInput {
   parentEvaluationId?: string; // for E2 re-evaluation after approval
   sessionId: string;
   env: Record<string, string | undefined>;
+  internalExecution?: {
+    action_type: 'AI_MODEL_INVOCATION';
+    invoke: () => TInternalResult | PromiseLike<TInternalResult>;
+  };
 }
 
-export interface EnforceOutput {
+export interface EnforceOutput<TInternalResult = never> {
   decision: Decision;
   reason_codes: ReasonCode[];
   action_type: GovernedActionType | null;
@@ -91,7 +103,18 @@ export interface EnforceOutput {
   required_attestations: string[];
   controls_involved: { control_id: string; status: string }[];
   evidence_recorded: boolean;
+
+  /**
+   * Legacy compatibility flag: true only for a verified real-world/provider
+   * effect. A successful simulation deliberately leaves this false.
+   */
   side_effect_performed: boolean;
+  adapter_executed: boolean | null;
+  external_effect_performed: boolean | null;
+  execution_mode: GovernedExecutionMode | null;
+  execution_status: GovernedExecutionStatus | null;
+  receipt: GovernedActionReceipt | null;
+  internal_execution_result?: TInternalResult;
 }
 
 function blocked(reason: ReasonCode, actionType: GovernedActionType, appId: string | null = null): EnforceOutput {
@@ -113,10 +136,17 @@ function blocked(reason: ReasonCode, actionType: GovernedActionType, appId: stri
     controls_involved: [],
     evidence_recorded: false,
     side_effect_performed: false,
+    adapter_executed: null,
+    external_effect_performed: null,
+    execution_mode: null,
+    execution_status: null,
+    receipt: null,
   };
 }
 
-export async function enforceGovernedAction(input: EnforceInput): Promise<EnforceOutput> {
+export async function enforceGovernedAction<TInternalResult = never>(
+  input: EnforceInput<TInternalResult>,
+): Promise<EnforceOutput<TInternalResult>> {
   const { session, conversationId, action, env, sessionId } = input;
 
   // 1. Schema readiness — fail closed.
@@ -274,7 +304,7 @@ export async function enforceGovernedAction(input: EnforceInput): Promise<Enforc
   const killSwitch = await store.getKillSwitch(app.qhub_app_id, session.orgId, env);
 
   // 9. Deterministic decision.
-  const result = evaluate({
+  let result = evaluate({
     request,
     action_digest: actionDigest,
     plan,
@@ -287,6 +317,47 @@ export async function enforceGovernedAction(input: EnforceInput): Promise<Enforc
     actor_id: session.userId,
     actor_role: session.role,
   });
+
+  const adapter = getGovernedActionAdapter(action.action_type);
+  const adapterPreflightInput: GovernedAdapterPreflightInput = {
+    tenant_id: session.orgId,
+    qhub_app_id: app.qhub_app_id,
+    conversation_id: conversationId,
+    action_type: action.action_type,
+    target_resource: action.target_resource,
+    operation: action.operation,
+    material_parameters: action.material_parameters ?? null,
+    environment: action.environment,
+    app_version_ref: action.app_version_ref ?? null,
+    risk_tier: profile.risk_tier,
+    schema_ready: true,
+    env,
+  };
+  const availability: AdapterAvailability =
+    action.action_type === 'AI_MODEL_INVOCATION'
+      ? {
+          available:
+            input.internalExecution?.action_type === 'AI_MODEL_INVOCATION' &&
+            typeof input.internalExecution.invoke === 'function',
+        }
+      : (adapter?.preflight(adapterPreflightInput) ?? { available: false });
+
+  if (result.decision !== 'DENY' && !availability.available) {
+    result = {
+      ...result,
+      decision: 'DENY',
+      reason_codes: ['ADAPTER_NOT_CONFIGURED'],
+      required_attestations: [],
+      control_results: [
+        ...result.control_results,
+        {
+          control_id: 'G04.ADAPTER_AVAILABLE',
+          status: 'FAIL',
+          reason_code: 'ADAPTER_NOT_CONFIGURED',
+        },
+      ],
+    };
+  }
 
   const evaluationId = randomUUID();
   const controlResultsHash = sha256(stableStringify(result.control_results));
@@ -404,6 +475,8 @@ export async function enforceGovernedAction(input: EnforceInput): Promise<Enforc
   );
 
   if (!approvalsConsumed) {
+    await store.markActionEvidence(evaluationId, session.orgId, 'FAILED', env);
+
     return {
       ...base,
       reason_codes: [...base.reason_codes, 'APPROVAL_CONSUMPTION_FAILED'],
@@ -412,11 +485,25 @@ export async function enforceGovernedAction(input: EnforceInput): Promise<Enforc
     };
   }
 
-  // Perform the protected side effect for WIRED action types only.
-  let sideEffectPerformed = false;
-  let evidenceRecorded = true;
-
   if (action.action_type === 'AI_MODEL_INVOCATION') {
+    let providerResult: TInternalResult;
+
+    try {
+      providerResult = await input.internalExecution!.invoke();
+    } catch {
+      await store.markActionEvidence(evaluationId, session.orgId, 'FAILED', env);
+
+      return {
+        ...base,
+        reason_codes: [...base.reason_codes, 'ADAPTER_EXECUTION_FAILED'],
+        evidence_recorded: false,
+        adapter_executed: true,
+        external_effect_performed: false,
+        execution_mode: action.environment === 'PRODUCTION' ? 'PRODUCTION' : 'SANDBOX',
+        execution_status: 'FAILED',
+      };
+    }
+
     const ai = await gov.recordAiModelInvokedDirect({
       conversationId,
       provider: action.provider_identity ?? 'Anthropic',
@@ -430,17 +517,110 @@ export async function enforceGovernedAction(input: EnforceInput): Promise<Enforc
         enforcement_plan_hash: plan.enforcement_plan_hash,
       },
     });
-    sideEffectPerformed = ai.ok;
-    evidenceRecorded = ai.ok;
+    const committed = ai.ok && (await store.markActionEvidence(evaluationId, session.orgId, 'COMMITTED', env));
 
-    // Post-action evidence must not vanish silently — mark the outbox state.
-    await store.markActionEvidence(evaluationId, session.orgId, ai.ok ? 'COMMITTED' : 'FAILED', env);
-  } else {
-    // Not operationally wired to a side effect adapter — decision recorded only.
-    await store.markActionEvidence(evaluationId, session.orgId, 'COMMITTED', env);
+    if (!committed) {
+      await store.markActionEvidence(evaluationId, session.orgId, 'FAILED', env);
+
+      return {
+        ...base,
+        reason_codes: [...base.reason_codes, 'RECEIPT_RECORD_FAILED'],
+        evidence_recorded: false,
+        adapter_executed: true,
+        external_effect_performed: true,
+        execution_mode: action.environment === 'PRODUCTION' ? 'PRODUCTION' : 'SANDBOX',
+        execution_status: 'FAILED',
+      };
+    }
+
+    return {
+      ...base,
+      evidence_recorded: true,
+      side_effect_performed: true,
+      adapter_executed: true,
+      external_effect_performed: true,
+      execution_mode: action.environment === 'PRODUCTION' ? 'PRODUCTION' : 'SANDBOX',
+      execution_status: 'SUCCEEDED',
+      internal_execution_result: providerResult,
+    };
   }
 
-  return { ...base, evidence_recorded: evidenceRecorded, side_effect_performed: sideEffectPerformed };
+  if (!adapter) {
+    await store.markActionEvidence(evaluationId, session.orgId, 'FAILED', env);
+
+    return { ...base, reason_codes: [...base.reason_codes, 'ADAPTER_NOT_CONFIGURED'] };
+  }
+
+  let receipt: GovernedActionReceipt;
+
+  try {
+    receipt = await adapter.execute({
+      ...adapterPreflightInput,
+      evaluation_id: evaluationId,
+      action_request_id: request.action_request_id,
+      action_digest: actionDigest,
+      material_parameters_hash: request.material_parameters_hash,
+      policy_profile_id: profile.policy_profile_id,
+      policy_profile_version: profile.policy_profile_version,
+      policy_profile_hash: profile.policy_profile_hash,
+      enforcement_plan_id: plan.enforcement_plan_id,
+      enforcement_plan_version: plan.enforcement_plan_version,
+      enforcement_plan_hash: plan.enforcement_plan_hash,
+      idempotency_key: evaluationId,
+    });
+  } catch {
+    await store.markActionEvidence(evaluationId, session.orgId, 'FAILED', env);
+
+    return {
+      ...base,
+      reason_codes: [...base.reason_codes, 'ADAPTER_EXECUTION_FAILED'],
+      adapter_executed: true,
+      external_effect_performed: false,
+      execution_mode: adapter.execution_mode,
+      execution_status: 'FAILED',
+    };
+  }
+
+  const { ledger_event_id: _eventId, ledger_event_hash: _eventHash, ledger_seq: _seq, ...receiptPayload } = receipt;
+  const receiptEvent = await gov.recordGovernedActionReceipt({
+    conversationId,
+    chainId,
+    riskTier: profile.risk_tier,
+    qhubAppId: app.qhub_app_id,
+    payload: receiptPayload as unknown as Record<string, unknown>,
+  });
+  const committed = receiptEvent.ok && (await store.markActionEvidence(evaluationId, session.orgId, 'COMMITTED', env));
+
+  if (!committed) {
+    await store.markActionEvidence(evaluationId, session.orgId, 'FAILED', env);
+
+    return {
+      ...base,
+      reason_codes: [...base.reason_codes, 'RECEIPT_RECORD_FAILED'],
+      adapter_executed: true,
+      external_effect_performed: false,
+      execution_mode: adapter.execution_mode,
+      execution_status: 'FAILED',
+    };
+  }
+
+  receipt = {
+    ...receipt,
+    ledger_event_id: receiptEvent.eventId,
+    ledger_event_hash: receiptEvent.eventHash,
+    ledger_seq: receiptEvent.seq,
+  };
+
+  return {
+    ...base,
+    evidence_recorded: true,
+    side_effect_performed: false,
+    adapter_executed: true,
+    external_effect_performed: false,
+    execution_mode: receipt.execution_mode,
+    execution_status: receipt.execution_status,
+    receipt,
+  };
 }
 
 function toOutput(
@@ -469,6 +649,11 @@ function toOutput(
     controls_involved: controls,
     evidence_recorded: false,
     side_effect_performed: false,
+    adapter_executed: null,
+    external_effect_performed: null,
+    execution_mode: null,
+    execution_status: null,
+    receipt: null,
   };
 }
 
@@ -491,5 +676,10 @@ function fromExisting(row: any): EnforceOutput {
     controls_involved: Array.isArray(row.control_results) ? row.control_results : [],
     evidence_recorded: true,
     side_effect_performed: false,
+    adapter_executed: false,
+    external_effect_performed: false,
+    execution_mode: null,
+    execution_status: null,
+    receipt: null,
   };
 }

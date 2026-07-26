@@ -14,9 +14,9 @@ import type { RiskTier } from './classification';
 
 /**
  * Every action type the enforcement engine can reason about. Only a subset is
- * OPERATIONALLY WIRED to a real executing route today (see WIRED_ACTION_TYPES in
- * enforcement-catalog.ts); the rest are evaluated (so their DENY/REQUIRE_APPROVAL
- * is authoritative) but have no side-effect adapter yet.
+ * OPERATIONALLY WIRED to a server-owned adapter today (see WIRED_ACTION_TYPES
+ * in enforcement-catalog.ts). Staging simulations are adapters but explicitly
+ * are not real external side effects.
  */
 export type GovernedActionType =
   | 'AI_MODEL_INVOCATION' // the real, wired side effect (→ AI_MODEL_INVOKED event)
@@ -32,6 +32,56 @@ export type GovernedActionType =
   | 'AGENT_TOOL_EXECUTION';
 
 export type Environment = 'PREVIEW' | 'INTERNAL' | 'PRODUCTION';
+
+export type GovernedExecutionMode = 'SIMULATION' | 'SANDBOX' | 'PRODUCTION';
+
+export type GovernedExecutionStatus = 'SIMULATED_SUCCESS' | 'SIMULATED_ACKNOWLEDGED' | 'SUCCEEDED' | 'FAILED';
+
+export type GovernedReceiptSafeMetadata =
+  | {
+      destination_alias: 'STAGING_SYNTHETIC_SINK';
+      payload_hash: string;
+      synthetic_byte_count: number;
+      content_type_category: 'STRUCTURED_DATA' | 'TEXT' | 'BINARY';
+    }
+  | {
+      simulated_order_id: string;
+      instrument_hash: string;
+      synthetic_quantity_category: 'UNIT' | 'SMALL' | 'MEDIUM' | 'LARGE';
+      risk_category: 'LOW' | 'MEDIUM' | 'HIGH';
+      simulated_route_alias: 'STAGING_SIMULATED_ROUTE';
+      accepted_at: string;
+    };
+
+/** Browser-safe terminal receipt. Raw action material never appears here. */
+export interface GovernedActionReceipt {
+  receipt_id: string;
+  evaluation_id: string;
+  action_request_id: string;
+  action_digest: string;
+  action_type: GovernedActionType;
+  adapter_id: string;
+  adapter_version: string;
+  execution_mode: GovernedExecutionMode;
+  execution_status: GovernedExecutionStatus;
+  adapter_executed: boolean;
+  external_effect_performed: boolean;
+  policy_profile_id: string;
+  policy_profile_version: number;
+  policy_profile_hash: string;
+  enforcement_plan_id: string;
+  enforcement_plan_version: number;
+  enforcement_plan_hash: string;
+  result_hash: string;
+  safe_result_metadata: GovernedReceiptSafeMetadata;
+  started_at: string;
+  completed_at: string;
+  incident_reference?: string;
+  receipt_schema_version: 'gate04-receipt-1.0.0';
+  ledger_event_id?: string;
+  ledger_event_hash?: string;
+  ledger_seq?: number;
+}
 
 // ─── Decision & control result ────────────────────────────────────────────────
 
@@ -91,7 +141,10 @@ export type ReasonCode =
   | 'EVALUATION_CONSUMED'
   | 'DECISION_RECORD_FAILED'
   | 'APPROVAL_CONSUMPTION_FAILED'
-  | 'LEDGER_UNAVAILABLE';
+  | 'LEDGER_UNAVAILABLE'
+  | 'ADAPTER_NOT_CONFIGURED'
+  | 'ADAPTER_EXECUTION_FAILED'
+  | 'RECEIPT_RECORD_FAILED';
 
 export interface ControlResult {
   control_id: string;

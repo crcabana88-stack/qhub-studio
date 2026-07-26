@@ -84,11 +84,22 @@ export async function action({ request, context }: ActionFunctionArgs) {
       env,
     });
 
+    if (decision.execution_status === 'FAILED') {
+      return json(
+        { ok: false, ...decision, error: 'Governed action execution failed; reconciliation may be required' },
+        { status: 502 },
+      );
+    }
+
     return json({ ok: true, ...decision });
   } catch (err) {
     console.error('[api.enforce] error:', err);
+
     // Fail closed — never treat an enforcement error as permission.
-    return json({ ok: false, decision: 'DENY', reason_codes: ['DECISION_RECORD_FAILED'], error: 'Enforcement error' }, { status: 500 });
+    return json(
+      { ok: false, decision: 'DENY', reason_codes: ['DECISION_RECORD_FAILED'], error: 'Enforcement error' },
+      { status: 500 },
+    );
   }
 }
 

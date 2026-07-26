@@ -15,6 +15,9 @@ primary_region = "iad"   # us-east (IAD) — closest to NY financial clients
   NODE_ENV = "production"
   VITE_LOG_LEVEL = "warn"
   PORT = "5173"
+  QHUB_DEPLOY_ENV = "staging"
+  QHUB_PUBLIC_HOSTNAME = "qhub-studio.fly.dev"
+  QHUB_ENABLE_GATE04_SIMULATION_ADAPTERS = "1"
   # Non-secret build-time vars only.
   # Runtime secrets (QHUB_HMAC_SECRET, SUPABASE_URL, etc.) set via:
   #   fly secrets set KEY=value

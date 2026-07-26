@@ -405,13 +405,25 @@ export async function markActionEvidence(
   orgId: string,
   state: 'COMMITTED' | 'FAILED',
   env: Record<string, string | undefined>,
-): Promise<void> {
+): Promise<boolean> {
   const sb = admin(env);
-  await sb
+  const { data, error } = await sb
     .from('qhub_control_evaluations')
     .update({ action_event_state: state })
     .eq('evaluation_id', evaluationId)
-    .eq('org_id', orgId);
+    .eq('org_id', orgId)
+    .select('evaluation_id');
+
+  if (error || !data || data.length !== 1) {
+    console.error(
+      '[Enforcement] markActionEvidence failed:',
+      error?.message ?? `expected one evaluation row, updated ${data?.length ?? 0}`,
+    );
+
+    return false;
+  }
+
+  return true;
 }
 
 // ─── Kill switch ──────────────────────────────────────────────────────────────

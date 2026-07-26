@@ -110,6 +110,7 @@ type LambdaEventType =
   | 'CLASSIFICATION_ASSIGNED'
   | 'POLICY_PROFILE_ASSIGNED' // Gate 03 — deterministic policy profile bound to the app
   | 'CONTROL_DECISION_RECORDED' // Gate 04 — authoritative enforcement decision for one action
+  | 'GOVERNED_ACTION_RECEIPT_RECORDED'
   | 'GATE_PASSED'
   | 'GATE_FAILED'
   | 'ATTESTATION_SIGNED'
@@ -749,7 +750,7 @@ export class GovernanceService {
   }): Promise<GovernanceResult> {
     if (!this.hmacSecret) {
       console.warn('[GovernanceService] No HMAC secret — AI_MODEL_INVOKED skipped');
-      return { ok: true };
+      return { ok: false, error: 'Ledger signing unavailable' };
     }
 
     let appRecord;
@@ -858,6 +859,49 @@ export class GovernanceService {
     const result = await this.postEvent(body);
 
     return { ok: result.ok };
+  }
+
+  /**
+   * Gate 04 / event catalog v2.10 — durable terminal governed-adapter receipt.
+   * The payload is already compact and allowlisted by the server-only adapter;
+   * do not append session data or raw action material.
+   */
+  async recordGovernedActionReceipt(params: {
+    conversationId: string;
+    chainId: string | null;
+    riskTier: LedgerRiskTier;
+    qhubAppId: string;
+    payload: Record<string, unknown>;
+  }): Promise<{ ok: boolean; eventId?: string; eventHash?: string; seq?: number }> {
+    if (!this.hmacSecret) {
+      console.warn('[GovernanceService] No HMAC secret — GOVERNED_ACTION_RECEIPT_RECORDED skipped');
+
+      return { ok: false };
+    }
+
+    const chainId = params.chainId ?? (await getChainId(params.conversationId, this.ctx.orgId, this.ctx.env));
+
+    if (!chainId) {
+      return { ok: false };
+    }
+
+    const body: LambdaEventBody = {
+      chain_id: chainId,
+      event_type: 'GOVERNED_ACTION_RECEIPT_RECORDED',
+      app_id: params.qhubAppId,
+      client_id: this.ctx.orgId,
+      actor: { id: this.ctx.userId, type: 'human', identity_provider: 'supabase' },
+      payload: params.payload,
+      risk_tier: params.riskTier,
+    };
+    const result = await this.postEvent(body);
+
+    return {
+      ok: result.ok,
+      eventId: result.data?.event_id,
+      eventHash: result.data?.event_hash,
+      seq: result.data?.seq,
+    };
   }
 
   private async recordAiModelInvoked(

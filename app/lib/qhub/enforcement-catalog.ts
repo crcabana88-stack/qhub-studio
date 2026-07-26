@@ -11,8 +11,12 @@
 import type { ClassificationSignals, RiskTier } from './classification';
 import type { EnforcementPhase, GovernedActionType } from './enforcement';
 
-/** The only action type wired to a real executing side effect today. */
-export const WIRED_ACTION_TYPES: GovernedActionType[] = ['AI_MODEL_INVOCATION'];
+/** Action types with server-owned execution adapters. Two are staging simulations. */
+export const WIRED_ACTION_TYPES: GovernedActionType[] = [
+  'AI_MODEL_INVOCATION',
+  'EXTERNAL_DATA_TRANSMISSION',
+  'TRADING_OR_ORDER_ROUTING',
+];
 
 /** Consequential action types (never auto-ALLOW without governing controls). */
 export const CONSEQUENTIAL_ACTIONS: GovernedActionType[] = [
@@ -37,6 +41,7 @@ export const PRODUCTION_CAPABLE_ACTIONS: GovernedActionType[] = [
 export interface ControlEnforcement {
   adapter: string;
   phase: EnforcementPhase;
+
   /** Action types this control gates at runtime. */
   guards: GovernedActionType[];
   title: string;
@@ -70,7 +75,13 @@ export const CONTROL_ENFORCEMENT: Record<string, ControlEnforcement> = {
     adapter: 'OWNER_ATTESTATION',
     phase: 'ATTESTATION',
     title: 'Owner attestation before production',
-    guards: ['DEPLOYMENT_EXECUTION', 'PRODUCTION_EXECUTION', 'EXTERNAL_DATA_TRANSMISSION', 'DATABASE_MUTATION', 'TRADING_OR_ORDER_ROUTING'],
+    guards: [
+      'DEPLOYMENT_EXECUTION',
+      'PRODUCTION_EXECUTION',
+      'EXTERNAL_DATA_TRANSMISSION',
+      'DATABASE_MUTATION',
+      'TRADING_OR_ORDER_ROUTING',
+    ],
   },
   'HO-DUAL-CONTROL': {
     adapter: 'DUAL_CONTROL',
@@ -118,7 +129,13 @@ export const CONTROL_ENFORCEMENT: Record<string, ControlEnforcement> = {
     adapter: 'RBAC',
     phase: 'RUNTIME',
     title: 'Formal RBAC',
-    guards: ['DEPLOYMENT_EXECUTION', 'PRODUCTION_EXECUTION', 'EXTERNAL_DATA_TRANSMISSION', 'DATABASE_MUTATION', 'TRADING_OR_ORDER_ROUTING'],
+    guards: [
+      'DEPLOYMENT_EXECUTION',
+      'PRODUCTION_EXECUTION',
+      'EXTERNAL_DATA_TRANSMISSION',
+      'DATABASE_MUTATION',
+      'TRADING_OR_ORDER_ROUTING',
+    ],
   },
   'TI-STRICT-ISOLATION': {
     adapter: 'TENANT_ISOLATION',
