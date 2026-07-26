@@ -24,7 +24,32 @@
  * a NON-SECRET diagnostic value — surfaced in /api/health and /api/system/schema-check
  * so an expected-vs-current comparison is trivial. Bump on every schema change.
  */
-export const EXPECTED_SCHEMA_VERSION = '2026-07-25.gate03';
+export const EXPECTED_SCHEMA_VERSION = '2026-07-26.gate04';
+
+/** Service-role-only metadata verifier introduced by Gate 04 assurance. */
+export const SCHEMA_VERIFIER_RPC = 'qhub_verify_governance_schema';
+
+export type SchemaCheckCategory =
+  | 'TABLE'
+  | 'COLUMN'
+  | 'CONSTRAINT'
+  | 'INDEX'
+  | 'RLS_ENABLED'
+  | 'RLS_POLICY'
+  | 'FUNCTION';
+
+export interface GovernanceSchemaCheck {
+  identifier: string;
+  category: SchemaCheckCategory;
+  ready: boolean;
+  reason_code: string;
+}
+
+export interface GovernanceSchemaVerification {
+  expected_version: string;
+  ready: boolean;
+  checks: GovernanceSchemaCheck[];
+}
 
 // ─── Required objects (probe one representative column per migration) ──────────
 
@@ -77,6 +102,30 @@ export const REQUIRED_SCHEMA_OBJECTS: RequiredSchemaObject[] = [
     column: 'proposal_id',
     migration: '20260725_gate03_policy',
     requiredBy: 'Gate 03 server-authoritative classification proposals',
+  },
+  {
+    table: 'qhub_enforcement_plans',
+    column: 'enforcement_plan_hash',
+    migration: '20260726_gate04_enforcement',
+    requiredBy: 'Gate 04 compiled enforcement-plan persistence',
+  },
+  {
+    table: 'qhub_control_evaluations',
+    column: 'action_request_id',
+    migration: '20260726_gate04_enforcement',
+    requiredBy: 'Gate 04 decision, replay, and single-use claim persistence',
+  },
+  {
+    table: 'qhub_control_approvals',
+    column: 'consumed_by_evaluation',
+    migration: '20260726_gate04_enforcement',
+    requiredBy: 'Gate 04 digest-bound approval consumption',
+  },
+  {
+    table: 'qhub_applications',
+    column: 'kill_switch_active',
+    migration: '20260726_gate04_enforcement',
+    requiredBy: 'Gate 04 server-authoritative kill switch',
   },
 ];
 

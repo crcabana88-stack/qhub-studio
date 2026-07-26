@@ -15,7 +15,11 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { getOrCreateQhubApp, getChainId, getClassification, getPolicyProfile } from './qhub-app.server';
 import { canonicalPolicyString } from './policy-engine';
-import { compileEnforcementPlan, canonicalEnforcementPlanString, canonicalActionRequestString } from './enforcement-plan';
+import {
+  compileEnforcementPlan,
+  canonicalEnforcementPlanString,
+  canonicalActionRequestString,
+} from './enforcement-plan';
 import { evaluate } from './enforcement-decision';
 import { assertGovernanceSchemaReady } from './schema-check.server';
 import { createGovernanceService } from './governance-service.server';
@@ -155,6 +159,20 @@ export async function enforceGovernedAction(input: EnforceInput): Promise<Enforc
 
   // 5. Active enforcement plan — compile & persist if absent or policy revised.
   const stored = await store.getActivePlan(app.qhub_app_id, session.orgId, env);
+  const storedBindingValid =
+    !stored ||
+    (stored.enforcement_plan_id === stored.plan.enforcement_plan_id &&
+      stored.org_id === session.orgId &&
+      stored.qhub_app_id === app.qhub_app_id &&
+      stored.plan.qhub_app_id === app.qhub_app_id &&
+      stored.policy_profile_id === stored.plan.policy_profile_id &&
+      stored.policy_profile_hash === stored.plan.policy_profile_hash &&
+      stored.enforcement_plan_hash === stored.plan.enforcement_plan_hash);
+
+  if (!storedBindingValid) {
+    return blocked('PLAN_HASH_MISMATCH', action.action_type, app.qhub_app_id);
+  }
+
   let plan = stored?.plan ?? null;
 
   if (!plan || plan.policy_profile_hash !== profile.policy_profile_hash) {
@@ -173,15 +191,32 @@ export async function enforceGovernedAction(input: EnforceInput): Promise<Enforc
       return blocked('PLAN_COMPILE_FAILED', action.action_type, app.qhub_app_id);
     }
 
-    plan = compiled;
+    const persistedBindingValid =
+      persisted.enforcement_plan_id === compiled.enforcement_plan_id &&
+      persisted.org_id === session.orgId &&
+      persisted.qhub_app_id === app.qhub_app_id &&
+      persisted.plan.enforcement_plan_id === persisted.enforcement_plan_id &&
+      persisted.plan.qhub_app_id === persisted.qhub_app_id &&
+      persisted.policy_profile_id === compiled.policy_profile_id &&
+      persisted.policy_profile_hash === compiled.policy_profile_hash &&
+      persisted.enforcement_plan_hash === compiled.enforcement_plan_hash &&
+      sha256(canonicalEnforcementPlanString(persisted.plan)) === persisted.enforcement_plan_hash;
+
+    if (!persistedBindingValid) {
+      return blocked('PLAN_COMPILE_FAILED', action.action_type, app.qhub_app_id);
+    }
+
+    plan = persisted.plan;
   } else if (sha256(canonicalEnforcementPlanString(plan)) !== plan.enforcement_plan_hash) {
     return blocked('PLAN_HASH_MISMATCH', action.action_type, app.qhub_app_id);
   }
 
-  // 6a. Re-evaluation (E2) after approval: load the parent (server-side, never
-  // trusted from the browser) to link the audit chain and to assert E2 resolves
-  // to the SAME content digest as E1 (else the action changed → DENY). The digest
-  // is content-based, so E2 matches E1 without reusing the per-attempt request id.
+  /*
+   * 6a. Re-evaluation (E2) after approval: load the parent (server-side, never
+   * trusted from the browser) to link the audit chain and to assert E2 resolves
+   * to the SAME content digest as E1 (else the action changed → DENY). The digest
+   * is content-based, so E2 matches E1 without reusing the per-attempt request id.
+   */
   let parentDigest: string | null = null;
 
   if (input.parentEvaluationId) {
@@ -215,11 +250,13 @@ export async function enforceGovernedAction(input: EnforceInput): Promise<Enforc
     enforcement_plan_version: plan.enforcement_plan_version,
     enforcement_plan_hash: plan.enforcement_plan_hash,
   };
-  const action_digest = sha256(canonicalActionRequestString(request));
+  const actionDigest = sha256(canonicalActionRequestString(request));
 
-  // 6b. A re-evaluation must resolve to the SAME action — a changed action digest
-  // means the operation changed and the parent authorization does not apply.
-  if (parentDigest && action_digest !== parentDigest) {
+  /*
+   * 6b. A re-evaluation must resolve to the SAME action — a changed action digest
+   * means the operation changed and the parent authorization does not apply.
+   */
+  if (parentDigest && actionDigest !== parentDigest) {
     return blocked('ACTION_DIGEST_MISMATCH', action.action_type, app.qhub_app_id);
   }
 
@@ -233,13 +270,13 @@ export async function enforceGovernedAction(input: EnforceInput): Promise<Enforc
   }
 
   // 8. Authoritative state for the engine.
-  const approvals = await store.gatherApprovals(app.qhub_app_id, session.orgId, action_digest, env);
+  const approvals = await store.gatherApprovals(app.qhub_app_id, session.orgId, actionDigest, env);
   const killSwitch = await store.getKillSwitch(app.qhub_app_id, session.orgId, env);
 
   // 9. Deterministic decision.
   const result = evaluate({
     request,
-    action_digest,
+    action_digest: actionDigest,
     plan,
     risk_tier: profile.risk_tier,
     environment: action.environment,
@@ -251,20 +288,23 @@ export async function enforceGovernedAction(input: EnforceInput): Promise<Enforc
     actor_role: session.role,
   });
 
-  const evaluation_id = randomUUID();
-  const control_results_hash = sha256(stableStringify(result.control_results));
-  const compactControls = result.control_results.map((c: ControlResult) => ({ control_id: c.control_id, status: c.status }));
+  const evaluationId = randomUUID();
+  const controlResultsHash = sha256(stableStringify(result.control_results));
+  const compactControls = result.control_results.map((c: ControlResult) => ({
+    control_id: c.control_id,
+    status: c.status,
+  }));
 
   // 10. Persist the authoritative evaluation record.
   const ins = await store.insertEvaluation(
     {
-      evaluation_id,
+      evaluation_id: evaluationId,
       action_request_id: request.action_request_id,
       parent_evaluation_id: input.parentEvaluationId ?? null,
       org_id: session.orgId,
       qhub_app_id: app.qhub_app_id,
       action_type: action.action_type,
-      action_digest,
+      action_digest: actionDigest,
       environment: action.environment,
       decision: result.decision,
       reason_codes: result.reason_codes,
@@ -275,7 +315,7 @@ export async function enforceGovernedAction(input: EnforceInput): Promise<Enforc
       enforcement_plan_version: plan.enforcement_plan_version,
       enforcement_plan_hash: plan.enforcement_plan_hash,
       control_results: compactControls,
-      control_results_hash,
+      control_results_hash: controlResultsHash,
       required_attestations: result.required_attestations,
       evaluator_version: ENFORCEMENT_EVALUATOR_VERSION,
       idempotency_key: input.idempotencyKey ?? null,
@@ -301,11 +341,11 @@ export async function enforceGovernedAction(input: EnforceInput): Promise<Enforc
     riskTier: profile.risk_tier,
     qhubAppId: app.qhub_app_id,
     payload: {
-      evaluation_id,
+      evaluation_id: evaluationId,
       action_request_id: request.action_request_id,
       parent_evaluation_id: input.parentEvaluationId ?? null,
       action_type: action.action_type,
-      action_digest,
+      action_digest: actionDigest,
       environment: action.environment,
       decision: result.decision,
       reason_codes: result.reason_codes,
@@ -316,7 +356,7 @@ export async function enforceGovernedAction(input: EnforceInput): Promise<Enforc
       enforcement_plan_version: plan.enforcement_plan_version,
       enforcement_plan_hash: plan.enforcement_plan_hash,
       control_results: compactControls,
-      control_results_hash,
+      control_results_hash: controlResultsHash,
       required_attestations: result.required_attestations,
       evaluated_at: new Date().toISOString(),
       evaluator_version: ENFORCEMENT_EVALUATOR_VERSION,
@@ -324,12 +364,17 @@ export async function enforceGovernedAction(input: EnforceInput): Promise<Enforc
     },
   });
 
-  const base = toOutput(result, request, evaluation_id, action_digest, app.qhub_app_id, compactControls);
+  const base = toOutput(result, request, evaluationId, actionDigest, app.qhub_app_id, compactControls);
 
   // Fail closed: if the decision could not be durably recorded on-chain, do not execute.
   if (!decisionEvent.ok) {
-    await store.markActionEvidence(evaluation_id, session.orgId, 'FAILED', env);
-    return { ...base, reason_codes: [...base.reason_codes, 'DECISION_RECORD_FAILED'], evidence_recorded: false, side_effect_performed: false };
+    await store.markActionEvidence(evaluationId, session.orgId, 'FAILED', env);
+    return {
+      ...base,
+      reason_codes: [...base.reason_codes, 'DECISION_RECORD_FAILED'],
+      evidence_recorded: false,
+      side_effect_performed: false,
+    };
   }
 
   // 12. Non-ALLOW → the recorded decision (DENY is the block record) is the result.
@@ -338,14 +383,34 @@ export async function enforceGovernedAction(input: EnforceInput): Promise<Enforc
   }
 
   // 13. ALLOW → atomically claim the single-use side effect.
-  const claimed = await store.claimEvaluation(evaluation_id, session.orgId, env);
+  const claimed = await store.claimEvaluation(evaluationId, session.orgId, env);
 
   if (!claimed) {
     // Already claimed (replay/concurrent) — no second side effect.
-    return { ...base, reason_codes: [...base.reason_codes, 'REPLAY_DENIED'], evidence_recorded: true, side_effect_performed: false };
+    return {
+      ...base,
+      reason_codes: [...base.reason_codes, 'REPLAY_DENIED'],
+      evidence_recorded: true,
+      side_effect_performed: false,
+    };
   }
 
-  await store.consumeApprovalsForDigest(app.qhub_app_id, session.orgId, action_digest, evaluation_id, env);
+  const approvalsConsumed = await store.consumeApprovalsForDigest(
+    app.qhub_app_id,
+    session.orgId,
+    actionDigest,
+    evaluationId,
+    env,
+  );
+
+  if (!approvalsConsumed) {
+    return {
+      ...base,
+      reason_codes: [...base.reason_codes, 'APPROVAL_CONSUMPTION_FAILED'],
+      evidence_recorded: true,
+      side_effect_performed: false,
+    };
+  }
 
   // Perform the protected side effect for WIRED action types only.
   let sideEffectPerformed = false;
@@ -357,9 +422,9 @@ export async function enforceGovernedAction(input: EnforceInput): Promise<Enforc
       provider: action.provider_identity ?? 'Anthropic',
       model: action.model_identity ?? 'unknown',
       enforcement: {
-        evaluation_id,
+        evaluation_id: evaluationId,
         action_request_id: request.action_request_id,
-        action_digest,
+        action_digest: actionDigest,
         enforcement_plan_id: plan.enforcement_plan_id,
         enforcement_plan_version: plan.enforcement_plan_version,
         enforcement_plan_hash: plan.enforcement_plan_hash,
@@ -367,11 +432,12 @@ export async function enforceGovernedAction(input: EnforceInput): Promise<Enforc
     });
     sideEffectPerformed = ai.ok;
     evidenceRecorded = ai.ok;
+
     // Post-action evidence must not vanish silently — mark the outbox state.
-    await store.markActionEvidence(evaluation_id, session.orgId, ai.ok ? 'COMMITTED' : 'FAILED', env);
+    await store.markActionEvidence(evaluationId, session.orgId, ai.ok ? 'COMMITTED' : 'FAILED', env);
   } else {
     // Not operationally wired to a side effect adapter — decision recorded only.
-    await store.markActionEvidence(evaluation_id, session.orgId, 'COMMITTED', env);
+    await store.markActionEvidence(evaluationId, session.orgId, 'COMMITTED', env);
   }
 
   return { ...base, evidence_recorded: evidenceRecorded, side_effect_performed: sideEffectPerformed };

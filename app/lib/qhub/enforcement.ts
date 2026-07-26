@@ -90,6 +90,7 @@ export type ReasonCode =
   | 'REPLAY_DENIED'
   | 'EVALUATION_CONSUMED'
   | 'DECISION_RECORD_FAILED'
+  | 'APPROVAL_CONSUMPTION_FAILED'
   | 'LEDGER_UNAVAILABLE';
 
 export interface ControlResult {
@@ -105,10 +106,12 @@ export interface EnforcementPlanEntry {
   title: string;
   phase: EnforcementPhase;
   adapter: string;
+
   /** Which action types this control gates. */
   guards: GovernedActionType[];
   mandatory: boolean;
   failure_mode: FailureMode;
+
   /** Whether a registered adapter exists to enforce this control at runtime. */
   enforceable: boolean;
   params?: Record<string, string | number | boolean | string[]>;
@@ -118,9 +121,11 @@ export interface ApprovalRequirement {
   requirement_id: string;
   attestation_type: string; // e.g. OWNER_ATTESTATION, AUTHORIZED_GOVERNANCE_APPROVAL
   applies_to: GovernedActionType[];
+
   /** Number of distinct approvals required (2 = dual control / four-eyes). */
   min_approvals: number;
   distinct_approvers: boolean;
+
   /** Roles that may satisfy this requirement (empty = any authenticated approver). */
   roles: string[];
 }
@@ -159,8 +164,10 @@ export interface EnforcementPlan {
 
   /** Action types restricted to preview/sandbox until production is authorized. */
   preview_only_actions: GovernedActionType[];
+
   /** Action types whose PRODUCTION environment requires explicit authorized approval. */
   production_restricted_actions: GovernedActionType[];
+
   /** Action types on which unrestricted autonomy is prohibited. */
   no_unrestricted_autonomy_actions: GovernedActionType[];
   kill_switch_required: boolean;
@@ -201,6 +208,7 @@ export interface GatheredApproval {
   attestation_type: string;
   approver_id: string;
   approver_role: string;
+
   /** Digest the approval was scoped to; must equal the action_digest under evaluation. */
   scoped_action_digest: string;
   scoped_policy_profile_hash: string;
@@ -215,13 +223,17 @@ export interface DecisionEngineInput {
   plan: EnforcementPlan;
   risk_tier: RiskTier;
   environment: Environment;
+
   /** Whether the caller requested unrestricted autonomous behavior. */
   autonomy_requested: 'NONE' | 'RESTRICTED' | 'UNRESTRICTED';
   kill_switch_active: boolean;
+
   /** Approvals already gathered for THIS exact action_digest + versions. */
   approvals: GatheredApproval[];
+
   /** Current usage per limit_id (for limit checks). */
   limit_usage: Record<string, number>;
+
   /** Actor requesting the action (for self-approval / RBAC checks). */
   actor_id: string;
   actor_role: string;

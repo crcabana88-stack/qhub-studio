@@ -27,8 +27,11 @@
 import {
   EXPECTED_SCHEMA_VERSION,
   REQUIRED_SCHEMA_OBJECTS,
+  SCHEMA_VERIFIER_RPC,
   isSchemaMissingError,
   projectRefFromUrl,
+  type GovernanceSchemaCheck,
+  type GovernanceSchemaVerification,
   type RequiredSchemaObject,
 } from './schema-contract';
 
@@ -44,6 +47,10 @@ export interface SchemaObjectStatus extends RequiredSchemaObject {
 
   /** Non-secret detail: PostgREST error code or a short reason. */
   detail?: string;
+
+  /** Gate 04 metadata category and stable non-sensitive identifier. */
+  category?: GovernanceSchemaCheck['category'];
+  identifier?: string;
 }
 
 export interface SchemaReadinessReport {
@@ -168,6 +175,79 @@ async function probeObject(url: string, serviceKey: string, obj: RequiredSchemaO
   }
 }
 
+async function probeMetadataContract(
+  url: string,
+  serviceKey: string,
+): Promise<{ objects: SchemaObjectStatus[]; error?: string }> {
+  try {
+    const res = await fetch(`${url.replace(/\/$/, '')}/rest/v1/rpc/${SCHEMA_VERIFIER_RPC}`, {
+      method: 'POST',
+      headers: {
+        apikey: serviceKey,
+        Authorization: `Bearer ${serviceKey}`,
+        Accept: 'application/json',
+        'Content-Type': 'application/json',
+      },
+      body: '{}',
+      signal: AbortSignal.timeout(8000),
+    });
+
+    if (!res.ok) {
+      const body = (await res.json().catch(() => null)) as { code?: string } | null;
+      return {
+        objects: [
+          {
+            table: 'governance_schema',
+            column: SCHEMA_VERIFIER_RPC,
+            migration: '20260726_gate04_schema_assurance_approval_cleanup',
+            requiredBy: 'Gate 04 metadata assurance',
+            identifier: `function.${SCHEMA_VERIFIER_RPC}`,
+            category: 'FUNCTION',
+            state: res.status === 404 ? 'missing' : 'unknown',
+            httpStatus: res.status,
+            detail: body?.code ?? `HTTP ${res.status}`,
+          },
+        ],
+        ...(res.status === 404 ? {} : { error: `Metadata verifier returned HTTP ${res.status}.` }),
+      };
+    }
+
+    const verification = (await res.json()) as GovernanceSchemaVerification;
+
+    if (
+      verification?.expected_version !== EXPECTED_SCHEMA_VERSION ||
+      typeof verification?.ready !== 'boolean' ||
+      !Array.isArray(verification?.checks)
+    ) {
+      return { objects: [], error: 'Metadata verifier returned an invalid or stale contract.' };
+    }
+
+    const objects = verification.checks.map(
+      (check): SchemaObjectStatus => ({
+        table: 'governance_schema',
+        column: check.identifier,
+        migration: '20260726_gate04_schema_assurance_approval_cleanup',
+        requiredBy: `Gate 04 ${check.category.toLowerCase()} assurance`,
+        identifier: check.identifier,
+        category: check.category,
+        state: check.ready ? 'present' : 'missing',
+        detail: check.reason_code,
+      }),
+    );
+
+    if (verification.ready !== objects.every((o) => o.state === 'present')) {
+      return { objects, error: 'Metadata verifier readiness summary is internally inconsistent.' };
+    }
+
+    return { objects };
+  } catch (err) {
+    return {
+      objects: [],
+      error: `Metadata verifier could not be reached (${err instanceof Error ? err.name : 'unknown error'}).`,
+    };
+  }
+}
+
 // ─── Public: readiness report (cached) ────────────────────────────────────────
 
 /**
@@ -215,13 +295,15 @@ export async function getSchemaReadiness(
     }
   }
 
-  const objects = await Promise.all(
+  const columnObjects = await Promise.all(
     REQUIRED_SCHEMA_OBJECTS.map((obj) => probeObject(creds.url, creds.serviceKey, obj)),
   );
+  const metadata = await probeMetadataContract(creds.url, creds.serviceKey);
+  const objects = [...columnObjects, ...metadata.objects];
 
   const missing = objects.filter((o) => o.state === 'missing');
   const unknown = objects.filter((o) => o.state === 'unknown');
-  const ready = missing.length === 0 && unknown.length === 0;
+  const ready = missing.length === 0 && unknown.length === 0 && !metadata.error;
 
   const report: SchemaReadinessReport = {
     ready,
@@ -231,11 +313,13 @@ export async function getSchemaReadiness(
     checkedAt: new Date().toISOString(),
     objects,
     missing,
-    ...(unknown.length > 0 && missing.length === 0
-      ? {
-          error: `Could not verify ${unknown.length} object(s): ${unknown.map((u) => `${u.table}.${u.column}`).join(', ')}`,
-        }
-      : {}),
+    ...(metadata.error
+      ? { error: metadata.error }
+      : unknown.length > 0 && missing.length === 0
+        ? {
+            error: `Could not verify ${unknown.length} object(s): ${unknown.map((u) => `${u.table}.${u.column}`).join(', ')}`,
+          }
+        : {}),
   };
 
   cache.set(cacheKey, { report, expiresAt: now + (ready ? READY_TTL_MS : NOT_READY_TTL_MS) });

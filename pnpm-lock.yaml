@@ -366,6 +366,9 @@ importers:
       '@cloudflare/workers-types':
         specifier: ^4.20251011.0
         version: 4.20251014.0
+      '@electric-sql/pglite':
+        specifier: 0.3.14
+        version: 0.3.14
       '@electron/notarize':
         specifier: ^2.5.0
         version: 2.5.0
@@ -1124,6 +1127,9 @@ packages:
   '@develar/schema-utils@2.6.5':
     resolution: {integrity: sha512-0cp4PsWQ/9avqTVMCtZ+GirikIA36ikvjtHweU4/j8yLtgObI0+JUPhYFScgwlteveGB1rt3Cm8UhN04XayDig==}
     engines: {node: '>= 8.9.0'}
+
+  '@electric-sql/pglite@0.3.14':
+    resolution: {integrity: sha512-3DB258dhqdsArOI1fIt7cb9RpUOgcDg5hXWVgVHAeqVQ/qxtFy605QKs4gx6mFq3jWsSPqDN8TgSEsqC3OfV9Q==}
 
   '@electron/asar@3.2.18':
     resolution: {integrity: sha512-2XyvMe3N3Nrs8cV39IKELRHTYUWFKrmqqSY1U+GMlc0jvqjIVnoxhNd2H4JolWQncbJi1DCvb5TNxZuI2fEjWg==}
@@ -9407,6 +9413,8 @@ snapshots:
     dependencies:
       ajv: 6.12.6
       ajv-keywords: 3.5.2(ajv@6.12.6)
+
+  '@electric-sql/pglite@0.3.14': {}
 
   '@electron/asar@3.2.18':
     dependencies:

@@ -4,7 +4,7 @@
  *
  * Durable records for enforcement plans, control evaluations, and scoped
  * single-use approvals, plus the kill switch. Security-critical transitions use
- * conditional writes (Postgres row-level atomic UPDATE) so they cannot race:
+ * service-role-only Postgres functions so they cannot race:
  *   - claimEvaluation(): flips claimed false->true exactly once (side-effect gate)
  *   - consumeApproval():  flips GRANTED->CONSUMED exactly once (single-use)
  *
@@ -30,11 +30,18 @@ function admin(env: Record<string, string | undefined>): SupabaseClient {
 
 export interface StoredPlan {
   enforcement_plan_id: string;
+  org_id: string;
+  qhub_app_id: string;
   enforcement_plan_version: number;
+  policy_profile_id: string | null;
+  policy_profile_hash: string;
   enforcement_plan_hash: string;
   status: string;
   plan: EnforcementPlan;
 }
+
+const STORED_PLAN_COLUMNS =
+  'enforcement_plan_id, org_id, qhub_app_id, enforcement_plan_version, policy_profile_id, policy_profile_hash, enforcement_plan_hash, status, plan';
 
 /** Get the ACTIVE plan for an app (tenant-scoped). Null if none. */
 export async function getActivePlan(
@@ -45,7 +52,7 @@ export async function getActivePlan(
   const sb = admin(env);
   const { data, error } = await sb
     .from('qhub_enforcement_plans')
-    .select('enforcement_plan_id, enforcement_plan_version, enforcement_plan_hash, status, plan')
+    .select(STORED_PLAN_COLUMNS)
     .eq('qhub_app_id', qhubAppId)
     .eq('org_id', orgId)
     .eq('status', 'ACTIVE')
@@ -82,6 +89,7 @@ export async function persistActivePlan(
   const { data, error } = await sb
     .from('qhub_enforcement_plans')
     .insert({
+      enforcement_plan_id: plan.enforcement_plan_id,
       org_id: orgId,
       qhub_app_id: plan.qhub_app_id,
       enforcement_plan_version: plan.enforcement_plan_version,
@@ -98,7 +106,7 @@ export async function persistActivePlan(
       generated_at: plan.generated_at,
       generated_by: generatedBy,
     })
-    .select('enforcement_plan_id, enforcement_plan_version, enforcement_plan_hash, status, plan')
+    .select(STORED_PLAN_COLUMNS)
     .single();
 
   if (error || !data) {
@@ -121,7 +129,9 @@ export async function gatherApprovals(
   const sb = admin(env);
   const { data, error } = await sb
     .from('qhub_control_approvals')
-    .select('attestation_type, approver_id, approver_role, action_digest, scoped_policy_profile_hash, scoped_enforcement_plan_hash, status, expires_at')
+    .select(
+      'attestation_type, approver_id, approver_role, action_digest, scoped_policy_profile_hash, scoped_enforcement_plan_hash, status, expires_at',
+    )
     .eq('qhub_app_id', qhubAppId)
     .eq('org_id', orgId)
     .eq('action_digest', actionDigest);
@@ -140,7 +150,9 @@ export async function gatherApprovals(
     scoped_policy_profile_hash: a.scoped_policy_profile_hash,
     scoped_enforcement_plan_hash: a.scoped_enforcement_plan_hash,
     status:
-      a.status === 'GRANTED' && new Date(a.expires_at).getTime() < now ? 'EXPIRED' : (a.status as GatheredApproval['status']),
+      a.status === 'GRANTED' && new Date(a.expires_at).getTime() < now
+        ? 'EXPIRED'
+        : (a.status as GatheredApproval['status']),
     expires_at: a.expires_at,
   }));
 }
@@ -161,7 +173,7 @@ export async function grantApproval(
   env: Record<string, string | undefined>,
 ): Promise<{ ok: boolean; approvalId?: string; error?: string }> {
   const sb = admin(env);
-  const expires_at = new Date(Date.now() + params.ttlMinutes * 60_000).toISOString();
+  const expiresAt = new Date(Date.now() + params.ttlMinutes * 60_000).toISOString();
   const { data, error } = await sb
     .from('qhub_control_approvals')
     .insert({
@@ -175,7 +187,7 @@ export async function grantApproval(
       approver_role: params.approverRole,
       single_use: true,
       status: 'GRANTED',
-      expires_at,
+      expires_at: expiresAt,
       created_by: params.createdBy,
     })
     .select('approval_id')
@@ -205,23 +217,28 @@ export async function revokeApproval(
   return !!data && data.length === 1;
 }
 
-/** Consume all GRANTED single-use approvals scoped to a digest (atomic per row). */
+/** Consume all unexpired GRANTED single-use approvals in one atomic transaction. */
 export async function consumeApprovalsForDigest(
   qhubAppId: string,
   orgId: string,
   actionDigest: string,
   evaluationId: string,
   env: Record<string, string | undefined>,
-): Promise<void> {
+): Promise<boolean> {
   const sb = admin(env);
-  await sb
-    .from('qhub_control_approvals')
-    .update({ status: 'CONSUMED', consumed_at: new Date().toISOString(), consumed_by_evaluation: evaluationId })
-    .eq('qhub_app_id', qhubAppId)
-    .eq('org_id', orgId)
-    .eq('action_digest', actionDigest)
-    .eq('single_use', true)
-    .eq('status', 'GRANTED');
+  const { error } = await sb.rpc('qhub_consume_control_approvals', {
+    p_qhub_app_id: qhubAppId,
+    p_org_id: orgId,
+    p_action_digest: actionDigest,
+    p_evaluation_id: evaluationId,
+  });
+
+  if (error) {
+    console.error('[Enforcement] approval consumption failed:', error.message);
+    return false;
+  }
+
+  return true;
 }
 
 // ─── Evaluations ──────────────────────────────────────────────────────────────
@@ -344,7 +361,9 @@ export async function insertEvaluation(
     if (error.code === '23505') {
       const existing =
         (await getEvaluationByActionRequestId(rec.org_id, rec.action_request_id, env)) ??
-        (rec.idempotency_key ? await getEvaluationByIdempotency(rec.org_id, rec.qhub_app_id, rec.idempotency_key, env) : null);
+        (rec.idempotency_key
+          ? await getEvaluationByIdempotency(rec.org_id, rec.qhub_app_id, rec.idempotency_key, env)
+          : null);
 
       if (existing) {
         return { ok: false, duplicate: true, existing };
@@ -367,21 +386,17 @@ export async function claimEvaluation(
   env: Record<string, string | undefined>,
 ): Promise<boolean> {
   const sb = admin(env);
-  const { data, error } = await sb
-    .from('qhub_control_evaluations')
-    .update({ claimed: true, claimed_at: new Date().toISOString(), action_event_state: 'PENDING' })
-    .eq('evaluation_id', evaluationId)
-    .eq('org_id', orgId)
-    .eq('decision', 'ALLOW')
-    .eq('claimed', false)
-    .select('evaluation_id');
+  const { data, error } = await sb.rpc('qhub_claim_control_evaluation', {
+    p_evaluation_id: evaluationId,
+    p_org_id: orgId,
+  });
 
   if (error) {
     console.error('[Enforcement] claimEvaluation failed:', error.message);
     return false;
   }
 
-  return !!data && data.length === 1;
+  return data === true;
 }
 
 /** Record the post-action evidence outcome (durable outbox state). */

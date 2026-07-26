@@ -46,7 +46,7 @@ vi.mock('~/lib/auth/session', () => ({
 function readyReport(overrides: Partial<SchemaReadinessReport> = {}): SchemaReadinessReport {
   return {
     ready: true,
-    expectedSchemaVersion: '2026-07-25.gate03',
+    expectedSchemaVersion: '2026-07-26.gate04',
     projectRef: 'jsjsanmaahvmynblmzkq',
     supabaseHost: 'jsjsanmaahvmynblmzkq.supabase.co',
     checkedAt: '2026-07-25T00:00:00Z',
@@ -193,7 +193,7 @@ describe('governance fails closed when the schema is behind the code', () => {
       new (schemaCheck.SchemaNotReadyError as any)({
         missing: [{ table: 'qhub_applications', column: 'classification' }],
         projectRef: 'wrong-project',
-        expectedSchemaVersion: '2026-07-25.gate03',
+        expectedSchemaVersion: '2026-07-26.gate04',
       }),
     );
 

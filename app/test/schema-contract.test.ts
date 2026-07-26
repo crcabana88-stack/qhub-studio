@@ -58,6 +58,7 @@ describe('REQUIRED_SCHEMA_OBJECTS', () => {
     expect(migrations.has('20260723_qhub_applications')).toBe(true);
     expect(migrations.has('20260725_qhub_classification')).toBe(true);
     expect(migrations.has('20260725_gate03_policy')).toBe(true);
+    expect(migrations.has('20260726_gate04_enforcement')).toBe(true);
   });
 
   it('includes the exact objects that masked the Gate 03 mismatch', () => {
@@ -69,6 +70,6 @@ describe('REQUIRED_SCHEMA_OBJECTS', () => {
   });
 
   it('has a pinned expected schema version', () => {
-    expect(EXPECTED_SCHEMA_VERSION).toMatch(/gate03/);
+    expect(EXPECTED_SCHEMA_VERSION).toBe('2026-07-26.gate04');
   });
 });

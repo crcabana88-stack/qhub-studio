@@ -27,7 +27,8 @@ import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 
-const EXPECTED_SCHEMA_VERSION = '2026-07-25.gate03';
+const EXPECTED_SCHEMA_VERSION = '2026-07-26.gate04';
+const SCHEMA_VERIFIER_RPC = 'qhub_verify_governance_schema';
 
 /** @type {{table:string,column:string,migration:string}[]} */
 const REQUIRED_SCHEMA_OBJECTS = [
@@ -35,6 +36,10 @@ const REQUIRED_SCHEMA_OBJECTS = [
   { table: 'qhub_applications', column: 'classification', migration: '20260725_qhub_classification' },
   { table: 'qhub_applications', column: 'policy_profile', migration: '20260725_gate03_policy' },
   { table: 'qhub_classification_proposals', column: 'proposal_id', migration: '20260725_gate03_policy' },
+  { table: 'qhub_enforcement_plans', column: 'enforcement_plan_hash', migration: '20260726_gate04_enforcement' },
+  { table: 'qhub_control_evaluations', column: 'action_request_id', migration: '20260726_gate04_enforcement' },
+  { table: 'qhub_control_approvals', column: 'consumed_by_evaluation', migration: '20260726_gate04_enforcement' },
+  { table: 'qhub_applications', column: 'kill_switch_active', migration: '20260726_gate04_enforcement' },
 ];
 
 const SCHEMA_MISSING_CODES = new Set(['PGRST205', 'PGRST204', '42P01', '42703']);
@@ -149,6 +154,55 @@ async function probe(url, serviceKey, obj) {
   }
 }
 
+async function verifyMetadata(url, serviceKey) {
+  const endpoint = `${url.replace(/\/$/, '')}/rest/v1/rpc/${SCHEMA_VERIFIER_RPC}`;
+
+  try {
+    const res = await fetch(endpoint, {
+      method: 'POST',
+      headers: {
+        apikey: serviceKey,
+        Authorization: `Bearer ${serviceKey}`,
+        Accept: 'application/json',
+        'Content-Type': 'application/json',
+      },
+      body: '{}',
+      signal: AbortSignal.timeout(8000),
+    });
+
+    if (!res.ok) {
+      const body = await res.json().catch(() => null);
+      return { ready: false, error: body?.code ?? `HTTP ${res.status}`, checks: [] };
+    }
+
+    const body = await res.json();
+
+    if (
+      body?.expected_version !== EXPECTED_SCHEMA_VERSION ||
+      typeof body?.ready !== 'boolean' ||
+      !Array.isArray(body?.checks)
+    ) {
+      return { ready: false, error: 'INVALID_OR_STALE_METADATA_CONTRACT', checks: [] };
+    }
+
+    const internallyReady = body.checks.every(
+      (check) =>
+        typeof check?.identifier === 'string' &&
+        typeof check?.category === 'string' &&
+        check?.ready === true &&
+        check?.reason_code === 'OK',
+    );
+
+    return {
+      ready: body.ready === true && internallyReady,
+      checks: body.checks,
+      ...(body.ready === internallyReady ? {} : { error: 'INCONSISTENT_METADATA_SUMMARY' }),
+    };
+  } catch (err) {
+    return { ready: false, error: err instanceof Error ? err.name : 'METADATA_PROBE_FAILED', checks: [] };
+  }
+}
+
 async function main() {
   loadDotenv();
 
@@ -196,6 +250,7 @@ async function main() {
   );
 
   const results = await Promise.all(REQUIRED_SCHEMA_OBJECTS.map((o) => probe(url, serviceKey, o)));
+  const metadata = await verifyMetadata(url, serviceKey);
 
   for (const r of results) {
     const mark = r.state === 'present' ? 'OK  ' : r.state === 'missing' ? 'MISS' : '??  ';
@@ -222,6 +277,17 @@ async function main() {
     );
     process.exit(1);
   }
+
+  if (!metadata.ready) {
+    const failed = metadata.checks.filter((check) => !check.ready);
+    console.error(
+      `[schema-smoke-check] FAIL: Gate 04 metadata contract is not ready — ` +
+        `${metadata.error ?? failed.map((check) => `${check.category}:${check.identifier}:${check.reason_code}`).join(', ')}`,
+    );
+    process.exit(1);
+  }
+
+  console.log(`  [OK  ] ${metadata.checks.length} Gate 04 metadata invariants`);
 
   console.log(`[schema-smoke-check] PASS: project ${projectRef ?? '(unknown)'} matches ${EXPECTED_SCHEMA_VERSION}.`);
   process.exit(0);
