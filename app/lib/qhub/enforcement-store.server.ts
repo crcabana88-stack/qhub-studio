@@ -251,6 +251,40 @@ export interface EvaluationRecord {
   created_by: string;
 }
 
+/** Look up an evaluation by its id (tenant-scoped) — used for E2 re-evaluation. */
+export async function getEvaluationById(
+  evaluationId: string,
+  orgId: string,
+  env: Record<string, string | undefined>,
+): Promise<any | null> {
+  const sb = admin(env);
+  const { data } = await sb
+    .from('qhub_control_evaluations')
+    .select('*')
+    .eq('evaluation_id', evaluationId)
+    .eq('org_id', orgId)
+    .maybeSingle();
+
+  return (data as any) ?? null;
+}
+
+/** Look up an evaluation by its unique action_request_id (replay dedup). */
+export async function getEvaluationByActionRequestId(
+  orgId: string,
+  actionRequestId: string,
+  env: Record<string, string | undefined>,
+): Promise<any | null> {
+  const sb = admin(env);
+  const { data } = await sb
+    .from('qhub_control_evaluations')
+    .select('*')
+    .eq('org_id', orgId)
+    .eq('action_request_id', actionRequestId)
+    .maybeSingle();
+
+  return (data as any) ?? null;
+}
+
 /** Look up an evaluation by idempotency key (for duplicate-request dedup). */
 export async function getEvaluationByIdempotency(
   orgId: string,
@@ -306,10 +340,15 @@ export async function insertEvaluation(
   });
 
   if (error) {
-    // 23505 = unique_violation (idempotency_key or action_request_id)
-    if (error.code === '23505' && rec.idempotency_key) {
-      const existing = await getEvaluationByIdempotency(rec.org_id, rec.qhub_app_id, rec.idempotency_key, env);
-      return { ok: false, duplicate: true, existing };
+    // 23505 = unique_violation (action_request_id or idempotency_key) → replay dedup.
+    if (error.code === '23505') {
+      const existing =
+        (await getEvaluationByActionRequestId(rec.org_id, rec.action_request_id, env)) ??
+        (rec.idempotency_key ? await getEvaluationByIdempotency(rec.org_id, rec.qhub_app_id, rec.idempotency_key, env) : null);
+
+      if (existing) {
+        return { ok: false, duplicate: true, existing };
+      }
     }
 
     return { ok: false, error: error.message };

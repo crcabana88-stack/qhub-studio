@@ -178,11 +178,29 @@ export async function enforceGovernedAction(input: EnforceInput): Promise<Enforc
     return blocked('PLAN_HASH_MISMATCH', action.action_type, app.qhub_app_id);
   }
 
+  // 6a. Re-evaluation (E2) after approval: reuse the parent's server-issued
+  // action_request_id so the digest — and thus the scoped approval — matches.
+  // The parent id is loaded server-side (never trusted from the browser), and
+  // E2 must resolve to the SAME action_digest (else the action changed → DENY).
+  let reuseRequestId: string | null = null;
+  let parentDigest: string | null = null;
+
+  if (input.parentEvaluationId) {
+    const parent = await store.getEvaluationById(input.parentEvaluationId, session.orgId, env);
+
+    if (!parent || parent.qhub_app_id !== app.qhub_app_id) {
+      return blocked('ACTION_DIGEST_MISMATCH', action.action_type, app.qhub_app_id);
+    }
+
+    reuseRequestId = parent.action_request_id;
+    parentDigest = parent.action_digest;
+  }
+
   // 6. Canonical action request + server-computed digest.
   const request: CanonicalActionRequest = {
     tenant_id: session.orgId,
     qhub_app_id: app.qhub_app_id,
-    action_request_id: randomUUID(),
+    action_request_id: reuseRequestId ?? randomUUID(),
     action_type: action.action_type,
     target_resource: action.target_resource,
     operation: action.operation,
@@ -200,6 +218,12 @@ export async function enforceGovernedAction(input: EnforceInput): Promise<Enforc
     enforcement_plan_hash: plan.enforcement_plan_hash,
   };
   const action_digest = sha256(canonicalActionRequestString(request));
+
+  // 6b. A re-evaluation must resolve to the SAME action — a changed action digest
+  // means the operation changed and the parent authorization does not apply.
+  if (parentDigest && action_digest !== parentDigest) {
+    return blocked('ACTION_DIGEST_MISMATCH', action.action_type, app.qhub_app_id);
+  }
 
   // 7. Idempotency — a duplicate request returns the prior decision, no re-exec.
   if (input.idempotencyKey) {
