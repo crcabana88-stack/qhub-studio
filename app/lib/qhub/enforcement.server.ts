@@ -178,11 +178,10 @@ export async function enforceGovernedAction(input: EnforceInput): Promise<Enforc
     return blocked('PLAN_HASH_MISMATCH', action.action_type, app.qhub_app_id);
   }
 
-  // 6a. Re-evaluation (E2) after approval: reuse the parent's server-issued
-  // action_request_id so the digest — and thus the scoped approval — matches.
-  // The parent id is loaded server-side (never trusted from the browser), and
-  // E2 must resolve to the SAME action_digest (else the action changed → DENY).
-  let reuseRequestId: string | null = null;
+  // 6a. Re-evaluation (E2) after approval: load the parent (server-side, never
+  // trusted from the browser) to link the audit chain and to assert E2 resolves
+  // to the SAME content digest as E1 (else the action changed → DENY). The digest
+  // is content-based, so E2 matches E1 without reusing the per-attempt request id.
   let parentDigest: string | null = null;
 
   if (input.parentEvaluationId) {
@@ -192,15 +191,14 @@ export async function enforceGovernedAction(input: EnforceInput): Promise<Enforc
       return blocked('ACTION_DIGEST_MISMATCH', action.action_type, app.qhub_app_id);
     }
 
-    reuseRequestId = parent.action_request_id;
     parentDigest = parent.action_digest;
   }
 
-  // 6. Canonical action request + server-computed digest.
+  // 6. Canonical action request + server-computed content digest.
   const request: CanonicalActionRequest = {
     tenant_id: session.orgId,
     qhub_app_id: app.qhub_app_id,
-    action_request_id: reuseRequestId ?? randomUUID(),
+    action_request_id: randomUUID(),
     action_type: action.action_type,
     target_resource: action.target_resource,
     operation: action.operation,

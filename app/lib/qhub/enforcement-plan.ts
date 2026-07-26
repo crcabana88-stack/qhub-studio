@@ -233,10 +233,21 @@ export function canonicalEnforcementPlanString(p: EnforcementPlan): string {
  * Never contains raw params/secrets — only the material_parameters_hash.
  */
 export function canonicalActionRequestString(r: CanonicalActionRequest): string {
+  /*
+   * The digest binds the action's CONTENT and the policy/plan it is evaluated
+   * under — by content HASH, not by ephemeral ids. It deliberately excludes the
+   * per-attempt `action_request_id` and the random `*_id`s so that a
+   * REQUIRE_APPROVAL (E1) and its post-approval re-evaluation (E2) of the SAME
+   * action produce the SAME digest (the scoped approval matches), while ANY
+   * material change (target, operation, params, model/tool, environment, tenant,
+   * app, policy version/hash, plan version/hash) yields a different digest — so
+   * an ALLOW for action A can never authorize a modified action B. Single-use is
+   * enforced by the ALLOW claim + single-use approval consumption + idempotency
+   * key, not by putting a nonce in the digest.
+   */
   const canonical = {
     tenant_id: r.tenant_id,
     qhub_app_id: r.qhub_app_id,
-    action_request_id: r.action_request_id,
     action_type: r.action_type,
     target_resource: r.target_resource,
     operation: r.operation,
@@ -246,10 +257,8 @@ export function canonicalActionRequestString(r: CanonicalActionRequest): string 
     tool_identity: r.tool_identity,
     environment: r.environment,
     app_version_ref: r.app_version_ref,
-    policy_profile_id: r.policy_profile_id,
     policy_profile_version: r.policy_profile_version,
     policy_profile_hash: r.policy_profile_hash,
-    enforcement_plan_id: r.enforcement_plan_id,
     enforcement_plan_version: r.enforcement_plan_version,
     enforcement_plan_hash: r.enforcement_plan_hash,
   };

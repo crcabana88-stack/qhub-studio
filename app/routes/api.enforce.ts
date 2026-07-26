@@ -43,6 +43,7 @@ export async function action({ request, context }: ActionFunctionArgs) {
   let body: {
     conversationId?: string;
     idempotencyKey?: string;
+    parentEvaluationId?: string;
     action?: Partial<EnforceActionInput> & { action_type?: GovernedActionType };
   };
 
@@ -78,6 +79,7 @@ export async function action({ request, context }: ActionFunctionArgs) {
         app_version_ref: a.app_version_ref ?? null,
       },
       idempotencyKey: body.idempotencyKey,
+      parentEvaluationId: body.parentEvaluationId,
       sessionId,
       env,
     });
