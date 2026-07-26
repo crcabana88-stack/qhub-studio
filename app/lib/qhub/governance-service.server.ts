@@ -860,6 +860,42 @@ export class GovernanceService {
     return { ok: result.ok };
   }
 
+  /**
+   * Gate 05 — emit a release/attestation/deployment event using an EXISTING
+   * canonical event type (APP_SUBMITTED, ATTESTATION_SIGNED, DEPLOYMENT_APPROVED,
+   * DEPLOYMENT_REJECTED, DEPLOYMENT_EXECUTED). Compact payload only — never raw
+   * source, secrets, or signer PII beyond the authenticated id.
+   */
+  async recordReleaseEvent(params: {
+    conversationId: string;
+    chainId: string | null;
+    eventType: 'APP_SUBMITTED' | 'ATTESTATION_SIGNED' | 'DEPLOYMENT_APPROVED' | 'DEPLOYMENT_REJECTED' | 'DEPLOYMENT_EXECUTED';
+    riskTier: LedgerRiskTier;
+    qhubAppId: string;
+    payload: Record<string, unknown>;
+  }): Promise<{ ok: boolean }> {
+    if (!this.hmacSecret) {
+      console.warn(`[GovernanceService] No HMAC secret — ${params.eventType} skipped`);
+      return { ok: false };
+    }
+
+    const chainId = params.chainId ?? (await getChainId(params.conversationId, this.ctx.orgId, this.ctx.env));
+
+    const body: LambdaEventBody = {
+      ...(chainId ? { chain_id: chainId } : {}),
+      event_type: params.eventType,
+      app_id: params.qhubAppId,
+      client_id: this.ctx.orgId,
+      actor: { id: this.ctx.userId, type: 'human', identity_provider: 'supabase' },
+      payload: { ...params.payload, session_id: this.ctx.sessionId, source: 'qhub-studio' },
+      risk_tier: params.riskTier,
+    };
+
+    const result = await this.postEvent(body);
+
+    return { ok: result.ok };
+  }
+
   private async recordAiModelInvoked(
     _intent: Extract<GovernanceIntent, { action: 'AI_MODEL_USED' }>,
   ): Promise<GovernanceResult> {
