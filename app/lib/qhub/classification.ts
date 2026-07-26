@@ -56,7 +56,8 @@ export const TIER_DISPLAY: Record<RiskTier, { label: string; short: string; blur
   T1: {
     label: 'T1 · Low',
     short: 'Low',
-    blurb: 'Internal productivity with limited business data. Read-only, no material customer or financial consequence.',
+    blurb:
+      'Internal productivity with limited business data. Read-only, no material customer or financial consequence.',
   },
   T2: {
     label: 'T2 · Elevated',

@@ -113,7 +113,7 @@ export function buildPolicyProfile(input: PolicyEngineInput): PolicyProfile {
   const advisory = all.filter((c) => c.enforcement_level === 'ADVISORY');
 
   // Attestations & evidence derived from controls (deterministic).
-  const required_attestations = sortUnique(
+  const requiredAttestations = sortUnique(
     required
       .filter((c) => c.control_id === 'HO-OWNER-ATTESTATION')
       .map(() => 'OWNER_ATTESTATION')
@@ -124,7 +124,7 @@ export function buildPolicyProfile(input: PolicyEngineInput): PolicyProfile {
       )
       .concat(required.filter((c) => c.control_id === 'HO-CHANGE-ATTESTATION').map(() => 'CHANGE_ATTESTATION')),
   );
-  const required_evidence = sortUnique(required.map((c) => c.evidence_required));
+  const requiredEvidence = sortUnique(required.map((c) => c.evidence_required));
 
   return {
     policy_profile_id: '', // assigned by the server (uuid)
@@ -145,8 +145,8 @@ export function buildPolicyProfile(input: PolicyEngineInput): PolicyProfile {
     deployment_constraints: constraintsForStage(all, ['PRE_DEPLOY', 'DEPLOY']),
     runtime_constraints: constraintsForStage(all, ['RUNTIME']),
 
-    required_attestations,
-    required_evidence,
+    required_attestations: requiredAttestations,
+    required_evidence: requiredEvidence,
 
     generated_at: '', // set by server
     generated_by: input.generated_by,

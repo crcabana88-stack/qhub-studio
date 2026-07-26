@@ -102,8 +102,8 @@ beforeEach(() => {
 });
 
 async function svc() {
-  const { GovernanceService } = await import('~/lib/qhub/governance-service.server');
-  return new GovernanceService({ userId: 'user-1', orgId: 'org-abc', sessionId: 's', env: ENV });
+  const { GovernanceService: governanceServiceClass } = await import('~/lib/qhub/governance-service.server');
+  return new governanceServiceClass({ userId: 'user-1', orgId: 'org-abc', sessionId: 's', env: ENV });
 }
 
 describe('POLICY_ASSIGN requires a confirmed classification', () => {

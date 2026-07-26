@@ -24,15 +24,16 @@ export interface QhubPostMessagePayload {
  * Post a governance event to the parent window.
  * Fires only when running inside an iframe — otherwise a no-op.
  */
-export function postGovernanceEvent(
-  event: QhubEventType,
-  data?: Record<string, unknown>,
-): void {
+export function postGovernanceEvent(event: QhubEventType, data?: Record<string, unknown>): void {
   // Guard: SSR / no window
-  if (typeof window === 'undefined') return;
+  if (typeof window === 'undefined') {
+    return;
+  }
 
   // Guard: not embedded in a parent frame
-  if (window.parent === window) return;
+  if (window.parent === window) {
+    return;
+  }
 
   const payload: QhubPostMessagePayload = {
     type: 'QHUB_EVENT',

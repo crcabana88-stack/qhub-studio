@@ -78,8 +78,10 @@ export function serializeCookie(name: string, value: string, options: SupabaseCo
   const sameSite = options.sameSite === undefined ? 'Lax' : normalizeSameSite(options.sameSite);
   parts.push(`SameSite=${sameSite}`);
 
-  // Auth cookies are always HttpOnly (never read by client JS) and Secure
-  // (served only over HTTPS in staging/production).
+  /*
+   * Auth cookies are always HttpOnly (never read by client JS) and Secure
+   * (served only over HTTPS in staging/production).
+   */
   parts.push('HttpOnly');
   parts.push('Secure');
 

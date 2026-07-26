@@ -55,9 +55,11 @@ export async function getSession(
 
   const cookieHeader = request.headers.get('Cookie') ?? '';
 
-  // Read-only: getSession only needs to READ the session. Chunked auth cookies
-  // require the getAll interface to reassemble; no responseHeaders → setAll is a
-  // no-op (any token refresh is re-persisted on the next write-capable request).
+  /*
+   * Read-only: getSession only needs to READ the session. Chunked auth cookies
+   * require the getAll interface to reassemble; no responseHeaders → setAll is a
+   * no-op (any token refresh is re-persisted on the next write-capable request).
+   */
   const supabase = createServerClient(supabaseUrl, supabaseAnonKey, {
     cookies: createCookieMethods(cookieHeader),
   });
@@ -73,11 +75,12 @@ export async function getSession(
 
   // org_id and role are stored in user_metadata by the Supabase invite flow
   const orgId: string = (user.user_metadata?.org_id as string) ?? 'default';
-  const role: QhubSession['role'] =
-    (user.user_metadata?.role as QhubSession['role']) ?? 'builder';
+  const role: QhubSession['role'] = (user.user_metadata?.role as QhubSession['role']) ?? 'builder';
 
-  // hmacSecret is intentionally NOT included here.
-  // Use getHmacSecret(env) in server actions/routes that need to sign events.
+  /*
+   * hmacSecret is intentionally NOT included here.
+   * Use getHmacSecret(env) in server actions/routes that need to sign events.
+   */
   return {
     userId: user.id,
     orgId,
@@ -86,8 +89,10 @@ export async function getSession(
   };
 }
 
-// getHmacSecret has been moved to app/lib/qhub/governance-secrets.server.ts
-// Import from there to enforce the .server.ts module boundary.
+/*
+ * getHmacSecret has been moved to app/lib/qhub/governance-secrets.server.ts
+ * Import from there to enforce the .server.ts module boundary.
+ */
 
 /** Dev-mode fallback when Supabase is not configured */
 function devFallbackSession(): QhubSession {

@@ -6,7 +6,10 @@ import { Header } from '~/components/header/Header';
 import BackgroundRays from '~/components/ui/BackgroundRays';
 
 export const meta: MetaFunction = () => {
-  return [{ title: 'QHUB Studio' }, { name: 'description', content: 'QHUB Studio — Governed AI App Builder by Quantex Technologies' }];
+  return [
+    { title: 'QHUB Studio' },
+    { name: 'description', content: 'QHUB Studio — Governed AI App Builder by Quantex Technologies' },
+  ];
 };
 
 export const loader = () => json({});

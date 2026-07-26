@@ -70,10 +70,12 @@ export default async function handleRequest(
 
   responseHeaders.set('Content-Type', 'text/html');
 
-  // 'credentialless' (not 'require-corp') so the WebContainer preview works:
-  // the runtime is configured for credentialless COEP (see webcontainer/index.ts)
-  // and serves from local-credentialless.webcontainer-api.io. require-corp blocks
-  // those cross-origin loads, leaving the preview blank.
+  /*
+   * 'credentialless' (not 'require-corp') so the WebContainer preview works:
+   * the runtime is configured for credentialless COEP (see webcontainer/index.ts)
+   * and serves from local-credentialless.webcontainer-api.io. require-corp blocks
+   * those cross-origin loads, leaving the preview blank.
+   */
   responseHeaders.set('Cross-Origin-Embedder-Policy', 'credentialless');
   responseHeaders.set('Cross-Origin-Opener-Policy', 'same-origin');
 

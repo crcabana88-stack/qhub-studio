@@ -28,15 +28,20 @@ export async function loader({ request, context }: LoaderFunctionArgs) {
     return null;
   }
 
-  const session = await getSession(request, (context.cloudflare?.env as unknown as Record<string, string | undefined>) ?? {});
+  const session = await getSession(
+    request,
+    (context.cloudflare?.env as unknown as Record<string, string | undefined>) ?? {},
+  );
 
   if (!session) {
     return redirect('/login');
   }
 
-  // SECURITY: return only the browser-safe subset of QhubSession.
-  // hmacSecret MUST NOT be included — it would be serialized into
-  // window.__remixContext and become readable from browser JavaScript.
+  /*
+   * SECURITY: return only the browser-safe subset of QhubSession.
+   * hmacSecret MUST NOT be included — it would be serialized into
+   * window.__remixContext and become readable from browser JavaScript.
+   */
   return {
     session: {
       userId: session.userId,

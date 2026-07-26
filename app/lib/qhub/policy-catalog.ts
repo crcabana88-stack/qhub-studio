@@ -18,23 +18,23 @@ export const POLICY_CATALOG_VERSION = 'gate03-catalog-1.0.0';
 // ─── Control factory (keeps definitions terse but complete) ───────────────────
 
 function ctl(
-  control_id: string,
+  controlId: string,
   category: ControlCategory,
   title: string,
   requirement: string,
   rationale: string,
-  enforcement_level: EnforcementLevel,
-  lifecycle_stage: LifecycleStage,
+  enforcementLevel: EnforcementLevel,
+  lifecycleStage: LifecycleStage,
   extra: Partial<PolicyControl> = {},
 ): PolicyControl {
   return {
-    control_id,
+    control_id: controlId,
     category,
     title,
     requirement,
     rationale,
-    enforcement_level,
-    lifecycle_stage,
+    enforcement_level: enforcementLevel,
+    lifecycle_stage: lifecycleStage,
     verification_method: extra.verification_method ?? 'Automated build check or human review',
     evidence_required: extra.evidence_required ?? 'Governance event / build attestation',
     source_refs: extra.source_refs ?? ['INTERNAL_POLICY'],

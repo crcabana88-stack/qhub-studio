@@ -454,21 +454,21 @@ export async function persistProposal(
   env: Record<string, string | undefined>,
 ): Promise<string> {
   const sb = getSupabaseAdmin(env);
-  const description_hash = createHash('sha256').update(params.description).digest('hex');
-  const expires_at = new Date(Date.now() + PROPOSAL_TTL_MIN * 60_000).toISOString();
+  const descriptionHash = createHash('sha256').update(params.description).digest('hex');
+  const expiresAt = new Date(Date.now() + PROPOSAL_TTL_MIN * 60_000).toISOString();
 
   const { data, error } = await sb
     .from('qhub_classification_proposals')
     .insert({
       org_id: params.orgId,
       conversation_id: params.conversationId,
-      description_hash,
+      description_hash: descriptionHash,
       provisional: params.provisional,
       risk_floor: params.provisional.risk_floor,
       ai_proposed_tier: params.provisional.ai_proposed_tier,
       classifier_version: params.provisional.classifier_version,
       created_by: params.createdBy,
-      expires_at,
+      expires_at: expiresAt,
     })
     .select('proposal_id')
     .single();

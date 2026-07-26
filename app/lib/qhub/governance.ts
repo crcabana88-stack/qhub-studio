@@ -17,22 +17,26 @@
  * the secret should use getHmacSecret() from ~/lib/auth/session directly.
  */
 
-export {
-  notifyProjectCreated,
-  notifyAiModelUsed,
-  assertDeploymentGate,
-} from './governance-client';
+export { notifyProjectCreated, notifyAiModelUsed, assertDeploymentGate } from './governance-client';
 
-export type {
-  GenesisIntent,
-  AiBomIntent,
-  GateCheckIntent,
-  GateState,
-  GovernanceResponse,
-} from './governance-client';
+export type { GenesisIntent, AiBomIntent, GateCheckIntent, GateState, GovernanceResponse } from './governance-client';
 
-// Legacy type aliases for any code that referenced the old param types
-// These can be removed in a later cleanup pass.
-export type GenesisParams = import('./governance-client').GenesisIntent & { userId?: string; orgId?: string; hmacSecret?: never };
-export type AiBomParams = import('./governance-client').AiBomIntent & { userId?: string; orgId?: string; hmacSecret?: never };
-export type GateParams = import('./governance-client').GateCheckIntent & { userId?: string; orgId?: string; hmacSecret?: never };
+/*
+ * Legacy type aliases for any code that referenced the old param types
+ * These can be removed in a later cleanup pass.
+ */
+export type GenesisParams = import('./governance-client').GenesisIntent & {
+  userId?: string;
+  orgId?: string;
+  hmacSecret?: never;
+};
+export type AiBomParams = import('./governance-client').AiBomIntent & {
+  userId?: string;
+  orgId?: string;
+  hmacSecret?: never;
+};
+export type GateParams = import('./governance-client').GateCheckIntent & {
+  userId?: string;
+  orgId?: string;
+  hmacSecret?: never;
+};

@@ -75,16 +75,20 @@ async function chatAction({ context, request }: ActionFunctionArgs) {
     parseCookies(cookieHeader || '').providers || '{}',
   );
 
-  // QHUB: Extract authenticated session for governance hook propagation.
-  // Session ID is now stable: derived from userId + first message ID,
-  // so the same conversation always maps to the same QHUB chain.
-  // hmacSecret is NOT included here — the GovernanceService reads it
-  // directly from process.env at signing time (server-only, never returned to browser).
+  /*
+   * QHUB: Extract authenticated session for governance hook propagation.
+   * Session ID is now stable: derived from userId + first message ID,
+   * so the same conversation always maps to the same QHUB chain.
+   * hmacSecret is NOT included here — the GovernanceService reads it
+   * directly from process.env at signing time (server-only, never returned to browser).
+   */
   const serverEnv = (context.cloudflare?.env as unknown as Record<string, string | undefined>) ?? {};
   const qhubRawSession = await getSession(request, serverEnv);
 
-  // Use first user message ID as the stable conversation anchor.
-  // Falls back to orgId+timestamp hash only if messages array is empty.
+  /*
+   * Use first user message ID as the stable conversation anchor.
+   * Falls back to orgId+timestamp hash only if messages array is empty.
+   */
   const firstMessageId = messages.find((m) => m.role === 'user')?.id ?? `init-${Date.now()}`;
 
   const qhubContext = qhubRawSession
@@ -94,6 +98,7 @@ async function chatAction({ context, request }: ActionFunctionArgs) {
         conversationId: firstMessageId,
         userId: qhubRawSession.userId,
         orgId: qhubRawSession.orgId,
+
         // hmacSecret is NOT passed here — GovernanceService reads from env directly
         serverEnv,
       }

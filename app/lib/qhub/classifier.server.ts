@@ -77,6 +77,7 @@ function keepValid<T>(value: unknown, allowed: T[]): T[] {
   if (!Array.isArray(value)) {
     return [];
   }
+
   return value.filter((v): v is T => allowed.includes(v as T));
 }
 
@@ -113,9 +114,11 @@ When uncertain, choose the HIGHER tier. Regulatory domains are applicability tag
 function extractJson(text: string): Record<string, unknown> | null {
   const start = text.indexOf('{');
   const end = text.lastIndexOf('}');
+
   if (start === -1 || end === -1 || end <= start) {
     return null;
   }
+
   try {
     return JSON.parse(text.slice(start, end + 1)) as Record<string, unknown>;
   } catch {
@@ -128,69 +131,83 @@ function heuristicSignals(description: string): { signals: ClassificationSignals
   const d = description.toLowerCase();
   const has = (...words: string[]) => words.some((w) => d.includes(w));
 
-  const data_classes: DataClass[] = [];
-  const integration_types: IntegrationType[] = [];
-  const regulatory_domains: RegulatoryDomain[] = [];
-  let ai_behavior: AiBehavior = 'NONE';
-  let autonomy_level: AutonomyLevel = 'NONE';
-  let deployment_surface: DeploymentSurface = 'INTERNAL';
+  const dataClasses: DataClass[] = [];
+  const integrationTypes: IntegrationType[] = [];
+  const regulatoryDomains: RegulatoryDomain[] = [];
+  let aiBehavior: AiBehavior = 'NONE';
+  let autonomyLevel: AutonomyLevel = 'NONE';
+  let deploymentSurface: DeploymentSurface = 'INTERNAL';
 
   if (has('trade', 'trading', 'order execution', 'execute order', 'buy/sell', 'brokerage order')) {
-    integration_types.push('TRADING_OR_ORDERS');
-    regulatory_domains.push('SEC', 'FINRA');
+    integrationTypes.push('TRADING_OR_ORDERS');
+    regulatoryDomains.push('SEC', 'FINRA');
   }
+
   if (has('payment', 'transfer money', 'move money', 'wire', 'ach', 'disburse', 'payout')) {
-    integration_types.push('PAYMENTS_OR_TRANSFERS');
+    integrationTypes.push('PAYMENTS_OR_TRANSFERS');
   }
+
   if (has('email customer', 'send email', 'sms', 'notify client', 'outreach', 'send message to')) {
-    integration_types.push('OUTBOUND_COMMUNICATION');
+    integrationTypes.push('OUTBOUND_COMMUNICATION');
   }
+
   if (has('client', 'customer', 'account holder', 'investor')) {
-    data_classes.push('CLIENT_PII');
+    dataClasses.push('CLIENT_PII');
   }
+
   if (has('trade data', 'transaction', 'commission', 'settlement', 'reconcile', 'reconciliation')) {
-    data_classes.push('TRANSACTION_DATA');
+    dataClasses.push('TRANSACTION_DATA');
   }
+
   if (has('books and records', 'recordkeeping', 'compliance record', 'audit record')) {
-    data_classes.push('REGULATED_RECORDS');
-    regulatory_domains.push('BOOKS_AND_RECORDS');
+    dataClasses.push('REGULATED_RECORDS');
+    regulatoryDomains.push('BOOKS_AND_RECORDS');
   }
+
   if (has('supervis', 'compliance workflow', 'surveillance')) {
-    regulatory_domains.push('SUPERVISION');
+    regulatoryDomains.push('SUPERVISION');
   }
+
   if (has('recommend', 'advice', 'suitab')) {
-    ai_behavior = has('financ', 'invest', 'portfolio', 'trade') ? 'FINANCIAL_RECOMMENDATION' : 'RECOMMENDATION';
+    aiBehavior = has('financ', 'invest', 'portfolio', 'trade') ? 'FINANCIAL_RECOMMENDATION' : 'RECOMMENDATION';
   }
+
   if (has('autonomous', 'automatically execute', 'without human', 'agent that acts', 'auto-execute')) {
-    autonomy_level = 'AUTONOMOUS';
-    deployment_surface = 'PRODUCTION';
+    autonomyLevel = 'AUTONOMOUS';
+    deploymentSurface = 'PRODUCTION';
   }
+
   if (has('accounting', 'quickbooks', 'erp', 'salesforce', 'crm', 'system of record')) {
-    integration_types.push('EXTERNAL_SYSTEM_OF_RECORD');
+    integrationTypes.push('EXTERNAL_SYSTEM_OF_RECORD');
   }
-  if (has('marketing', 'landing page', 'microsite', 'brochure', 'public website') && data_classes.length === 0) {
-    data_classes.push('PUBLIC');
-    deployment_surface = 'INTERNAL';
+
+  if (has('marketing', 'landing page', 'microsite', 'brochure', 'public website') && dataClasses.length === 0) {
+    dataClasses.push('PUBLIC');
+    deploymentSurface = 'INTERNAL';
   }
-  if (data_classes.length === 0) {
-    data_classes.push('INTERNAL_BUSINESS');
+
+  if (dataClasses.length === 0) {
+    dataClasses.push('INTERNAL_BUSINESS');
   }
-  if (integration_types.length === 0) {
-    integration_types.push('NONE');
+
+  if (integrationTypes.length === 0) {
+    integrationTypes.push('NONE');
   }
-  if (regulatory_domains.length === 0) {
-    regulatory_domains.push('NONE_IDENTIFIED');
+
+  if (regulatoryDomains.length === 0) {
+    regulatoryDomains.push('NONE_IDENTIFIED');
   }
 
   const signals: ClassificationSignals = {
-    data_classes,
-    integration_types,
-    ai_behavior,
-    autonomy_level,
-    deployment_surface,
-    regulatory_domains,
+    data_classes: dataClasses,
+    integration_types: integrationTypes,
+    ai_behavior: aiBehavior,
+    autonomy_level: autonomyLevel,
+    deployment_surface: deploymentSurface,
+    regulatory_domains: regulatoryDomains,
   };
   const { floor } = computeRiskFloor(signals);
+
   return { signals, tier: floor };
 }
 
@@ -223,6 +240,7 @@ async function callAnthropicClassifier(
     const data = (await res.json()) as { content?: { type: string; text?: string }[] };
     const text = (data.content ?? []).map((c) => c.text ?? '').join('');
     const parsed = extractJson(text);
+
     if (!parsed) {
       return null;
     }
@@ -235,12 +253,15 @@ async function callAnthropicClassifier(
       deployment_surface: oneOf(parsed.deployment_surface, DEPLOYMENT_SURFACES, 'INTERNAL'),
       regulatory_domains: keepValid(parsed.regulatory_domains, REG_DOMAINS),
     };
+
     if (signals.data_classes.length === 0) {
       signals.data_classes = ['INTERNAL_BUSINESS'];
     }
+
     if (signals.integration_types.length === 0) {
       signals.integration_types = ['NONE'];
     }
+
     if (signals.regulatory_domains.length === 0) {
       signals.regulatory_domains = ['NONE_IDENTIFIED'];
     }

@@ -35,9 +35,18 @@ function Chips({ label, items }: { label: string; items: string[] }) {
   if (!items || items.length === 0) {
     return null;
   }
+
   return (
     <div style={{ marginBottom: 10 }}>
-      <div style={{ fontSize: 11, letterSpacing: '0.04em', textTransform: 'uppercase', color: 'rgba(120,130,141,0.9)', marginBottom: 4 }}>
+      <div
+        style={{
+          fontSize: 11,
+          letterSpacing: '0.04em',
+          textTransform: 'uppercase',
+          color: 'rgba(120,130,141,0.9)',
+          marginBottom: 4,
+        }}
+      >
         {label}
       </div>
       <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6 }}>
@@ -87,7 +96,9 @@ export function ClassificationCard({
     >
       {/* Header */}
       <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 6 }}>
-        <span style={{ fontSize: 11, letterSpacing: '0.08em', textTransform: 'uppercase', color: 'rgba(120,130,141,0.9)' }}>
+        <span
+          style={{ fontSize: 11, letterSpacing: '0.08em', textTransform: 'uppercase', color: 'rgba(120,130,141,0.9)' }}
+        >
           01 · Classify
         </span>
         <span
@@ -141,7 +152,15 @@ export function ClassificationCard({
       {/* Floor reasons */}
       {classification.floor_reasons.length > 0 && (
         <div style={{ marginBottom: 14 }}>
-          <div style={{ fontSize: 11, letterSpacing: '0.04em', textTransform: 'uppercase', color: 'rgba(120,130,141,0.9)', marginBottom: 4 }}>
+          <div
+            style={{
+              fontSize: 11,
+              letterSpacing: '0.04em',
+              textTransform: 'uppercase',
+              color: 'rgba(120,130,141,0.9)',
+              marginBottom: 4,
+            }}
+          >
             Factors that set the minimum tier (T{floorRank})
           </div>
           <ul style={{ margin: 0, paddingLeft: 18, fontSize: 12.5, lineHeight: 1.5 }}>
@@ -153,20 +172,33 @@ export function ClassificationCard({
       )}
 
       {/* Tier selector (cannot go below floor) */}
-      <div style={{ marginBottom: 8, fontSize: 11, letterSpacing: '0.04em', textTransform: 'uppercase', color: 'rgba(120,130,141,0.9)' }}>
+      <div
+        style={{
+          marginBottom: 8,
+          fontSize: 11,
+          letterSpacing: '0.04em',
+          textTransform: 'uppercase',
+          color: 'rgba(120,130,141,0.9)',
+        }}
+      >
         Confirm or raise the tier
       </div>
       <div style={{ display: 'flex', gap: 8, marginBottom: 12 }}>
         {RISK_TIERS.map((t) => {
           const belowFloor = tierRank(t) < floorRank;
           const active = t === selected;
+
           return (
             <button
               key={t}
               type="button"
               disabled={belowFloor || busy}
               onClick={() => setSelected(t)}
-              title={belowFloor ? `Blocked: below the required minimum (${classification.risk_floor})` : TIER_DISPLAY[t].short}
+              title={
+                belowFloor
+                  ? `Blocked: below the required minimum (${classification.risk_floor})`
+                  : TIER_DISPLAY[t].short
+              }
               style={{
                 flex: 1,
                 padding: '8px 6px',

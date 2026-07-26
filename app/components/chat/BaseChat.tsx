@@ -42,6 +42,7 @@ interface BaseChatProps {
   scrollRef?: RefCallback<HTMLDivElement> | undefined;
   showChat?: boolean;
   chatStarted?: boolean;
+
   /** QHUB Gate 02: classification card rendered above the input while pending. */
   classificationSlot?: React.ReactNode;
   isStreaming?: boolean;

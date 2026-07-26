@@ -61,9 +61,9 @@ describe('deterministic floors — T3 triggers (single high-risk characteristic)
     expect(computeRiskFloor(signals({ ai_behavior: 'CONSEQUENTIAL_DECISION' })).floor).toBe('T3');
   });
   it('autonomous in production → T3', () => {
-    expect(
-      computeRiskFloor(signals({ autonomy_level: 'AUTONOMOUS', deployment_surface: 'PRODUCTION' })).floor,
-    ).toBe('T3');
+    expect(computeRiskFloor(signals({ autonomy_level: 'AUTONOMOUS', deployment_surface: 'PRODUCTION' })).floor).toBe(
+      'T3',
+    );
   });
   it('MNPI or credentials exposure → T3', () => {
     expect(computeRiskFloor(signals({ data_classes: ['MNPI'] })).floor).toBe('T3');

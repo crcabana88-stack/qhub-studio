@@ -1,4 +1,5 @@
 import { atom, map, type MapStore, type ReadableAtom, type WritableAtom } from 'nanostores';
+
 // QHUB: Governance hooks (browser-side client — no secrets, no signing)
 import { notifyProjectCreated, assertDeploymentGate, type GateState } from '~/lib/qhub/governance-client';
 import { postGovernanceEvent } from '~/lib/qhub/messenger';
@@ -59,6 +60,7 @@ export class WorkbenchStore {
     import.meta.hot?.data.deployAlert ?? atom<DeployAlert | undefined>(undefined);
   modifiedFiles = new Set<string>();
   artifactIdList: string[] = [];
+
   /**
    * QHUB session context — browser-safe identity only.
    * MUST NOT contain hmacSecret or any signing credentials.
@@ -489,12 +491,15 @@ export class WorkbenchStore {
       return;
     }
 
-    // ── QHUB HOOK 1: PROJECT_CREATED (GENESIS) ───────────────────────────
-    // Sidebar postMessage fires unconditionally (local UI, no auth needed).
-    // Backend ledger write goes through /api/governance (server-side signing).
-    // No HMAC secret is handled here — the server action manages all signing.
+    /*
+     * ── QHUB HOOK 1: PROJECT_CREATED (GENESIS) ───────────────────────────
+     * Sidebar postMessage fires unconditionally (local UI, no auth needed).
+     * Backend ledger write goes through /api/governance (server-side signing).
+     * No HMAC secret is handled here — the server action manages all signing.
+     */
     if (this.artifactIdList.length === 0) {
       postGovernanceEvent('GENESIS', { projectTitle: title });
+
       if (this.#qhubSession) {
         const s = this.#qhubSession;
         notifyProjectCreated({
@@ -502,9 +507,11 @@ export class WorkbenchStore {
           appId: s.appId,
           projectTitle: title,
         });
+
         // notifyProjectCreated is fire-and-forget — errors logged internally
       }
     }
+
     // ── END QHUB HOOK 1 ──────────────────────────────────────────────────
 
     if (!this.artifactIdList.includes(id)) {
@@ -722,36 +729,39 @@ export class WorkbenchStore {
     isPrivate: boolean = false,
     branchName: string = 'main',
   ) {
-    // ── QHUB HOOK 3: DEPLOYMENT GATE (FAIL-CLOSED) ───────────────────────
-    //
-    // GATE STATE MACHINE:
-    //   APPROVED  → deployment may proceed (only this state passes)
-    //   BLOCKED   → attestation required but not completed
-    //   UNKNOWN   → governance API unreachable (fail-closed for production)
-    //   ERROR     → server error (fail-closed for production)
-    //   NO_SESSION→ session not established (fail-closed for production)
-    //
-    // NEVER silently treat UNKNOWN / ERROR / NO_SESSION as APPROVED.
-    // A session is REQUIRED for the gate to pass. Missing session → blocked.
+    /*
+     * ── QHUB HOOK 3: DEPLOYMENT GATE (FAIL-CLOSED) ───────────────────────
+     *
+     * GATE STATE MACHINE:
+     *   APPROVED  → deployment may proceed (only this state passes)
+     *   BLOCKED   → attestation required but not completed
+     *   UNKNOWN   → governance API unreachable (fail-closed for production)
+     *   ERROR     → server error (fail-closed for production)
+     *   NO_SESSION→ session not established (fail-closed for production)
+     *
+     * NEVER silently treat UNKNOWN / ERROR / NO_SESSION as APPROVED.
+     * A session is REQUIRED for the gate to pass. Missing session → blocked.
+     */
 
     if (!this.#qhubSession) {
-      // No session = identity not established = cannot authorize deployment
-      // DEV EXCEPTION: requires BOTH Vite dev mode AND explicit opt-in env flag.
-      // Set VITE_QHUB_ALLOW_GOVERNANCE_BYPASS=true in .env.local to enable.
-      // Neither condition alone is sufficient — production builds never set DEV=true,
-      // and local dev without the flag also hits the gate (tests real auth flow).
-      const isDev =
-        import.meta.env.DEV === true &&
-        import.meta.env.VITE_QHUB_ALLOW_GOVERNANCE_BYPASS === 'true';
+      /*
+       * No session = identity not established = cannot authorize deployment
+       * DEV EXCEPTION: requires BOTH Vite dev mode AND explicit opt-in env flag.
+       * Set VITE_QHUB_ALLOW_GOVERNANCE_BYPASS=true in .env.local to enable.
+       * Neither condition alone is sufficient — production builds never set DEV=true,
+       * and local dev without the flag also hits the gate (tests real auth flow).
+       */
+      const isDev = import.meta.env.DEV === true && import.meta.env.VITE_QHUB_ALLOW_GOVERNANCE_BYPASS === 'true';
 
       if (isDev) {
         console.warn(
           '[QHUB] ⚠️ DEV BYPASS ACTIVE: Deployment gate skipped — ' +
-          'VITE_QHUB_ALLOW_GOVERNANCE_BYPASS=true is set. ' +
-          'This override CANNOT occur in production builds. ' +
-          'Remove VITE_QHUB_ALLOW_GOVERNANCE_BYPASS from .env.local to enforce the gate locally.',
+            'VITE_QHUB_ALLOW_GOVERNANCE_BYPASS=true is set. ' +
+            'This override CANNOT occur in production builds. ' +
+            'Remove VITE_QHUB_ALLOW_GOVERNANCE_BYPASS from .env.local to enforce the gate locally.',
         );
         postGovernanceEvent('GATE_PASSED', { note: 'dev-bypass-no-session' });
+
         // Continue to deployment — advisory only, does not write authoritative GATE_PASSED to ledger
       } else {
         // Production: fail closed
@@ -764,11 +774,13 @@ export class WorkbenchStore {
             'Please refresh the page to re-establish your session, then try again.',
           source: 'QHUB',
         } as any);
+
         return;
       }
     } else {
       const s = this.#qhubSession;
       let gateState: GateState;
+
       try {
         gateState = await assertDeploymentGate({
           conversationId: s.conversationId,
@@ -787,7 +799,7 @@ export class WorkbenchStore {
             title: 'Governance Attestation Required',
             description:
               'This project must be attested in the QHUB Governance Console before deployment. ' +
-              'Go to console.quantex-tech.com, open this project\'s chain, and click Attest.',
+              "Go to console.quantex-tech.com, open this project's chain, and click Attest.",
           },
           UNKNOWN: {
             title: 'Governance API Unreachable',
@@ -814,12 +826,14 @@ export class WorkbenchStore {
           description: msg.description,
           source: 'QHUB',
         } as any);
+
         return; // BLOCK deployment
       }
 
       // Only APPROVED reaches here
       postGovernanceEvent('GATE_PASSED', { conversationId: s.conversationId });
     }
+
     // ── END QHUB HOOK 3 ──────────────────────────────────────────────────
 
     try {
@@ -1009,6 +1023,7 @@ export class WorkbenchStore {
         const repoUrl = await pushFilesToRepo();
 
         // Return the repository URL
+        // eslint-disable-next-line consistent-return
         return repoUrl;
       }
 
@@ -1064,6 +1079,7 @@ export class WorkbenchStore {
           actions,
         });
 
+        // eslint-disable-next-line consistent-return
         return repo.web_url;
       }
 

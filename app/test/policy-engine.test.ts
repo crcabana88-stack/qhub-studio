@@ -10,14 +10,14 @@ import type { ClassificationSignals, RegulatoryDomain, RiskTier } from '~/lib/qh
 function input(
   tier: RiskTier,
   signals: Partial<ClassificationSignals>,
-  regulatory_domains: RegulatoryDomain[] = ['NONE_IDENTIFIED'],
+  regulatoryDomains: RegulatoryDomain[] = ['NONE_IDENTIFIED'],
 ): PolicyEngineInput {
   return {
     qhub_app_id: 'app-1',
     classification_version: 1,
     classification_reference: 'chain-1',
     risk_tier: tier,
-    regulatory_domains,
+    regulatory_domains: regulatoryDomains,
     policy_profile_version: 1,
     generated_by: 'svc',
     signals: {
@@ -26,7 +26,7 @@ function input(
       ai_behavior: 'NONE',
       autonomy_level: 'NONE',
       deployment_surface: 'INTERNAL',
-      regulatory_domains,
+      regulatory_domains: regulatoryDomains,
       ...signals,
     },
   };

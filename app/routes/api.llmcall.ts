@@ -151,7 +151,11 @@ async function llmCallAction({ context, request }: ActionFunctionArgs) {
     }
   } else {
     try {
-      const models = await getModelList({ apiKeys, providerSettings, serverEnv: (context.cloudflare?.env ?? process.env) as any });
+      const models = await getModelList({
+        apiKeys,
+        providerSettings,
+        serverEnv: (context.cloudflare?.env ?? process.env) as any,
+      });
       const modelDetails = models.find((m: ModelInfo) => m.name === model);
 
       if (!modelDetails) {

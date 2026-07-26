@@ -35,8 +35,10 @@ User's request:
 export interface QHubPromptSeedResult {
   /** The prompt to fire (governance-wrapped if source=landing, raw otherwise) */
   seededPrompt: string | null;
+
   /** True if a ?prompt param was found and consumed */
   wasSeeded: boolean;
+
   /** True if the prompt was wrapped with the QHUB governance preamble */
   isGovernanceWrapped: boolean;
 }
@@ -53,9 +55,7 @@ export function useQHubPromptSeed(): QHubPromptSeedResult {
     }
 
     const fromLanding = source === 'landing';
-    const seededPrompt = fromLanding
-      ? `${QHUB_GOVERNANCE_PREAMBLE}${rawPrompt}`
-      : rawPrompt;
+    const seededPrompt = fromLanding ? `${QHUB_GOVERNANCE_PREAMBLE}${rawPrompt}` : rawPrompt;
 
     return {
       seededPrompt,
@@ -64,7 +64,6 @@ export function useQHubPromptSeed(): QHubPromptSeedResult {
     };
   }, [
     // Only evaluate once on mount — searchParams reference is stable until cleared
-    // eslint-disable-next-line react-hooks/exhaustive-deps
     searchParams.get('prompt'),
     searchParams.get('source'),
   ]);

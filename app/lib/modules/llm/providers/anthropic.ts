@@ -13,11 +13,13 @@ export default class AnthropicProvider extends BaseProvider {
   };
 
   staticModels: ModelInfo[] = [
-    // Claude Sonnet 4.6 — verified working with the installed @ai-sdk/anthropic
-    // (0.0.39). The 2025 "…-5 / …-4-8" IDs reject the default temperature this
-    // old SDK sends ("temperature is deprecated for this model"), so they are NOT
-    // used as static defaults. The full current model list still comes from
-    // getDynamicModels() for users who want to pick a specific model.
+    /*
+     * Claude Sonnet 4.6 — verified working with the installed @ai-sdk/anthropic
+     * (0.0.39). The 2025 "…-5 / …-4-8" IDs reject the default temperature this
+     * old SDK sends ("temperature is deprecated for this model"), so they are NOT
+     * used as static defaults. The full current model list still comes from
+     * getDynamicModels() for users who want to pick a specific model.
+     */
     {
       name: 'claude-sonnet-4-6',
       label: 'Claude Sonnet 4.6',
