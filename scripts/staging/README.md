@@ -12,6 +12,16 @@ Required environment variable names:
 - `SUPABASE_ANON_KEY`
 - `SUPABASE_SERVICE_ROLE_KEY`
 
+The deployed staging service must independently have:
+
+- `QHUB_ENABLE_GATE04_SIMULATION_ADAPTERS=1`
+- `QHUB_DEPLOY_ENV=staging`
+- `FLY_APP_NAME=qhub-studio`
+- `QHUB_PUBLIC_HOSTNAME=qhub-studio.fly.dev`
+
+Those server-side guards authorize only the two Gate 04 synthetic simulation
+adapters. They do not authorize a real external connector.
+
 If the five named synthetic staging principals do not yet exist, the separate
 guard `QHUB_ALLOW_STAGING_PRINCIPAL_PROVISIONING=1` authorizes creation through
 Supabase Auth admin APIs. It does not create application routes or database
@@ -27,7 +37,13 @@ The script refuses other hosts, Supabase projects, tenants, non-HTTPS targets,
 and production environment markers. Actions target `.invalid` no-op resources.
 Approvals and kill-switch transitions go exclusively through the deployed
 authenticated routes. Database reads are limited to postcondition checks.
+The matrix also drives one real governed model-provider call and verifies that
+its ALLOW was claimed and its `AI_MODEL_INVOKED` evidence state reached
+`COMMITTED`; the provider-throws-before-handle path remains a deterministic
+automated regression so no deliberate provider outage or secret mutation is
+required in staging.
 
 Reports are redacted and written with restrictive permissions beneath the
 operating system temporary directory. Authentication material is never
-included.
+included. Case B/C receipt counts come from distinct durable receipt identities,
+not the legacy `side_effect_performed` boolean.

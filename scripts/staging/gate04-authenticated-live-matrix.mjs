@@ -485,6 +485,25 @@ async function evaluationRow(db, evaluationId) {
   return data;
 }
 
+async function latestActionEvaluation(db, qhubAppId, actionType) {
+  const { data, error } = await db
+    .from('qhub_control_evaluations')
+    .select(
+      'evaluation_id,action_request_id,org_id,qhub_app_id,action_type,action_digest,decision,reason_codes,policy_profile_id,policy_profile_hash,enforcement_plan_id,enforcement_plan_hash,claimed,claimed_at,action_event_state,created_at',
+    )
+    .eq('qhub_app_id', qhubAppId)
+    .eq('action_type', actionType)
+    .order('created_at', { ascending: false })
+    .limit(1)
+    .maybeSingle();
+
+  if (error || !data) {
+    throw new Error('Governed action postcondition query failed');
+  }
+
+  return data;
+}
+
 async function approvalOwnershipOrphanCount(db) {
   const { data: approvals, error: approvalsError } = await db
     .from('qhub_control_approvals')
@@ -518,6 +537,27 @@ function summarizeDecision(response) {
     requiredAttestations: body.required_attestations ?? [],
     evidenceRecorded: body.evidence_recorded === true,
     sideEffectPerformed: body.side_effect_performed === true,
+    adapterExecuted: body.adapter_executed ?? null,
+    externalEffectPerformed: body.external_effect_performed ?? null,
+    executionMode: body.execution_mode ?? null,
+    executionStatus: body.execution_status ?? null,
+    receipt: body.receipt
+      ? {
+          receiptId: body.receipt.receipt_id ?? null,
+          evaluationId: body.receipt.evaluation_id ?? null,
+          actionRequestId: body.receipt.action_request_id ?? null,
+          actionDigest: body.receipt.action_digest ?? null,
+          adapterId: body.receipt.adapter_id ?? null,
+          adapterVersion: body.receipt.adapter_version ?? null,
+          executionMode: body.receipt.execution_mode ?? null,
+          executionStatus: body.receipt.execution_status ?? null,
+          externalEffectPerformed: body.receipt.external_effect_performed ?? null,
+          resultHash: body.receipt.result_hash ?? null,
+          ledgerEventId: body.receipt.ledger_event_id ?? null,
+          ledgerEventHash: body.receipt.ledger_event_hash ?? null,
+          ledgerSeq: body.receipt.ledger_seq ?? null,
+        }
+      : null,
   };
 }
 
@@ -574,6 +614,57 @@ async function runSchemaChecks({ clients, report }) {
   };
 }
 
+async function runAiInvocationCase({ clients, db, runId, report }) {
+  const conversationId = `gate04-r2-ai-${runId}`;
+  const app = await setupGovernedApp(
+    clients.requester,
+    conversationId,
+    'T0',
+    'Public synthetic marketing microsite with informational AI copy generation, public data only, no integrations, no customer data, and no external actions.',
+    report,
+  );
+  const response = await clients.requester('/api/chat', {
+    method: 'POST',
+    body: {
+      messages: [
+        {
+          id: conversationId,
+          role: 'user',
+          content:
+            '[Model: claude-sonnet-4-6]\n\n[Provider: Anthropic]\n\nReturn only the word READY for this synthetic staging evidence test.',
+        },
+      ],
+      files: {},
+      contextOptimization: false,
+      chatMode: 'discuss',
+      maxLLMSteps: 1,
+    },
+  });
+
+  assert(response.status === 200, 'Governed AI invocation did not return HTTP 200', report);
+
+  const evaluation = await latestActionEvaluation(db, app.qhubAppId, 'AI_MODEL_INVOCATION');
+  assert(evaluation.decision === 'ALLOW', 'Governed AI invocation was not ALLOW', report);
+  assert(evaluation.claimed === true, 'Governed AI invocation ALLOW was not claimed', report);
+  assert(evaluation.action_event_state === 'COMMITTED', 'AI_MODEL_INVOKED evidence was not COMMITTED', report);
+
+  report.aiInvocation = {
+    httpStatus: response.status,
+    appId: app.qhubAppId,
+    evaluationId: evaluation.evaluation_id,
+    actionRequestId: evaluation.action_request_id,
+    actionDigest: evaluation.action_digest,
+    decision: evaluation.decision,
+    claimed: evaluation.claimed,
+    actionEventState: evaluation.action_event_state,
+    policyProfileId: evaluation.policy_profile_id,
+    policyProfileHash: evaluation.policy_profile_hash,
+    enforcementPlanId: evaluation.enforcement_plan_id,
+    enforcementPlanHash: evaluation.enforcement_plan_hash,
+    failedBeforeHandleCoverage: 'enforcement-server provider-throw regression',
+  };
+}
+
 async function runCaseB({ clients, db, runId, report }) {
   const conversationId = `gate04-r2-t2-${runId}`;
   const app = await setupGovernedApp(
@@ -626,6 +717,15 @@ async function runCaseB({ clients, db, runId, report }) {
   const e2 = e2Response.body;
   assert(e2Response.status === 200 && e2?.decision === 'ALLOW', 'Case B E2 was not ALLOW', report);
   assert(e2.action_digest === e1.action_digest, 'Case B E2 action digest differs from E1', report);
+  assert(e2.adapter_executed === true, 'Case B simulation adapter did not execute', report);
+  assert(e2.external_effect_performed === false, 'Case B performed a real external effect', report);
+  assert(e2.side_effect_performed === false, 'Case B reported a legacy real-world side effect', report);
+  assert(e2.execution_mode === 'SIMULATION', 'Case B execution mode is not SIMULATION', report);
+  assert(e2.execution_status === 'SIMULATED_SUCCESS', 'Case B receipt is not SIMULATED_SUCCESS', report);
+  assert(e2.receipt?.receipt_id, 'Case B has no durable receipt identity', report);
+  assert(e2.receipt?.evaluation_id === e2.evaluation_id, 'Case B receipt evaluation binding differs', report);
+  assert(e2.receipt?.action_request_id === e2.action_request_id, 'Case B receipt request binding differs', report);
+  assert(e2.receipt?.action_digest === e2.action_digest, 'Case B receipt digest binding differs', report);
 
   const replayResponse = await enforce(clients.requester, conversationId, action, `${runId}-t2-e2`, e1.evaluation_id);
   const replay = replayResponse.body;
@@ -636,6 +736,7 @@ async function runCaseB({ clients, db, runId, report }) {
   );
   assert(replay.reason_codes?.includes('REPLAY_DENIED'), 'Case B replay lacks REPLAY_DENIED', report);
   assert(replay.side_effect_performed === false, 'Case B replay performed a side effect', report);
+  assert(!replay.receipt, 'Case B replay returned or created another receipt', report);
 
   const approvals = await approvalRows(db, app.qhubAppId, e1.action_digest);
   const e1Db = await evaluationRow(db, e1.evaluation_id);
@@ -671,7 +772,7 @@ async function runCaseB({ clients, db, runId, report }) {
       approvalRowsCreated: approvalsAfterCrossTenant.length - approvalsBeforeCrossTenant.length,
       orphanCount: orphanCountAfter,
     },
-    sideEffectReceiptCount: Number(e2.side_effect_performed === true),
+    sideEffectReceiptCount: Number(Boolean(e2.receipt?.receipt_id)),
     actionEventState: e2Db.action_event_state,
   };
   report.caseB.e2.parentEvaluationId = e2Db.parent_evaluation_id;
@@ -758,6 +859,15 @@ async function runCaseC({ clients, db, runId, report }) {
     report,
   );
   assert(e2.action_digest === e1.action_digest, 'Case C E2 action digest differs from E1', report);
+  assert(e2.adapter_executed === true, 'Case C simulation adapter did not execute', report);
+  assert(e2.external_effect_performed === false, 'Case C performed a real external effect', report);
+  assert(e2.side_effect_performed === false, 'Case C reported a legacy real-world side effect', report);
+  assert(e2.execution_mode === 'SIMULATION', 'Case C execution mode is not SIMULATION', report);
+  assert(e2.execution_status === 'SIMULATED_ACKNOWLEDGED', 'Case C did not return a simulated acknowledgment', report);
+  assert(e2.receipt?.receipt_id, 'Case C has no durable receipt identity', report);
+  assert(e2.receipt?.evaluation_id === e2.evaluation_id, 'Case C receipt evaluation binding differs', report);
+  assert(e2.receipt?.action_request_id === e2.action_request_id, 'Case C receipt request binding differs', report);
+  assert(e2.receipt?.action_digest === e2.action_digest, 'Case C receipt digest binding differs', report);
 
   const approvals = await approvalRows(db, app.qhubAppId, e1.action_digest);
   const approverIds = approvals.map((approval) => approval.approver_id);
@@ -819,6 +929,7 @@ async function runCaseC({ clients, db, runId, report }) {
       'Kill switch DENY performed a side effect',
       report,
     );
+    assert(!killedActionResponse.body?.receipt, 'Kill switch DENY created a receipt', report);
 
     const killedDb = await evaluationRow(db, killedActionResponse.body.evaluation_id);
     assert(
@@ -867,7 +978,7 @@ async function runCaseC({ clients, db, runId, report }) {
       approverRole: approval.approver_role,
       status: approval.status,
     })),
-    sideEffectReceiptCount: Number(e2.side_effect_performed === true),
+    sideEffectReceiptCount: Number(Boolean(e2.receipt?.receipt_id)),
     actionEventState: e2Db.action_event_state,
     killSwitch: {
       activated: killResponse?.body?.active === true,
@@ -894,6 +1005,7 @@ async function writeReports(report) {
     `Gate 04 authenticated live matrix: ${report.status}`,
     `Run: ${report.runId}`,
     `Schema: ${report.schema?.authenticated?.ready ? 'READY' : 'NOT READY'}`,
+    `AI invocation: ${report.aiInvocation?.actionEventState ?? 'NOT RUN'}`,
     `Case B: ${report.caseB?.e2?.decision ?? 'NOT RUN'}`,
     `Case B replay: ${(report.caseB?.replay?.reasonCodes ?? []).join(',') || 'NOT RUN'}`,
     `Cross-tenant rows created: ${report.caseB?.crossTenant?.approvalRowsCreated ?? 'NOT RUN'}`,
@@ -925,6 +1037,7 @@ async function main() {
     tenants: { primary: guard.primaryTenant, adversarial: guard.otherTenant },
     principals: {},
     schema: null,
+    aiInvocation: null,
     caseB: null,
     caseC: null,
     failures: [],
@@ -956,6 +1069,7 @@ async function main() {
     }
 
     await runSchemaChecks({ clients, report });
+    await runAiInvocationCase({ clients, db, runId, report });
     await runCaseB({ clients, db, runId, report });
     await runCaseC({ clients, db, runId, report });
 
