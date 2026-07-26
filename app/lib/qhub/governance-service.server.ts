@@ -109,6 +109,7 @@ type LambdaEventType =
   | 'AI_MODEL_INVOKED' // v2.6 — AI/LLM model invoked during development
   | 'CLASSIFICATION_ASSIGNED'
   | 'POLICY_PROFILE_ASSIGNED' // Gate 03 — deterministic policy profile bound to the app
+  | 'CONTROL_DECISION_RECORDED' // Gate 04 — authoritative enforcement decision for one action
   | 'GATE_PASSED'
   | 'GATE_FAILED'
   | 'ATTESTATION_SIGNED'
@@ -733,6 +734,18 @@ export class GovernanceService {
     builderProjectId?: string;
     provider: string;
     model: string;
+    /**
+     * Gate 04 enforcement references. When present, this AI invocation is bound
+     * to a prior exact ALLOW decision — the action event references that evaluation.
+     */
+    enforcement?: {
+      evaluation_id: string;
+      action_request_id: string;
+      action_digest: string;
+      enforcement_plan_id: string;
+      enforcement_plan_version: number;
+      enforcement_plan_hash: string;
+    };
   }): Promise<GovernanceResult> {
     if (!this.hmacSecret) {
       console.warn('[GovernanceService] No HMAC secret — AI_MODEL_INVOKED skipped');
@@ -790,6 +803,17 @@ export class GovernanceService {
               policy_catalog_version: policy.policy_catalog_version,
             }
           : {}),
+        ...(params.enforcement
+          ? {
+              evaluation_id: params.enforcement.evaluation_id,
+              action_request_id: params.enforcement.action_request_id,
+              action_digest: params.enforcement.action_digest,
+              enforcement_plan_id: params.enforcement.enforcement_plan_id,
+              enforcement_plan_version: params.enforcement.enforcement_plan_version,
+              enforcement_plan_hash: params.enforcement.enforcement_plan_hash,
+              enforcement_decision: 'ALLOW',
+            }
+          : {}),
         session_id: this.ctx.sessionId,
         source: 'qhub-studio',
       },
@@ -801,15 +825,52 @@ export class GovernanceService {
     return { ok: result.ok, qhubAppId: appRecord.qhub_app_id };
   }
 
+  /**
+   * Gate 04 — emit the authoritative CONTROL_DECISION_RECORDED event. This is the
+   * durable enforcement evidence written BEFORE any protected side effect. A
+   * decision=DENY event is itself the affirmative block record. Compact payload:
+   * ids/hashes/decision/reason_codes/control-result summary — never raw params.
+   */
+  async recordControlDecision(params: {
+    conversationId: string;
+    chainId: string | null;
+    riskTier: LedgerRiskTier;
+    qhubAppId: string;
+    payload: Record<string, unknown>;
+  }): Promise<{ ok: boolean }> {
+    if (!this.hmacSecret) {
+      console.warn('[GovernanceService] No HMAC secret — CONTROL_DECISION_RECORDED skipped');
+      return { ok: false };
+    }
+
+    const chainId = params.chainId ?? (await getChainId(params.conversationId, this.ctx.orgId, this.ctx.env));
+
+    const body: LambdaEventBody = {
+      ...(chainId ? { chain_id: chainId } : {}),
+      event_type: 'CONTROL_DECISION_RECORDED',
+      app_id: params.qhubAppId,
+      client_id: this.ctx.orgId,
+      actor: { id: this.ctx.userId, type: 'human', identity_provider: 'supabase' },
+      payload: { ...params.payload, session_id: this.ctx.sessionId, source: 'qhub-studio' },
+      risk_tier: params.riskTier,
+    };
+
+    const result = await this.postEvent(body);
+
+    return { ok: result.ok };
+  }
+
   private async recordAiModelInvoked(
-    intent: Extract<GovernanceIntent, { action: 'AI_MODEL_USED' }>,
+    _intent: Extract<GovernanceIntent, { action: 'AI_MODEL_USED' }>,
   ): Promise<GovernanceResult> {
-    return this.recordAiModelInvokedDirect({
-      conversationId: intent.conversationId,
-      builderProjectId: intent.builderProjectId,
-      provider: intent.provider,
-      model: intent.model,
-    });
+    /*
+     * Gate 04: the AI_MODEL_USED browser notification no longer emits AI_MODEL_INVOKED
+     * directly — that would bypass enforcement. The real model call is enforced and
+     * emitted server-side in stream-text.ts via enforceGovernedAction (which records
+     * CONTROL_DECISION_RECORDED first and emits AI_MODEL_INVOKED only on ALLOW). This
+     * intent is now a no-op acknowledgement.
+     */
+    return { ok: true };
   }
 
   // ── DEPLOYMENT GATE CHECK ──────────────────────────────────────────────────

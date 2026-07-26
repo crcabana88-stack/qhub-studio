@@ -367,20 +367,66 @@ export async function streamText(props: {
    * Signing happens inside GovernanceService using Node.js crypto.
    * The HMAC secret is read from serverEnv — never passed through qhubContext.
    */
-  if (qhubContext?.sessionId && qhubContext?.serverEnv) {
-    const svc = createGovernanceService({
-      userId: qhubContext.userId,
-      orgId: qhubContext.orgId,
-      sessionId: qhubContext.sessionId,
-      env: qhubContext.serverEnv,
-    });
-    svc
-      .recordAiModelInvokedDirect({
+  if (qhubContext?.sessionId && qhubContext?.serverEnv && qhubContext.userId && qhubContext.userId !== 'anonymous') {
+    /*
+     * Gate 04: the model call is a PROTECTED side effect. Route it through the
+     * central enforcement entry point, which records CONTROL_DECISION_RECORDED
+     * BEFORE generation and (on ALLOW) emits AI_MODEL_INVOKED referencing the
+     * exact evaluation. A governed DENY (kill switch, unapproved model, schema
+     * drift, plan/hash mismatch, autonomy/limit) blocks generation. For
+     * conversations that never went through Gate 02/03 (no classification/policy),
+     * fall back to the legacy AI-BOM emit so ungoverned generation is not broken.
+     */
+    const { enforceGovernedAction } = await import('~/lib/qhub/enforcement.server');
+    const role = (qhubContext as { role?: string }).role ?? 'builder';
+
+    let decision;
+
+    try {
+      decision = await enforceGovernedAction({
+        session: { userId: qhubContext.userId, orgId: qhubContext.orgId, role },
         conversationId: qhubContext.conversationId,
-        provider: currentProvider,
-        model: currentModel,
-      })
-      .catch((err: unknown) => console.error('[QHUB] AI-BOM log failed:', err));
+        action: {
+          action_type: 'AI_MODEL_INVOCATION',
+          target_resource: 'studio://generate',
+          operation: 'stream',
+          material_parameters: { provider: currentProvider, model: currentModel },
+          model_identity: currentModel,
+          provider_identity: currentProvider,
+          environment: 'PREVIEW',
+          autonomy_requested: 'NONE',
+        },
+        sessionId: qhubContext.sessionId,
+        env: qhubContext.serverEnv,
+      });
+    } catch (err) {
+      // Enforcement infrastructure error → fail closed for governed generation.
+      logger.error(`[QHUB] enforcement error — blocking generation: ${String(err)}`);
+      throw new Error('QHUB governance enforcement is unavailable; generation blocked (fail-closed).');
+    }
+
+    const ungovernedFallback: string[] = ['POLICY_MISSING', 'CLASSIFICATION_MISSING', 'APP_NOT_FOUND'];
+    const isUngoverned = decision.decision !== 'ALLOW' && decision.reason_codes.every((r) => ungovernedFallback.includes(r));
+
+    if (decision.decision !== 'ALLOW' && !isUngoverned) {
+      logger.warn(`[QHUB] generation blocked by enforcement: ${decision.decision} ${decision.reason_codes.join(',')}`);
+      throw new Error(`QHUB governance blocked this action (${decision.decision}): ${decision.reason_codes.join(', ')}.`);
+    }
+
+    if (isUngoverned) {
+      // Legacy/ungoverned conversation — preserve prior AI-BOM behavior.
+      const svc = createGovernanceService({
+        userId: qhubContext.userId,
+        orgId: qhubContext.orgId,
+        sessionId: qhubContext.sessionId,
+        env: qhubContext.serverEnv,
+      });
+      svc
+        .recordAiModelInvokedDirect({ conversationId: qhubContext.conversationId, provider: currentProvider, model: currentModel })
+        .catch((err: unknown) => console.error('[QHUB] AI-BOM log failed:', err));
+    }
+
+    // ALLOW: AI_MODEL_INVOKED already emitted by the enforcement entry point.
   }
 
   // ── END QHUB HOOK 2 ──────────────────────────────────────────────────────
