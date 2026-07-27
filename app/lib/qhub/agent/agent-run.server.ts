@@ -282,6 +282,7 @@ export async function runAgent(input: RunAgentInput): Promise<RunResult> {
   return driveRun({
     sb,
     run_id,
+    conversationId: input.conversationId,
     agent,
     version,
     session,
@@ -297,6 +298,7 @@ export async function runAgent(input: RunAgentInput): Promise<RunResult> {
 interface DriveContext {
   sb: SupabaseClient;
   run_id: string;
+  conversationId: string;
   agent: AgentRow;
   version: AgentVersionRow;
   session: { userId: string; orgId: string; role: string };
@@ -471,7 +473,7 @@ async function routeThroughGate04(
 
   const enforceOut = await enforceGovernedAction<{ ok: true }>({
     session,
-    conversationId: ctx.version.qhub_app_id, // stable per-agent-app conversation surrogate
+    conversationId: ctx.conversationId, // the governed app's conversation
     action: {
       action_type: action.action_type,
       target_resource: action.target_resource,
@@ -480,6 +482,7 @@ async function routeThroughGate04(
       model_identity: action.model_identity ?? null,
       environment: mapEnvironment(ctx.version.manifest.execution_environment),
       autonomy_requested: 'NONE',
+      app_version_ref: ctx.conversationId,
     },
     idempotencyKey: `${ctx.run_id}:${stepIndex}`,
     parentEvaluationId,
@@ -642,6 +645,19 @@ export async function resumeAgentRun(input: {
 
   await selection.provider.init({ manifest: manifestView(version), synthetic_inputs: input.synthetic_inputs });
 
+  /*
+   * Server-derive the governed app's conversation from the run's app (not the
+   * browser) so the resumed action re-enforces against the same app.
+   */
+  const appRow = await sb
+    .from('qhub_applications')
+    .select('conversation_id')
+    .eq('qhub_app_id', run.qhub_app_id as string)
+    .eq('org_id', session.orgId)
+    .maybeSingle();
+  const conversationId =
+    (appRow.data as { conversation_id?: string } | null)?.conversation_id ?? (run.qhub_app_id as string);
+
   const stepIndex = run.current_step as number;
   const counters = {
     proposed: run.proposed_action_count as number,
@@ -663,6 +679,7 @@ export async function resumeAgentRun(input: {
   const ctx: DriveContext = {
     sb,
     run_id: input.run_id,
+    conversationId,
     agent,
     version,
     session,

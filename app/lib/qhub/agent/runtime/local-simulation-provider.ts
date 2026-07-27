@@ -71,10 +71,11 @@ export class LocalSimulationProvider implements AgentRuntimeProvider {
         action_type: 'EXTERNAL_DATA_TRANSMISSION',
 
         /*
-         * Shaped for the existing staging simulation adapter: '.invalid' synthetic
-         * sink + 'write_simulation' allowlisted operation. No real destination.
+         * Shaped for the existing staging simulation adapter: an https '.invalid'
+         * synthetic sink + 'write_simulation' allowlisted operation. No real
+         * destination — the host resolves nowhere by RFC 6761.
          */
-        target_resource: `commission-ledger://${proposal.broker_id}.invalid`,
+        target_resource: `https://commission-recon-${proposal.broker_id.toLowerCase()}.invalid/reconcile`,
         operation: 'write_simulation',
         material_parameters: {
           synthetic: true,
