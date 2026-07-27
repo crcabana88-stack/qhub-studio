@@ -12,6 +12,7 @@ import {
   computeArtifactHash,
   missingMarkers,
   dirtySourcePaths,
+  compareBuildIdentity,
 } from '~/lib/qhub/build-identity';
 
 describe('deployment build integrity', () => {
@@ -68,5 +69,37 @@ describe('deployment build integrity', () => {
 
   it('a clean tracked tree yields no dirty source (proofs 2/3 precondition)', () => {
     expect(dirtySourcePaths(['?? .claude/', '?? .pnpm-store/'])).toEqual([]);
+  });
+
+  it('includes the LangGraph runtime-provider marker', () => {
+    expect(REQUIRED_BUILD_MARKERS).toContain('qhub.runtime.langgraph');
+  });
+});
+
+describe('release-integrity: reported identity vs on-image manifest', () => {
+  const manifest = { source_commit: 'abc123', artifact_hash: 'hash-xyz' };
+
+  it('passes when the reported identity matches the manifest', () => {
+    const r = compareBuildIdentity({ source_commit: 'abc123', artifact_hash: 'hash-xyz', built_at: 't' }, manifest);
+    expect(r.ok).toBe(true);
+    expect(r.reasons).toEqual([]);
+  });
+
+  it('fails closed on a source-commit mismatch', () => {
+    const r = compareBuildIdentity({ source_commit: 'WRONG', artifact_hash: 'hash-xyz', built_at: 't' }, manifest);
+    expect(r.ok).toBe(false);
+    expect(r.reasons).toContain('SOURCE_COMMIT_MISMATCH');
+  });
+
+  it('fails closed on an artifact-hash mismatch', () => {
+    const r = compareBuildIdentity({ source_commit: 'abc123', artifact_hash: 'TAMPERED', built_at: 't' }, manifest);
+    expect(r.ok).toBe(false);
+    expect(r.reasons).toContain('ARTIFACT_HASH_MISMATCH');
+  });
+
+  it('fails closed when the reported identity is unavailable', () => {
+    const r = compareBuildIdentity({ source_commit: null, artifact_hash: null, built_at: null }, manifest);
+    expect(r.ok).toBe(false);
+    expect(r.reasons).toEqual(['IDENTITY_UNAVAILABLE']);
   });
 });

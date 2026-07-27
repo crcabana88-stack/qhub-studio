@@ -14,10 +14,17 @@ import {
   LOCAL_SIMULATION_PROVIDER_ID,
   LOCAL_SIMULATION_PROVIDER_VERSION,
 } from './local-simulation-provider';
+import { LangGraphRuntimeProvider, LANGGRAPH_PROVIDER_ID } from './langgraph-runtime-provider';
 
-/** Known providers this build is allowed to run. Add future adapters here. */
+/**
+ * Known providers this build is allowed to run. Add future adapters here.
+ * The local deterministic simulation provider is the default verified baseline;
+ * the LangGraph provider is present for controlled evaluation only (selected
+ * server-side by a manifest's runtime_provider, never the default).
+ */
 const PROVIDER_FACTORIES: Record<string, () => AgentRuntimeProvider> = {
   [LOCAL_SIMULATION_PROVIDER_ID]: () => new LocalSimulationProvider(),
+  [LANGGRAPH_PROVIDER_ID]: () => new LangGraphRuntimeProvider(),
 };
 
 export const DEFAULT_RUNTIME_PROVIDER_ID = LOCAL_SIMULATION_PROVIDER_ID;

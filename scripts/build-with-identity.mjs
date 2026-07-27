@@ -36,6 +36,7 @@ const REQUIRED_BUILD_MARKERS = [
   'bind_release',
   'AGENT_MANIFEST_NOT_IN_RELEASE',
   'qhub_verify_governance_schema',
+  'qhub.runtime.langgraph',
 ];
 function dirtySourcePaths(lines) {
   const excluded = /^(\.claude\/|\.pnpm-store\/|build\/|node_modules\/)/;
