@@ -484,7 +484,13 @@ async function routeThroughGate04(
       autonomy_requested: 'NONE',
       app_version_ref: ctx.conversationId,
     },
-    idempotencyKey: `${ctx.run_id}:${stepIndex}`,
+
+    /*
+     * A resumed step (parentEvaluationId set) is a NEW E2 evaluation — it must
+     * NOT reuse the paused E1's idempotency key, or Gate 04 returns the cached
+     * REQUIRE_APPROVAL instead of consuming the approval and executing.
+     */
+    idempotencyKey: parentEvaluationId ? `${ctx.run_id}:${stepIndex}:e2` : `${ctx.run_id}:${stepIndex}`,
     parentEvaluationId,
     sessionId,
     env,
@@ -749,6 +755,30 @@ export async function resumeAgentRun(input: {
     await finishRun(sb, input.run_id, session.orgId, 'FAILED', counters, 'GOVERNED_ACTION_DENIED');
 
     return { ok: false, run_id: input.run_id, state: 'FAILED', reason_codes: ['GOVERNED_ACTION_DENIED'] };
+  }
+
+  /*
+   * Fail-closed: if the re-evaluated action still requires approval, do NOT
+   * proceed — keep the run paused rather than treating it as authorized.
+   */
+  if (decision.result.decision === 'REQUIRE_APPROVAL') {
+    await sb
+      .from('qhub_agent_runs')
+      .update({
+        current_state: 'AWAITING_APPROVAL',
+        pending_evaluation_id: decision.evaluation_id,
+        ...counterCols(counters),
+      })
+      .eq('run_id', input.run_id)
+      .eq('org_id', session.orgId);
+
+    return {
+      ok: true,
+      run_id: input.run_id,
+      state: 'AWAITING_APPROVAL',
+      reason_codes: [],
+      pending_evaluation_id: decision.evaluation_id,
+    };
   }
 
   counters.approved += 1;

@@ -468,6 +468,16 @@ describe('agent run orchestrator — Gate 04 routing (tests 17-31)', () => {
     // No governed action reported a real external effect (all SIMULATION).
     const anyRealEffect = H.enforce.mock.results.some((res: any) => res.value?.side_effect_performed === true);
     expect(anyRealEffect).toBe(false);
+
+    // The paused transmission step was updated IN PLACE to its SIMULATED receipt.
+    const txSteps = STORE.steps.filter((s) => s.action_type === 'EXTERNAL_DATA_TRANSMISSION');
+    expect(txSteps.length).toBe(1);
+    expect(txSteps[0].decision).toBe('SIMULATED');
+    expect(txSteps[0].receipt_id).toBe('rT');
+
+    // Resume used a DISTINCT E2 idempotency key (not the paused E1 key).
+    const e2call = H.enforce.mock.calls.find((c) => c[0].parentEvaluationId === 'E1');
+    expect(e2call?.[0].idempotencyKey).toMatch(/:e2$/);
   });
 
   it('Agent Run fails closed when schema is not ready — no run row, no Gate 04 action (tests 14/15/16)', async () => {
