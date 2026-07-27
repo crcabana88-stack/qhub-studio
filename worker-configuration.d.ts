@@ -32,6 +32,15 @@ interface Env {
   QHUB_DEPLOY_ENV: string;
   QHUB_PUBLIC_HOSTNAME: string;
   QHUB_ENABLE_GATE04_SIMULATION_ADAPTERS: string;
+
+  /*
+   * Non-secret build identity injected at deploy time. Declared here so bindings.sh
+   * forwards them to `wrangler pages dev` as --binding flags, making them visible to
+   * context.cloudflare.env for the authenticated /api/system/build-info diagnostic.
+   */
+  QHUB_BUILD_SOURCE_COMMIT: string;
+  QHUB_BUILD_ARTIFACT_HASH: string;
+  QHUB_BUILD_AT: string;
   FLY_APP_NAME: string;
   SUPABASE_URL: string;
   SUPABASE_ANON_KEY: string;

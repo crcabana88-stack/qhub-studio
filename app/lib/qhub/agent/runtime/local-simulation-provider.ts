@@ -43,6 +43,14 @@ export class LocalSimulationProvider implements AgentRuntimeProvider {
     this._plan = this._buildPlan(ctx);
   }
 
+  /**
+   * The deterministic governed-action plan. Read-only; used by the no-replay
+   * reconstruction guard to compute expected input hashes for stored steps.
+   */
+  plan(): readonly ProposedAction[] {
+    return this._plan;
+  }
+
   /** Deterministic plan for the commission-reconciliation reference workflow. */
   private _buildPlan(ctx: RuntimeInitContext): ProposedAction[] {
     const model = ctx.manifest.primary_model;
