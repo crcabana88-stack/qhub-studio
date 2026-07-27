@@ -1,3 +1,5 @@
+import { readFileSync } from 'node:fs';
+
 import { describe, expect, it, vi } from 'vitest';
 import { getGovernedActionAdapter } from '~/lib/qhub/governed-action-adapters.server';
 
@@ -8,6 +10,15 @@ const ENV = {
   QHUB_PUBLIC_HOSTNAME: 'qhub-studio.fly.dev',
   SUPABASE_URL: 'https://jsjsanmaahvmynblmzkq.supabase.co',
 };
+
+it('forwards every staging safeguard into the deployed worker', () => {
+  const workerConfiguration = readFileSync(new URL('../../worker-configuration.d.ts', import.meta.url), 'utf8');
+
+  expect(workerConfiguration).toContain('QHUB_DEPLOY_ENV: string;');
+  expect(workerConfiguration).toContain('QHUB_PUBLIC_HOSTNAME: string;');
+  expect(workerConfiguration).toContain('QHUB_ENABLE_GATE04_SIMULATION_ADAPTERS: string;');
+  expect(workerConfiguration).toContain('FLY_APP_NAME: string;');
+});
 
 function preflight(actionType: 'EXTERNAL_DATA_TRANSMISSION' | 'TRADING_OR_ORDER_ROUTING', over: any = {}) {
   return {

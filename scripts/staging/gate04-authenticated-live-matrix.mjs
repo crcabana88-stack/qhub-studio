@@ -61,7 +61,7 @@ export function validateStagingGuards(env = process.env) {
   const target = safeUrl(env.QHUB_STAGING_BASE_URL);
   const supabase = safeUrl(env.SUPABASE_URL);
   const targetRef = supabase?.hostname.split('.')[0] ?? '';
-  const deploymentMarkers = [env.NODE_ENV, env.QHUB_DEPLOY_ENV, env.FLY_APP_NAME, env.ENVIRONMENT].filter(Boolean);
+  const deploymentMarkers = [env.QHUB_DEPLOY_ENV, env.FLY_APP_NAME, env.ENVIRONMENT].filter(Boolean);
 
   if (env.QHUB_ALLOW_STAGING_LIVE_TESTS !== '1') {
     problems.push('live-test flag is not enabled');
@@ -155,6 +155,16 @@ export function assertRedactedReportSafe(report) {
   }
 
   return true;
+}
+
+export function redactDiagnostic(error) {
+  const message = error instanceof Error ? error.message : String(error ?? 'Unclassified harness failure');
+
+  if (SECRET_KEY.test(message) || JWT_LIKE.test(message) || EMAIL_LIKE.test(message)) {
+    return 'Sensitive diagnostic was redacted';
+  }
+
+  return message;
 }
 
 function safeUrl(value) {
@@ -686,6 +696,10 @@ async function runCaseB({ clients, db, runId, report }) {
 
   const e1Response = await enforce(clients.requester, conversationId, action, `${runId}-t2-e1`);
   const e1 = e1Response.body;
+  report.caseB = {
+    conversationRef: conversationId,
+    e1: summarizeDecision(e1Response),
+  };
   assert(
     e1Response.status === 200 && e1?.decision === 'REQUIRE_APPROVAL',
     'Case B E1 was not REQUIRE_APPROVAL',
@@ -1016,7 +1030,7 @@ async function writeReports(report) {
   await writeFile(jsonPath, `${JSON.stringify(safeReport, null, 2)}\n`, { mode: 0o600 });
   await writeFile(textPath, `${human}\n`, { mode: 0o600 });
 
-  return { jsonPath, textPath };
+  return { jsonPath, textPath, safeReport };
 }
 
 async function main() {
@@ -1095,9 +1109,19 @@ async function main() {
     report.status = 'FAIL';
   }
 
-  const paths = await writeReports(report);
+  const { safeReport, ...reportFiles } = await writeReports(report);
   process.stdout.write(
-    `${JSON.stringify({ status: report.status, runId: report.runId, reportFiles: paths, failures: report.failures }, null, 2)}\n`,
+    `${JSON.stringify(
+      {
+        status: report.status,
+        runId: report.runId,
+        reportFiles,
+        failures: report.failures,
+        ...(process.env.QHUB_LIVE_REPORT_STDOUT === '1' ? { report: safeReport } : {}),
+      },
+      null,
+      2,
+    )}\n`,
   );
   process.exitCode = report.status === 'PASS' ? 0 : 1;
 }
@@ -1105,8 +1129,8 @@ async function main() {
 const invokedPath = process.argv[1] ? pathToFileURL(process.argv[1]).href : '';
 
 if (import.meta.url === invokedPath) {
-  main().catch(() => {
-    process.stderr.write('Gate 04 harness terminated without exposing diagnostic internals.\n');
+  main().catch((error) => {
+    process.stderr.write(`Gate 04 harness terminated safely: ${redactDiagnostic(error)}\n`);
     process.exitCode = 1;
   });
 }

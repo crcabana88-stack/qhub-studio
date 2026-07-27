@@ -6,6 +6,7 @@ import { describe, expect, it } from 'vitest';
 // eslint-disable-next-line no-restricted-imports
 import {
   assertRedactedReportSafe,
+  redactDiagnostic,
   redactForReport,
   validateStagingGuards,
 } from '../../scripts/staging/gate04-authenticated-live-matrix.mjs';
@@ -41,10 +42,22 @@ describe('Gate 04 authenticated staging harness', () => {
   });
 
   it('refuses production markers and customer tenant overrides', () => {
-    expect(() => validateStagingGuards({ ...validEnvironment, NODE_ENV: 'production' })).toThrow(/production/);
+    expect(() => validateStagingGuards({ ...validEnvironment, QHUB_DEPLOY_ENV: 'production' })).toThrow(/production/);
     expect(() => validateStagingGuards({ ...validEnvironment, QHUB_TEST_TENANT: 'customer-one' })).toThrow(
       /customer tenant/,
     );
+  });
+
+  it('allows an optimized Node build on the exact staging deployment', () => {
+    expect(
+      validateStagingGuards({
+        ...validEnvironment,
+        NODE_ENV: 'production',
+        QHUB_DEPLOY_ENV: 'staging',
+        FLY_APP_NAME: 'qhub-studio',
+        ENVIRONMENT: 'staging',
+      }),
+    ).toMatchObject({ projectRef: 'jsjsanmaahvmynblmzkq' });
   });
 
   it('redacts authentication material recursively', () => {
@@ -59,6 +72,13 @@ describe('Gate 04 authenticated staging harness', () => {
       nested: {},
     });
     expect(assertRedactedReportSafe(report)).toBe(true);
+  });
+
+  it('never emits secret-bearing authentication diagnostics', () => {
+    expect(redactDiagnostic(new Error('schema preflight failed'))).toBe('schema preflight failed');
+    expect(redactDiagnostic(new Error('access token rejected for user@example.com'))).toBe(
+      'Sensitive diagnostic was redacted',
+    );
   });
 
   it('contains no product auth bypass or direct governance-table mutation', () => {
