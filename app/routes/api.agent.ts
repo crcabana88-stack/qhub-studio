@@ -6,6 +6,7 @@
  *   op = 'create'   — build server-authoritative manifest + create draft agent
  *   op = 'version'  — create a new immutable version (material change)
  *   op = 'freeze'   — freeze the current version's manifest
+ *   op = 'freeze_release' — freeze a Gate 05 release binding the exact manifest hash
  *   op = 'bind_release' — bind an APPROVED Gate 05 release to a frozen version
  *   op = 'state'    — request a lifecycle transition (server decides)
  *   op = 'suspend'  — kill switch (durable suspend)
@@ -35,6 +36,8 @@ import {
 import { transitionAgentState, killSwitchAgent } from '~/lib/qhub/agent/agent-lifecycle.server';
 import { runAgent, resumeAgentRun } from '~/lib/qhub/agent/agent-run.server';
 import { assertAgentSchemaReady } from '~/lib/qhub/agent/agent-schema-check.server';
+import { agentReleaseFileEntry, agentReleaseFileManifestHash } from '~/lib/qhub/agent/agent-release-binding.server';
+import { freezeReleaseCandidate } from '~/lib/qhub/attestation.server';
 
 export async function action({ request, context }: ActionFunctionArgs) {
   const env = (context.cloudflare?.env as unknown as Record<string, string | undefined>) ?? {};
@@ -125,10 +128,47 @@ export async function action({ request, context }: ActionFunctionArgs) {
       return json({ ok }, { status: ok ? 200 : 409 });
     }
 
+    case 'freeze_release': {
+      /*
+       * Server freezes a Gate 05 release that cryptographically binds the exact
+       * agent manifest (as a dedicated file entry). The browser supplies no hash.
+       */
+      const conversationId = (body.conversationId ?? '').trim();
+      const version = await getAgentVersion(body.agent_version_id, session.orgId, env);
+
+      if (!conversationId || !version) {
+        return json({ ok: false, error: 'Missing conversationId or version' }, { status: 400 });
+      }
+
+      if (!version.frozen) {
+        return json({ ok: false, error: 'AGENT_VERSION_NOT_FROZEN' }, { status: 409 });
+      }
+
+      const sessionId = generateStableSessionId(session.userId, conversationId);
+      const r = await freezeReleaseCandidate({
+        session: sess,
+        conversationId,
+        files: [agentReleaseFileEntry(version.agent_version_id, version.manifest_hash)],
+        declared_models: version.manifest.approved_models,
+        declared_connectors: version.manifest.approved_connectors.map((c) => c.connector_id),
+        declared_data_access: [`agent:${version.agent_id}`],
+        dependency_lockfile_hash: null,
+        source_commit: version.manifest_hash,
+        target_environment: version.manifest.execution_environment,
+        deployment_target: version.manifest.runtime_provider,
+        release_scope: 'agent',
+        sessionId,
+        env,
+      });
+
+      return json(r, { status: r.ok ? 200 : 409 });
+    }
+
     case 'bind_release': {
       /*
-       * Server-authoritative: verify the release is APPROVED for this tenant and
-       * resolve its exact hash + APPROVE decision; the browser supplies neither.
+       * Server-authoritative: verify the release is APPROVED for this tenant,
+       * that it cryptographically contains the exact agent manifest, and resolve
+       * its exact hash + APPROVE decision; the browser supplies none of these.
        */
       const approved = await getApprovedReleaseForBinding(body.release_candidate_id, session.orgId, env);
 
@@ -140,6 +180,14 @@ export async function action({ request, context }: ActionFunctionArgs) {
 
       if (!version || version.qhub_app_id !== approved.qhub_app_id) {
         return json({ ok: false, error: 'RELEASE_APP_MISMATCH' }, { status: 409 });
+      }
+
+      // Exact-version: the approved release must contain THIS agent's manifest hash.
+      if (
+        approved.canonical_file_manifest_hash !==
+        agentReleaseFileManifestHash(version.agent_version_id, version.manifest_hash)
+      ) {
+        return json({ ok: false, error: 'AGENT_MANIFEST_NOT_IN_RELEASE' }, { status: 409 });
       }
 
       const ok = await bindApprovedRelease(

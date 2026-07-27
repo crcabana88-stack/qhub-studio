@@ -261,11 +261,16 @@ export async function getApprovedReleaseForBinding(
   releaseCandidateId: string,
   orgId: string,
   env: Record<string, string | undefined>,
-): Promise<{ release_candidate_hash: string; qhub_app_id: string; deployment_decision_id: string } | null> {
+): Promise<{
+  release_candidate_hash: string;
+  qhub_app_id: string;
+  canonical_file_manifest_hash: string;
+  deployment_decision_id: string;
+} | null> {
   const sb = admin(env);
   const { data: rc } = await sb
     .from('qhub_release_candidates')
-    .select('release_candidate_hash, qhub_app_id, status')
+    .select('release_candidate_hash, qhub_app_id, canonical_file_manifest_hash, status')
     .eq('release_candidate_id', releaseCandidateId)
     .eq('org_id', orgId)
     .maybeSingle();
@@ -291,6 +296,7 @@ export async function getApprovedReleaseForBinding(
   return {
     release_candidate_hash: (rc as { release_candidate_hash: string }).release_candidate_hash,
     qhub_app_id: (rc as { qhub_app_id: string }).qhub_app_id,
+    canonical_file_manifest_hash: (rc as { canonical_file_manifest_hash: string }).canonical_file_manifest_hash,
     deployment_decision_id: (decision as { decision_id: string }).decision_id,
   };
 }
