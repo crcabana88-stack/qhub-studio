@@ -546,10 +546,37 @@ async function recordStep(
   },
 ): Promise<boolean> {
   /*
-   * Upsert on (run_id, step_index): a REQUIRE_APPROVAL step is recorded at pause
-   * and updated in place to its final decision when the run resumes.
+   * A REQUIRE_APPROVAL step is recorded at pause and updated IN PLACE to its final
+   * decision when the run resumes. Explicit update-or-insert on (run_id,
+   * step_index) — robust regardless of on-conflict target resolution.
    */
-  const { error } = await sb.from('qhub_agent_run_steps').upsert(step, { onConflict: 'run_id,step_index' });
+  const { data: existing } = await sb
+    .from('qhub_agent_run_steps')
+    .select('step_id')
+    .eq('run_id', step.run_id)
+    .eq('step_index', step.step_index)
+    .maybeSingle();
+
+  if (existing) {
+    const { error } = await sb
+      .from('qhub_agent_run_steps')
+      .update({
+        step_kind: step.step_kind,
+        action_type: step.action_type,
+        evaluation_id: step.evaluation_id,
+        decision: step.decision,
+        reason_codes: step.reason_codes,
+        receipt_id: step.receipt_id,
+        input_hash: step.input_hash,
+        summary: step.summary,
+      })
+      .eq('run_id', step.run_id)
+      .eq('step_index', step.step_index);
+
+    return !error;
+  }
+
+  const { error } = await sb.from('qhub_agent_run_steps').insert(step);
 
   return !error;
 }
