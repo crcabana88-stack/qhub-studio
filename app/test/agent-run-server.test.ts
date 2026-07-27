@@ -56,6 +56,25 @@ function fakeClient() {
 
         return exec();
       },
+      upsert(r: any) {
+        if (key === 'steps' && STORE.failStepInsert) {
+          return Promise.resolve({ data: null, error: { message: 'forced step upsert failure' } });
+        }
+
+        const arr = Array.isArray(r) ? r : [r];
+
+        for (const row of arr) {
+          const idx = STORE[key].findIndex((x) => x.run_id === row.run_id && x.step_index === row.step_index);
+
+          if (idx >= 0) {
+            STORE[key][idx] = { ...row };
+          } else {
+            STORE[key].push({ ...row });
+          }
+        }
+
+        return Promise.resolve({ data: arr, error: null });
+      },
       update(p: any) {
         mode = 'update';
         payload = p;

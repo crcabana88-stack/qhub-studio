@@ -545,7 +545,11 @@ async function recordStep(
     summary: string;
   },
 ): Promise<boolean> {
-  const { error } = await sb.from('qhub_agent_run_steps').insert(step);
+  /*
+   * Upsert on (run_id, step_index): a REQUIRE_APPROVAL step is recorded at pause
+   * and updated in place to its final decision when the run resumes.
+   */
+  const { error } = await sb.from('qhub_agent_run_steps').upsert(step, { onConflict: 'run_id,step_index' });
 
   return !error;
 }
