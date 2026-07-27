@@ -92,12 +92,14 @@ const H = vi.hoisted(() => ({
   getAgentVersion: vi.fn(),
   checkReleaseBinding: vi.fn(),
   enforce: vi.fn(),
+  assertSchema: vi.fn(),
 }));
 
 vi.mock('@supabase/supabase-js', () => ({ createClient: () => fakeClient() }));
 vi.mock('~/lib/qhub/agent/agent-registry.server', () => ({ getAgent: H.getAgent, getAgentVersion: H.getAgentVersion }));
 vi.mock('~/lib/qhub/agent/agent-release-binding.server', () => ({ checkReleaseBinding: H.checkReleaseBinding }));
 vi.mock('~/lib/qhub/enforcement.server', () => ({ enforceGovernedAction: H.enforce }));
+vi.mock('~/lib/qhub/agent/agent-schema-check.server', () => ({ assertAgentSchemaReady: H.assertSchema }));
 
 const ENV = { SUPABASE_URL: 'https://p.supabase.co', SUPABASE_SERVICE_ROLE_KEY: 'k' };
 const SESSION = { userId: 'user-1', orgId: 'client-smoke', role: 'owner' };
@@ -220,6 +222,7 @@ beforeEach(() => {
   STORE.runs = [];
   STORE.steps = [];
   STORE.failStepInsert = false;
+  H.assertSchema.mockResolvedValue(undefined);
   H.getAgent.mockResolvedValue(makeAgent());
   H.getAgentVersion.mockResolvedValue(makeVersion());
   H.checkReleaseBinding.mockResolvedValue({
@@ -446,6 +449,17 @@ describe('agent run orchestrator — Gate 04 routing (tests 17-31)', () => {
     // No governed action reported a real external effect (all SIMULATION).
     const anyRealEffect = H.enforce.mock.results.some((res: any) => res.value?.side_effect_performed === true);
     expect(anyRealEffect).toBe(false);
+  });
+
+  it('Agent Run fails closed when schema is not ready — no run row, no Gate 04 action (tests 14/15/16)', async () => {
+    H.assertSchema.mockRejectedValueOnce(new Error('SchemaNotReadyError'));
+
+    const r = await run();
+    expect(r.state).toBe('BLOCKED');
+    expect(r.reason_codes).toContain('SCHEMA_NOT_READY');
+    expect(H.enforce).not.toHaveBeenCalled(); // no Gate 04 action
+    expect(STORE.runs.length).toBe(0); // no partial run record
+    expect(STORE.steps.length).toBe(0);
   });
 
   it('run + step records contain hashes only — no raw params/secrets (test 31)', async () => {

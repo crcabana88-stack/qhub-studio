@@ -24,6 +24,7 @@ import {
   type AgentActionLimits,
 } from './agent-manifest';
 import { LOCAL_SIMULATION_PROVIDER_ID, LOCAL_SIMULATION_PROVIDER_VERSION } from './runtime/local-simulation-provider';
+import { assertAgentSchemaReady } from './agent-schema-check.server';
 import type { TargetEnvironment } from '~/lib/qhub/release-candidate';
 
 const sha256 = (s: string) => createHash('sha256').update(s).digest('hex');
@@ -83,6 +84,7 @@ export interface BuiltManifest {
 }
 
 export type ManifestBuildError =
+  | 'SCHEMA_NOT_READY'
   | 'UNIMPLEMENTED_OPERATING_MODE'
   | 'MISSING_CLASSIFICATION'
   | 'MISSING_POLICY_PROFILE'
@@ -104,6 +106,16 @@ export async function buildAgentManifest(
   input: AgentManifestDraftInput,
   opts: { agent_id?: string; agent_version_id?: string } = {},
 ): Promise<ManifestBuildResult> {
+  /*
+   * Fail closed before any governance read/write if the Agent Framework schema
+   * is missing or misconfigured — no agent is created.
+   */
+  try {
+    await assertAgentSchemaReady(input.env);
+  } catch {
+    return { ok: false, error: 'SCHEMA_NOT_READY' };
+  }
+
   if (!IMPLEMENTED_OPERATING_MODES.includes(input.operating_mode)) {
     // BOUNDED_AUTONOMOUS_AGENT may exist only as a disabled/simulation-only option.
     return { ok: false, error: 'UNIMPLEMENTED_OPERATING_MODE' };

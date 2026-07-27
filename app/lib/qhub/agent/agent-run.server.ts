@@ -19,6 +19,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import { enforceGovernedAction } from '~/lib/qhub/enforcement.server';
 import { getAgent, getAgentVersion, type AgentRow, type AgentVersionRow } from './agent-registry.server';
 import { checkReleaseBinding } from './agent-release-binding.server';
+import { assertAgentSchemaReady } from './agent-schema-check.server';
 import { canRunInState } from './agent-lifecycle';
 import { selectRuntimeProvider } from './runtime/provider-registry.server';
 import { canonicalRunString, type AgentRunState } from './agent-run';
@@ -62,6 +63,7 @@ export interface RunAgentInput {
 }
 
 export type RunReasonCode =
+  | 'SCHEMA_NOT_READY'
   | 'AGENT_NOT_FOUND'
   | 'KILL_SWITCH_ACTIVE'
   | 'NOT_RUNNABLE_STATE'
@@ -120,6 +122,17 @@ function blocked(reason: RunReasonCode): RunResult {
  */
 export async function runAgent(input: RunAgentInput): Promise<RunResult> {
   const { session, env } = input;
+
+  /*
+   * Fail closed before any run row is created if the Agent Framework schema is
+   * missing/misconfigured — no run begins, no Gate 04 action, no evidence.
+   */
+  try {
+    await assertAgentSchemaReady(env);
+  } catch {
+    return blocked('SCHEMA_NOT_READY');
+  }
+
   const agent = await getAgent(input.agent_id, session.orgId, env);
 
   if (!agent) {
@@ -571,6 +584,13 @@ export async function resumeAgentRun(input: {
   env: Record<string, string | undefined>;
 }): Promise<RunResult> {
   const { session, env } = input;
+
+  try {
+    await assertAgentSchemaReady(env);
+  } catch {
+    return blocked('SCHEMA_NOT_READY');
+  }
+
   const sb = admin(env);
   const runRow = await sb
     .from('qhub_agent_runs')

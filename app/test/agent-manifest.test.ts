@@ -10,6 +10,7 @@ const H = vi.hoisted(() => ({
   getClassification: vi.fn(),
   getPolicyProfile: vi.fn(),
   getActivePlan: vi.fn(),
+  assertSchema: vi.fn(),
 }));
 
 vi.mock('~/lib/qhub/qhub-app.server', () => ({
@@ -18,6 +19,7 @@ vi.mock('~/lib/qhub/qhub-app.server', () => ({
   getPolicyProfile: H.getPolicyProfile,
 }));
 vi.mock('~/lib/qhub/enforcement-store.server', () => ({ getActivePlan: H.getActivePlan }));
+vi.mock('~/lib/qhub/agent/agent-schema-check.server', () => ({ assertAgentSchemaReady: H.assertSchema }));
 
 import { canonicalAgentManifestString } from '~/lib/qhub/agent/agent-manifest';
 
@@ -49,6 +51,7 @@ function draft(over: any = {}) {
 
 beforeEach(() => {
   vi.clearAllMocks();
+  H.assertSchema.mockResolvedValue(undefined);
   H.getOrCreateQhubApp.mockResolvedValue({ qhub_app_id: 'app-1', chain_id: 'chain-1' });
   H.getClassification.mockResolvedValue({ classification_version: 2 });
   H.getPolicyProfile.mockResolvedValue({
@@ -128,6 +131,18 @@ describe('buildAgentManifest (tests 1-9)', () => {
     expect(r.built!.manifest.policy_profile_hash).toBe('PPHASH');
     expect(r.built!.manifest.enforcement_plan_hash).toBe('EPHASH');
     expect(r.built!.manifest.risk_tier).toBe('T2');
+  });
+
+  it('agent creation fails closed when the Agent Framework schema is not ready (test 13)', async () => {
+    const { buildAgentManifest } = await import('~/lib/qhub/agent/agent-manifest.server');
+    H.assertSchema.mockRejectedValueOnce(new Error('SchemaNotReadyError'));
+
+    const r = await buildAgentManifest(draft());
+    expect(r.ok).toBe(false);
+    expect(r.error).toBe('SCHEMA_NOT_READY');
+
+    // No governance read happened after the failed readiness gate.
+    expect(H.getPolicyProfile).not.toHaveBeenCalled();
   });
 
   it('rejects an unimplemented operating mode (BOUNDED_AUTONOMOUS_AGENT)', async () => {

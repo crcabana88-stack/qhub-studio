@@ -15,11 +15,13 @@ import type { SchemaReadinessReport } from '~/lib/qhub/schema-check.server';
 
 // ─── Hoisted mocks ────────────────────────────────────────────────────────────
 
-const { mockGetSchemaReadiness, mockAssertGovernanceSchemaReady, mockGetSession } = vi.hoisted(() => ({
-  mockGetSchemaReadiness: vi.fn(),
-  mockAssertGovernanceSchemaReady: vi.fn(),
-  mockGetSession: vi.fn(),
-}));
+const { mockGetSchemaReadiness, mockAssertGovernanceSchemaReady, mockGetSession, mockGetAgentSchemaReadiness } =
+  vi.hoisted(() => ({
+    mockGetSchemaReadiness: vi.fn(),
+    mockAssertGovernanceSchemaReady: vi.fn(),
+    mockGetSession: vi.fn(),
+    mockGetAgentSchemaReadiness: vi.fn(),
+  }));
 
 vi.mock('~/lib/qhub/schema-check.server', () => {
   class SchemaNotReadyError extends Error {
@@ -37,6 +39,11 @@ vi.mock('~/lib/qhub/schema-check.server', () => {
     SchemaNotReadyError,
   };
 });
+
+vi.mock('~/lib/qhub/agent/agent-schema-check.server', () => ({
+  getAgentSchemaReadiness: mockGetAgentSchemaReadiness,
+  assertAgentSchemaReady: vi.fn(),
+}));
 
 vi.mock('~/lib/auth/session', () => ({
   getSession: mockGetSession,
@@ -83,6 +90,17 @@ const fakeContext = { cloudflare: { env: {} } } as any;
 
 beforeEach(() => {
   vi.clearAllMocks();
+
+  // Agent Framework readiness defaults to ready; individual tests override.
+  mockGetAgentSchemaReadiness.mockResolvedValue({
+    ready: true,
+    expectedSchemaVersion: '2026-07-27.agent-foundation',
+    projectRef: 'jsjsanmaahvmynblmzkq',
+    supabaseHost: 'jsjsanmaahvmynblmzkq.supabase.co',
+    checkedAt: '2026-07-27T00:00:00Z',
+    objects: [],
+    missing: [],
+  });
 });
 
 // ─── /api/health — generic public response ────────────────────────────────────

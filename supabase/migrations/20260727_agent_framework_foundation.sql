@@ -293,4 +293,145 @@ COMMENT ON TABLE qhub_agent_versions IS
 COMMENT ON TABLE qhub_agent_runs IS
   'Agent Framework: governed run records. Every action routes through Gate 04; no DEPLOYMENT_EXECUTED is fabricated.';
 
+-- ─── 8. Metadata-only Agent Framework verifier (service-role only) ────────────
+-- Separate from qhub_verify_governance_schema() so Gate 04's verified contract
+-- stays stable. Reads ONLY pg_catalog / information_schema metadata and returns a
+-- compact, non-sensitive readiness result (no raw SQL, RLS predicates, secrets,
+-- or customer data). Missing-safe: joins by relname so a dropped table yields
+-- ready=false instead of raising.
+CREATE OR REPLACE FUNCTION public.qhub_verify_agent_schema()
+RETURNS JSONB
+LANGUAGE sql
+STABLE
+SECURITY DEFINER
+SET search_path = pg_catalog, public
+AS $$
+WITH agent_tables(name) AS (
+  VALUES ('qhub_agents'), ('qhub_agent_versions'), ('qhub_agent_runs'), ('qhub_agent_run_steps')
+),
+fk_count AS (
+  SELECT count(*) AS n
+  FROM pg_constraint c
+  JOIN pg_class t ON t.oid = c.conrelid
+  JOIN pg_namespace n ON n.oid = t.relnamespace
+  WHERE c.contype = 'f' AND n.nspname = 'public'
+    AND t.relname IN ('qhub_agents','qhub_agent_versions','qhub_agent_runs','qhub_agent_run_steps')
+    AND c.convalidated
+),
+checks(identifier, category, ready, reason_code) AS (
+  VALUES
+    ('table.qhub_agents', 'TABLE', to_regclass('public.qhub_agents') IS NOT NULL, 'TABLE_MISSING'),
+    ('table.qhub_agent_versions', 'TABLE', to_regclass('public.qhub_agent_versions') IS NOT NULL, 'TABLE_MISSING'),
+    ('table.qhub_agent_runs', 'TABLE', to_regclass('public.qhub_agent_runs') IS NOT NULL, 'TABLE_MISSING'),
+    ('table.qhub_agent_run_steps', 'TABLE', to_regclass('public.qhub_agent_run_steps') IS NOT NULL, 'TABLE_MISSING'),
+
+    ('column.agents_contract', 'COLUMN', (
+      SELECT count(*) = 14 FROM information_schema.columns
+      WHERE table_schema='public' AND table_name='qhub_agents'
+        AND column_name = ANY(ARRAY['agent_id','org_id','qhub_app_id','name','owner_user_id','owning_team',
+          'current_version_id','current_lifecycle_state','current_operating_mode','risk_tier',
+          'kill_switch_active','created_by','created_at','updated_at'])
+    ), 'COLUMN_MISSING_OR_MISMATCH'),
+    ('column.versions_contract', 'COLUMN', (
+      SELECT count(*) = 17 FROM information_schema.columns
+      WHERE table_schema='public' AND table_name='qhub_agent_versions'
+        AND column_name = ANY(ARRAY['agent_version_id','agent_id','org_id','qhub_app_id','manifest','manifest_hash',
+          'manifest_version','operating_mode','autonomy_level','risk_tier','policy_profile_hash','enforcement_plan_hash',
+          'release_candidate_id','release_candidate_hash','deployment_decision_id','frozen','created_at'])
+    ), 'COLUMN_MISSING_OR_MISMATCH'),
+    ('column.runs_contract', 'COLUMN', (
+      SELECT count(*) = 24 FROM information_schema.columns
+      WHERE table_schema='public' AND table_name='qhub_agent_runs'
+        AND column_name = ANY(ARRAY['run_id','agent_id','agent_version_id','org_id','qhub_app_id','release_candidate_id',
+          'release_candidate_hash','initiating_user_id','operating_mode','runtime_provider','runtime_provider_version',
+          'current_state','current_step','policy_profile_hash','enforcement_plan_hash','primary_model','input_hash',
+          'output_hash','proposed_action_count','idempotency_key','pending_evaluation_id','error_reference','run_hash','started_at'])
+    ), 'COLUMN_MISSING_OR_MISMATCH'),
+    ('column.steps_contract', 'COLUMN', (
+      SELECT count(*) = 11 FROM information_schema.columns
+      WHERE table_schema='public' AND table_name='qhub_agent_run_steps'
+        AND column_name = ANY(ARRAY['step_id','run_id','org_id','step_index','step_kind','action_type',
+          'evaluation_id','decision','reason_codes','input_hash','summary'])
+    ), 'COLUMN_MISSING_OR_MISMATCH'),
+
+    ('constraint.foreign_keys_validated', 'CONSTRAINT', (SELECT n = 13 FROM fk_count), 'FK_MISSING_OR_UNVALIDATED'),
+
+    ('constraint.lifecycle_state_check', 'CONSTRAINT', EXISTS (
+      SELECT 1 FROM pg_constraint c JOIN pg_class t ON t.oid=c.conrelid
+      WHERE t.relname='qhub_agents' AND c.contype='c' AND pg_get_constraintdef(c.oid) ILIKE '%current_lifecycle_state%'
+    ), 'CONSTRAINT_MISSING'),
+    ('constraint.run_state_check', 'CONSTRAINT', EXISTS (
+      SELECT 1 FROM pg_constraint c JOIN pg_class t ON t.oid=c.conrelid
+      WHERE t.relname='qhub_agent_runs' AND c.contype='c' AND pg_get_constraintdef(c.oid) ILIKE '%current_state%'
+    ), 'CONSTRAINT_MISSING'),
+    ('constraint.step_decision_check', 'CONSTRAINT', EXISTS (
+      SELECT 1 FROM pg_constraint c JOIN pg_class t ON t.oid=c.conrelid
+      WHERE t.relname='qhub_agent_run_steps' AND c.contype='c' AND pg_get_constraintdef(c.oid) ILIKE '%decision%'
+    ), 'CONSTRAINT_MISSING'),
+
+    ('index.version_content_unique', 'INDEX', EXISTS (
+      SELECT 1 FROM pg_index i JOIN pg_class c ON c.oid=i.indexrelid
+      WHERE c.relname='idx_agent_versions_hash' AND i.indisunique
+    ), 'INDEX_MISSING_OR_MISMATCH'),
+    ('index.run_idempotency_unique', 'INDEX', EXISTS (
+      SELECT 1 FROM pg_index i JOIN pg_class c ON c.oid=i.indexrelid
+      WHERE c.relname='idx_agent_runs_idem' AND i.indisunique
+    ), 'INDEX_MISSING_OR_MISMATCH'),
+    ('index.step_index_unique', 'INDEX', EXISTS (
+      SELECT 1 FROM pg_index i JOIN pg_class c ON c.oid=i.indexrelid
+      WHERE c.relname='idx_agent_run_steps_run_index' AND i.indisunique
+    ), 'INDEX_MISSING_OR_MISMATCH'),
+
+    ('rls.enabled_all', 'RLS_ENABLED', (
+      SELECT count(*) = 4 FROM pg_class t JOIN pg_namespace n ON n.oid=t.relnamespace
+      JOIN agent_tables a ON a.name = t.relname
+      WHERE n.nspname='public' AND t.relrowsecurity
+    ), 'RLS_DISABLED'),
+
+    ('policy.restrictive_service_only', 'RLS_POLICY', (
+      SELECT count(*) = 4 FROM pg_policy p JOIN pg_class t ON t.oid=p.polrelid
+      JOIN agent_tables a ON a.name = t.relname
+      WHERE p.polpermissive = FALSE
+    ), 'POLICY_MISSING_OR_PERMISSIVE'),
+
+    ('privilege.browser_roles_denied', 'FUNCTION', (
+      SELECT count(*) = 0 FROM information_schema.role_table_grants
+      WHERE table_schema='public' AND grantee IN ('PUBLIC','anon','authenticated')
+        AND table_name IN ('qhub_agents','qhub_agent_versions','qhub_agent_runs','qhub_agent_run_steps')
+    ), 'BROWSER_PRIVILEGE_BROADENED'),
+    ('privilege.service_role_scoped', 'FUNCTION', (
+      SELECT count(*) = 12 FROM information_schema.role_table_grants
+      WHERE table_schema='public' AND grantee='service_role'
+        AND table_name IN ('qhub_agents','qhub_agent_versions','qhub_agent_runs','qhub_agent_run_steps')
+        AND privilege_type IN ('SELECT','INSERT','UPDATE')
+    ), 'SERVICE_ROLE_PRIVILEGE_MISMATCH'),
+
+    ('function.agent_verifier', 'FUNCTION',
+      to_regprocedure('public.qhub_verify_agent_schema()') IS NOT NULL
+      AND (SELECT prosecdef FROM pg_proc WHERE oid = 'public.qhub_verify_agent_schema()'::regprocedure)
+      AND NOT has_function_privilege('anon', 'public.qhub_verify_agent_schema()', 'EXECUTE')
+      AND NOT has_function_privilege('authenticated', 'public.qhub_verify_agent_schema()', 'EXECUTE')
+      AND has_function_privilege('service_role', 'public.qhub_verify_agent_schema()', 'EXECUTE'),
+      'FUNCTION_MISSING_OR_EXPOSED')
+),
+normalized AS (
+  SELECT identifier, category, ready, CASE WHEN ready THEN 'OK' ELSE reason_code END AS reason_code
+  FROM checks
+)
+SELECT jsonb_build_object(
+  'expected_version', '2026-07-27.agent-foundation',
+  'ready', bool_and(ready),
+  'checks', jsonb_agg(
+    jsonb_build_object('identifier', identifier, 'category', category, 'ready', ready, 'reason_code', reason_code)
+    ORDER BY category, identifier
+  )
+)
+FROM normalized
+$$;
+
+REVOKE ALL ON FUNCTION public.qhub_verify_agent_schema() FROM PUBLIC;
+REVOKE ALL ON FUNCTION public.qhub_verify_agent_schema() FROM anon;
+REVOKE ALL ON FUNCTION public.qhub_verify_agent_schema() FROM authenticated;
+GRANT EXECUTE ON FUNCTION public.qhub_verify_agent_schema() TO service_role;
+
 COMMIT;

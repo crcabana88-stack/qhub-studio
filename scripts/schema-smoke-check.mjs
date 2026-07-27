@@ -30,6 +30,21 @@ import { dirname, join } from 'node:path';
 const EXPECTED_SCHEMA_VERSION = '2026-07-26.gate04';
 const SCHEMA_VERIFIER_RPC = 'qhub_verify_governance_schema';
 
+/*
+ * Agent Framework schema — separate contract so Gate 04's stays stable.
+ * KEEP IN SYNC with app/lib/qhub/agent/agent-schema-check.server.ts.
+ */
+const EXPECTED_AGENT_SCHEMA_VERSION = '2026-07-27.agent-foundation';
+const AGENT_SCHEMA_VERIFIER_RPC = 'qhub_verify_agent_schema';
+
+/** @type {{table:string,column:string,migration:string}[]} */
+const AGENT_REQUIRED_OBJECTS = [
+  { table: 'qhub_agents', column: 'current_lifecycle_state', migration: '20260727_agent_framework_foundation' },
+  { table: 'qhub_agent_versions', column: 'manifest_hash', migration: '20260727_agent_framework_foundation' },
+  { table: 'qhub_agent_runs', column: 'idempotency_key', migration: '20260727_agent_framework_foundation' },
+  { table: 'qhub_agent_run_steps', column: 'step_index', migration: '20260727_agent_framework_foundation' },
+];
+
 /** @type {{table:string,column:string,migration:string}[]} */
 const REQUIRED_SCHEMA_OBJECTS = [
   { table: 'qhub_applications', column: 'qhub_app_id', migration: '20260723_qhub_applications' },
@@ -154,8 +169,8 @@ async function probe(url, serviceKey, obj) {
   }
 }
 
-async function verifyMetadata(url, serviceKey) {
-  const endpoint = `${url.replace(/\/$/, '')}/rest/v1/rpc/${SCHEMA_VERIFIER_RPC}`;
+async function verifyMetadata(url, serviceKey, rpc = SCHEMA_VERIFIER_RPC, expectedVersion = EXPECTED_SCHEMA_VERSION) {
+  const endpoint = `${url.replace(/\/$/, '')}/rest/v1/rpc/${rpc}`;
 
   try {
     const res = await fetch(endpoint, {
@@ -178,7 +193,7 @@ async function verifyMetadata(url, serviceKey) {
     const body = await res.json();
 
     if (
-      body?.expected_version !== EXPECTED_SCHEMA_VERSION ||
+      body?.expected_version !== expectedVersion ||
       typeof body?.ready !== 'boolean' ||
       !Array.isArray(body?.checks)
     ) {
@@ -289,7 +304,36 @@ async function main() {
 
   console.log(`  [OK  ] ${metadata.checks.length} Gate 04 metadata invariants`);
 
-  console.log(`[schema-smoke-check] PASS: project ${projectRef ?? '(unknown)'} matches ${EXPECTED_SCHEMA_VERSION}.`);
+  // ── Agent Framework schema (separate contract) ──
+  const agentResults = await Promise.all(AGENT_REQUIRED_OBJECTS.map((o) => probe(url, serviceKey, o)));
+  const agentMissing = agentResults.filter((r) => r.state !== 'present');
+
+  if (agentMissing.length > 0) {
+    console.error(
+      `[schema-smoke-check] FAIL: Agent Framework schema is behind the code — missing: ` +
+        `${agentMissing.map((m) => `${m.table}.${m.column} (${m.migration})`).join(', ')}`,
+    );
+    process.exit(1);
+  }
+
+  const agentMeta = await verifyMetadata(url, serviceKey, AGENT_SCHEMA_VERIFIER_RPC, EXPECTED_AGENT_SCHEMA_VERSION);
+
+  if (!agentMeta.ready) {
+    const failed = agentMeta.checks.filter((check) => !check.ready);
+    console.error(
+      `[schema-smoke-check] FAIL: Agent Framework metadata contract is not ready — ` +
+        `${agentMeta.error ?? failed.map((check) => `${check.category}:${check.identifier}:${check.reason_code}`).join(', ')}`,
+    );
+    process.exit(1);
+  }
+
+  console.log(
+    `  [OK  ] ${agentMeta.checks.length} Agent Framework metadata invariants (${EXPECTED_AGENT_SCHEMA_VERSION})`,
+  );
+
+  console.log(
+    `[schema-smoke-check] PASS: project ${projectRef ?? '(unknown)'} matches ${EXPECTED_SCHEMA_VERSION} + ${EXPECTED_AGENT_SCHEMA_VERSION}.`,
+  );
   process.exit(0);
 }
 

@@ -22,6 +22,7 @@
 import { json, type LoaderFunctionArgs } from '@remix-run/cloudflare';
 import { getSession } from '~/lib/auth/session';
 import { getSchemaReadiness } from '~/lib/qhub/schema-check.server';
+import { getAgentSchemaReadiness } from '~/lib/qhub/agent/agent-schema-check.server';
 
 export const loader = async ({ request, context }: LoaderFunctionArgs) => {
   const env = (context?.cloudflare?.env as unknown as Record<string, string | undefined>) ?? {};
@@ -36,6 +37,7 @@ export const loader = async ({ request, context }: LoaderFunctionArgs) => {
   const force = new URL(request.url).searchParams.get('force') === '1';
 
   const report = await getSchemaReadiness(env, { force });
+  const agent = await getAgentSchemaReadiness(env, { force });
 
   return json(
     {
@@ -59,8 +61,22 @@ export const loader = async ({ request, context }: LoaderFunctionArgs) => {
         migration: m.migration,
       })),
       ...(report.error ? { error: report.error } : {}),
+
+      // Agent Framework readiness (separate contract; compact, non-secret).
+      agent: {
+        ready: agent.ready,
+        expectedSchemaVersion: agent.expectedSchemaVersion,
+        objects: agent.objects.map((o) => ({
+          identifier: o.identifier ?? `${o.table}.${o.column}`,
+          category: o.category ?? 'COLUMN',
+          state: o.state,
+          ...(o.detail ? { detail: o.detail } : {}),
+        })),
+        missing: agent.missing.map((m) => m.identifier ?? `${m.table}.${m.column}`),
+        ...(agent.error ? { error: agent.error } : {}),
+      },
     },
-    { status: report.ready ? 200 : 503 },
+    { status: report.ready && agent.ready ? 200 : 503 },
   );
 };
 

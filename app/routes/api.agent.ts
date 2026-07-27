@@ -31,6 +31,7 @@ import {
 } from '~/lib/qhub/agent/agent-registry.server';
 import { transitionAgentState, killSwitchAgent } from '~/lib/qhub/agent/agent-lifecycle.server';
 import { runAgent, resumeAgentRun } from '~/lib/qhub/agent/agent-run.server';
+import { assertAgentSchemaReady } from '~/lib/qhub/agent/agent-schema-check.server';
 
 export async function action({ request, context }: ActionFunctionArgs) {
   const env = (context.cloudflare?.env as unknown as Record<string, string | undefined>) ?? {};
@@ -38,6 +39,13 @@ export async function action({ request, context }: ActionFunctionArgs) {
 
   if (!session) {
     return json({ ok: false, error: 'Unauthenticated' }, { status: 401 });
+  }
+
+  // Fail closed for EVERY agent op if the Agent Framework schema is not ready.
+  try {
+    await assertAgentSchemaReady(env);
+  } catch {
+    return json({ ok: false, error: 'Agent Framework schema not ready' }, { status: 503 });
   }
 
   const sess = { userId: session.userId, orgId: session.orgId, role: session.role };

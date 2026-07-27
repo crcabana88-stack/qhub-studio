@@ -22,12 +22,13 @@ import {
   type AgentVersionRow,
 } from './agent-registry.server';
 import { checkReleaseBinding } from './agent-release-binding.server';
+import { assertAgentSchemaReady } from './agent-schema-check.server';
 import { getClassification, getPolicyProfile } from '~/lib/qhub/qhub-app.server';
 import { getActivePlan } from '~/lib/qhub/enforcement-store.server';
 
 export interface TransitionAgentResult {
   ok: boolean;
-  reason?: LifecycleReasonCode | 'AGENT_NOT_FOUND' | 'NO_CURRENT_VERSION';
+  reason?: LifecycleReasonCode | 'AGENT_NOT_FOUND' | 'NO_CURRENT_VERSION' | 'SCHEMA_NOT_READY';
   state?: AgentLifecycleState;
 }
 
@@ -67,6 +68,12 @@ export async function transitionAgentState(input: {
   policy_allows_active?: boolean;
   env: Record<string, string | undefined>;
 }): Promise<TransitionAgentResult> {
+  try {
+    await assertAgentSchemaReady(input.env);
+  } catch {
+    return { ok: false, reason: 'SCHEMA_NOT_READY' };
+  }
+
   const agent = await getAgent(input.agent_id, input.session.orgId, input.env);
 
   if (!agent) {
