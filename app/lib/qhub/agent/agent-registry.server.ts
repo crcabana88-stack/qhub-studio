@@ -92,6 +92,9 @@ export async function createDraftAgent(
   const vRes = await insertVersion(sb, params);
 
   if (!vRes.ok) {
+    // Roll back the just-created agent so no partial record survives.
+    await sb.from('qhub_agents').delete().eq('agent_id', m.agent_id).eq('org_id', m.org_id);
+
     return { ok: false, reason: vRes.reason };
   }
 
@@ -155,6 +158,7 @@ async function insertVersion(
     release_candidate_hash: m.release_candidate_hash,
     deployment_decision_id: m.deployment_decision_id,
     frozen: false,
+    created_by: m.created_by,
   });
 
   if (error) {
