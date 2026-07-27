@@ -77,7 +77,7 @@ const lockfileHash = createHash('sha256').update(readFileSync(join(ROOT, 'pnpm-l
 console.log('[build-with-identity] removing build/ …');
 rmSync(join(ROOT, 'build'), { recursive: true, force: true });
 console.log('[build-with-identity] running production build …');
-execSync('remix vite:build', { cwd: ROOT, stdio: 'inherit', env: { ...process.env, NODE_OPTIONS: '--max-old-space-size=4096' } });
+execSync('npx --no-install remix vite:build', { cwd: ROOT, stdio: 'inherit', env: { ...process.env, NODE_OPTIONS: '--max-old-space-size=4096' } });
 
 // 3. Require the build to exist.
 const serverDir = join(ROOT, 'build', 'server');
