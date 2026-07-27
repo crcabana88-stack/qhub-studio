@@ -6,6 +6,7 @@
  *   op = 'create'   — build server-authoritative manifest + create draft agent
  *   op = 'version'  — create a new immutable version (material change)
  *   op = 'freeze'   — freeze the current version's manifest
+ *   op = 'bind_release' — bind an APPROVED Gate 05 release to a frozen version
  *   op = 'state'    — request a lifecycle transition (server decides)
  *   op = 'suspend'  — kill switch (durable suspend)
  *   op = 'run'      — start (or replay) a governed run
@@ -25,6 +26,8 @@ import {
   createDraftAgent,
   createAgentVersion,
   freezeAgentVersion,
+  bindApprovedRelease,
+  getApprovedReleaseForBinding,
   getAgent,
   getAgentVersion,
   listAgents,
@@ -120,6 +123,37 @@ export async function action({ request, context }: ActionFunctionArgs) {
       const ok = await freezeAgentVersion(body.agent_version_id, session.orgId, env);
 
       return json({ ok }, { status: ok ? 200 : 409 });
+    }
+
+    case 'bind_release': {
+      /*
+       * Server-authoritative: verify the release is APPROVED for this tenant and
+       * resolve its exact hash + APPROVE decision; the browser supplies neither.
+       */
+      const approved = await getApprovedReleaseForBinding(body.release_candidate_id, session.orgId, env);
+
+      if (!approved) {
+        return json({ ok: false, error: 'RELEASE_NOT_APPROVED' }, { status: 409 });
+      }
+
+      const version = await getAgentVersion(body.agent_version_id, session.orgId, env);
+
+      if (!version || version.qhub_app_id !== approved.qhub_app_id) {
+        return json({ ok: false, error: 'RELEASE_APP_MISMATCH' }, { status: 409 });
+      }
+
+      const ok = await bindApprovedRelease(
+        {
+          agent_version_id: body.agent_version_id,
+          org_id: session.orgId,
+          release_candidate_id: body.release_candidate_id,
+          release_candidate_hash: approved.release_candidate_hash,
+          deployment_decision_id: approved.deployment_decision_id,
+        },
+        env,
+      );
+
+      return json({ ok, release_candidate_hash: approved.release_candidate_hash }, { status: ok ? 200 : 409 });
     }
 
     case 'state': {

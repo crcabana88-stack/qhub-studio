@@ -248,6 +248,49 @@ export async function bindApprovedRelease(
   return Array.isArray(data) && data.length === 1;
 }
 
+/**
+ * Server-authoritative lookup of an APPROVED Gate 05 release for binding. Returns
+ * the exact release hash + app + the APPROVE deployment-decision id, or null if
+ * the release is not APPROVED for this tenant. The browser never supplies these.
+ */
+export async function getApprovedReleaseForBinding(
+  releaseCandidateId: string,
+  orgId: string,
+  env: Record<string, string | undefined>,
+): Promise<{ release_candidate_hash: string; qhub_app_id: string; deployment_decision_id: string } | null> {
+  const sb = admin(env);
+  const { data: rc } = await sb
+    .from('qhub_release_candidates')
+    .select('release_candidate_hash, qhub_app_id, status')
+    .eq('release_candidate_id', releaseCandidateId)
+    .eq('org_id', orgId)
+    .maybeSingle();
+
+  if (!rc || (rc as { status: string }).status !== 'APPROVED') {
+    return null;
+  }
+
+  const { data: decision } = await sb
+    .from('qhub_deployment_decisions')
+    .select('decision_id')
+    .eq('release_candidate_id', releaseCandidateId)
+    .eq('org_id', orgId)
+    .eq('decision', 'APPROVE')
+    .order('decided_at', { ascending: false })
+    .limit(1)
+    .maybeSingle();
+
+  if (!decision) {
+    return null;
+  }
+
+  return {
+    release_candidate_hash: (rc as { release_candidate_hash: string }).release_candidate_hash,
+    qhub_app_id: (rc as { qhub_app_id: string }).qhub_app_id,
+    deployment_decision_id: (decision as { decision_id: string }).decision_id,
+  };
+}
+
 /** Set the agent's mutable lifecycle state (transition already validated). */
 export async function setLifecycleState(
   agentId: string,
