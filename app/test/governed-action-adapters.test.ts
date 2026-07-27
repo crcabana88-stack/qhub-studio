@@ -13,11 +13,16 @@ const ENV = {
 
 it('forwards every staging safeguard into the deployed worker', () => {
   const workerConfiguration = readFileSync(new URL('../../worker-configuration.d.ts', import.meta.url), 'utf8');
+  const bindingScript = readFileSync(new URL('../../bindings.sh', import.meta.url), 'utf8');
 
   expect(workerConfiguration).toContain('QHUB_DEPLOY_ENV: string;');
   expect(workerConfiguration).toContain('QHUB_PUBLIC_HOSTNAME: string;');
   expect(workerConfiguration).toContain('QHUB_ENABLE_GATE04_SIMULATION_ADAPTERS: string;');
   expect(workerConfiguration).toContain('FLY_APP_NAME: string;');
+  expect(bindingScript).toContain("grep -o '[A-Z_][A-Z0-9_]*:' worker-configuration.d.ts");
+
+  const extractedNames = [...workerConfiguration.matchAll(/\b([A-Z_][A-Z0-9_]*):/g)].map((match) => match[1]);
+  expect(extractedNames).toContain('QHUB_ENABLE_GATE04_SIMULATION_ADAPTERS');
 });
 
 function preflight(actionType: 'EXTERNAL_DATA_TRANSMISSION' | 'TRADING_OR_ORDER_ROUTING', over: any = {}) {

@@ -4,7 +4,7 @@ bindings=""
 
 # Function to extract variable names from the TypeScript interface
 extract_env_vars() {
-  grep -o '[A-Z_]\+:' worker-configuration.d.ts | sed 's/://'
+  grep -o '[A-Z_][A-Z0-9_]*:' worker-configuration.d.ts | sed 's/://'
 }
 
 # First try to read from .env.local if it exists
