@@ -11,6 +11,8 @@ import {
   missingMarkers,
   dirtySourcePaths,
   untrackedBuildInputs,
+  viteLoadedEnvFiles,
+  unexpectedBuildEnv,
   evaluateBuildIntegrity,
   type BuildIdentityTriple,
 } from '~/lib/qhub/build-identity';
@@ -100,6 +102,56 @@ describe('clean build inputs', () => {
   it('allows only the narrow untracked artifact allowlist', () => {
     const porcelain = ['?? .claude/', '?? .pnpm-store/', '?? build/server/x.js', '?? node_modules/x'];
     expect(untrackedBuildInputs(porcelain)).toEqual([]);
+  });
+});
+
+describe('ignored Vite env files (invisible to git status)', () => {
+  it('flags every Vite-loaded .env file at root and under functions/', () => {
+    const flagged = viteLoadedEnvFiles([
+      '.env',
+      '.env.local',
+      '.env.production',
+      '.env.production.local',
+      '.env.staging',
+      '.env.staging.local',
+      'functions/.env',
+      '.env.example', // template, not loaded → ignored
+      '.env.d.ts', // type file, not loaded → ignored
+      'README.md', // unrelated
+    ]);
+
+    for (const p of [
+      '.env',
+      '.env.local',
+      '.env.production',
+      '.env.production.local',
+      '.env.staging',
+      'functions/.env',
+    ]) {
+      expect(flagged).toContain(p);
+    }
+    expect(flagged).not.toContain('.env.example');
+    expect(flagged).not.toContain('.env.d.ts');
+    expect(flagged).not.toContain('README.md');
+  });
+
+  it('.env.example alone does not affect the build', () => {
+    expect(viteLoadedEnvFiles(['.env.example'])).toEqual([]);
+  });
+});
+
+describe('sanitized build environment', () => {
+  it('rejects unexpected VITE_*, PUBLIC_*, and build-time QHUB_BUILD_* variables', () => {
+    const bad = unexpectedBuildEnv(['VITE_SECRET', 'PUBLIC_URL', 'QHUB_BUILD_SOURCE_COMMIT', 'PATH', 'NODE_OPTIONS']);
+    expect(bad).toContain('VITE_SECRET');
+    expect(bad).toContain('PUBLIC_URL');
+    expect(bad).toContain('QHUB_BUILD_SOURCE_COMMIT');
+    expect(bad).not.toContain('PATH');
+    expect(bad).not.toContain('NODE_OPTIONS');
+  });
+
+  it('permits an empty/clean environment', () => {
+    expect(unexpectedBuildEnv(['PATH', 'HOME', 'NODE_OPTIONS', 'QHUB_ALLOW_DIRTY_BUILD'])).toEqual([]);
   });
 });
 

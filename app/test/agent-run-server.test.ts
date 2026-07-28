@@ -183,6 +183,8 @@ const H = vi.hoisted(() => ({
   enforce: vi.fn(),
   assertSchema: vi.fn(),
   getEval: vi.fn(),
+  gather: vi.fn(),
+  plan: vi.fn(),
 }));
 
 vi.mock('@supabase/supabase-js', () => ({ createClient: () => fakeClient() }));
@@ -190,7 +192,46 @@ vi.mock('~/lib/qhub/agent/agent-registry.server', () => ({ getAgent: H.getAgent,
 vi.mock('~/lib/qhub/agent/agent-release-binding.server', () => ({ checkReleaseBinding: H.checkReleaseBinding }));
 vi.mock('~/lib/qhub/enforcement.server', () => ({ enforceGovernedAction: H.enforce }));
 vi.mock('~/lib/qhub/agent/agent-schema-check.server', () => ({ assertAgentSchemaReady: H.assertSchema }));
-vi.mock('~/lib/qhub/enforcement-store.server', () => ({ getEvaluationById: H.getEval }));
+vi.mock('~/lib/qhub/enforcement-store.server', () => ({
+  getEvaluationById: H.getEval,
+  gatherApprovals: H.gather,
+  getActivePlan: H.plan,
+}));
+
+const OWNER_REQ = {
+  requirement_id: 'REQ-OWNER',
+  attestation_type: 'OWNER_ATTESTATION',
+  applies_to: ['EXTERNAL_DATA_TRANSMISSION'],
+  min_approvals: 1,
+  distinct_approvers: false,
+  roles: ['owner'],
+};
+
+/** Configure a valid resume: matching evaluation + active plan + a valid approval. */
+async function setupValidResume(inputs: any) {
+  const ev: any = await pausedEvalForConnector(inputs);
+  ev.required_attestations = ['OWNER_ATTESTATION'];
+  H.getEval.mockResolvedValue(ev);
+  H.plan.mockResolvedValue({
+    policy_profile_hash: 'PPHASH',
+    enforcement_plan_hash: 'EPHASH',
+    plan: { approval_requirements: [OWNER_REQ] },
+  });
+  H.gather.mockResolvedValue([
+    {
+      attestation_type: 'OWNER_ATTESTATION',
+      approver_id: 'owner-9',
+      approver_role: 'owner',
+      scoped_action_digest: ev.action_digest,
+      scoped_policy_profile_hash: 'PPHASH',
+      scoped_enforcement_plan_hash: 'EPHASH',
+      status: 'GRANTED',
+      expires_at: new Date(Date.now() + 3600_000).toISOString(),
+    },
+  ]);
+
+  return ev;
+}
 
 const ENV = { SUPABASE_URL: 'https://p.supabase.co', SUPABASE_SERVICE_ROLE_KEY: 'k' };
 const SESSION = { userId: 'user-1', orgId: 'client-smoke', role: 'owner' };
@@ -368,7 +409,7 @@ describe('agent run orchestrator — Gate 04 routing (tests 17-31)', () => {
 
   it('resume with the exact approved evaluation resumes only that action → COMPLETED (test 21)', async () => {
     await run();
-    H.getEval.mockResolvedValue(await pausedEvalForConnector(syntheticCommissionDatasets()));
+    await setupValidResume(syntheticCommissionDatasets());
 
     const { resumeAgentRun } = await import('~/lib/qhub/agent/agent-run.server');
     const runId = STORE.runs[0].run_id;
@@ -526,7 +567,7 @@ describe('agent run orchestrator — Gate 04 routing (tests 17-31)', () => {
   it('commission reconciliation reference agent completes in simulation with no real effect (tests 29/30)', async () => {
     const started = await run();
     expect(started.state).toBe('AWAITING_APPROVAL');
-    H.getEval.mockResolvedValue(await pausedEvalForConnector(syntheticCommissionDatasets()));
+    await setupValidResume(syntheticCommissionDatasets());
 
     const { resumeAgentRun } = await import('~/lib/qhub/agent/agent-run.server');
     const done = await resumeAgentRun({
@@ -649,6 +690,41 @@ describe('agent run orchestrator — Gate 04 routing (tests 17-31)', () => {
     const r = await resume();
     expect(r.state).toBe('BLOCKED');
     expect(r.reason_codes).toContain('SUSPENDED');
+    expect(H.enforce.mock.calls.find((c) => c[0].parentEvaluationId)).toBeUndefined();
+  });
+
+  it('resume fails closed with NO valid approval — zero E2 submission, zero receipt', async () => {
+    await run();
+    await setupValidResume(syntheticCommissionDatasets());
+    H.gather.mockResolvedValue([]); // binding is valid, but there is no valid approval
+
+    const r = await resume();
+    expect(r.state).toBe('BLOCKED');
+    expect(r.reason_codes).toContain('RECONSTRUCTION_FAILED');
+
+    // No E2 Gate 04 submission was made, and the paused step has no receipt.
+    expect(H.enforce.mock.calls.find((c) => c[0].parentEvaluationId)).toBeUndefined();
+    expect(STORE.steps.find((s) => s.step_index === 1)!.receipt_id).toBeNull();
+  });
+
+  it('resume fails closed when an approval is scoped to a DIFFERENT action digest', async () => {
+    await run();
+    await setupValidResume(syntheticCommissionDatasets());
+    H.gather.mockResolvedValue([
+      {
+        attestation_type: 'OWNER_ATTESTATION',
+        approver_id: 'owner-9',
+        approver_role: 'owner',
+        scoped_action_digest: 'digest-for-a-different-action',
+        scoped_policy_profile_hash: 'PPHASH',
+        scoped_enforcement_plan_hash: 'EPHASH',
+        status: 'GRANTED',
+        expires_at: new Date(Date.now() + 3600_000).toISOString(),
+      },
+    ]);
+
+    const r = await resume();
+    expect(r.state).toBe('BLOCKED');
     expect(H.enforce.mock.calls.find((c) => c[0].parentEvaluationId)).toBeUndefined();
   });
 

@@ -10,6 +10,8 @@
  * else ALLOW. Mandatory controls are fail-closed.
  */
 
+/* eslint-disable @typescript-eslint/naming-convention -- local bindings mirror snake_case wire/DB fields */
+
 import {
   ENFORCEMENT_EVALUATOR_VERSION,
   type ApprovalRequirement,
@@ -39,13 +41,10 @@ function hostOf(resource: string): string {
 }
 
 /** Count distinct valid approvers for a requirement (independence-aware). */
-function requirementSatisfied(
-  req: ApprovalRequirement,
-  valid: GatheredApproval[],
-  actorId: string,
-): boolean {
+export function requirementSatisfied(req: ApprovalRequirement, valid: GatheredApproval[], actorId: string): boolean {
   let pool = valid.filter(
-    (a) => a.attestation_type === req.attestation_type && (req.roles.length === 0 || req.roles.includes(a.approver_role)),
+    (a) =>
+      a.attestation_type === req.attestation_type && (req.roles.length === 0 || req.roles.includes(a.approver_role)),
   );
 
   if (req.distinct_approvers) {
@@ -54,6 +53,49 @@ function requirementSatisfied(
   }
 
   return new Set(pool.map((a) => a.approver_id)).size >= req.min_approvals;
+}
+
+export type ApprovalSetReason = 'UNKNOWN_REQUIRED_ATTESTATION' | 'APPROVAL_NOT_SATISFIED';
+
+/**
+ * PURE pre-Gate-04 check that the EXACT required approval set is satisfied. Uses
+ * the SAME valid-approval filter and `requirementSatisfied` quorum/SoD logic as
+ * the authoritative decision engine, so it can never diverge from what Gate 04's
+ * E2 evaluation would decide. Approvals are valid ONLY for the exact action
+ * digest + policy + plan the paused evaluation was scoped to; expired/revoked/
+ * consumed approvals are excluded (their `status` is not GRANTED). Any shortfall
+ * → not satisfied, so the caller submits NO E2 request.
+ */
+export function checkApprovalSet(params: {
+  requiredAttestations: string[];
+  approvalRequirements: ApprovalRequirement[];
+  gathered: GatheredApproval[];
+  actionDigest: string;
+  policyProfileHash: string;
+  enforcementPlanHash: string;
+  actorId: string;
+}): { ok: boolean; reason?: ApprovalSetReason; detail?: string } {
+  const valid = params.gathered.filter(
+    (a) =>
+      a.status === 'GRANTED' &&
+      a.scoped_action_digest === params.actionDigest &&
+      a.scoped_policy_profile_hash === params.policyProfileHash &&
+      a.scoped_enforcement_plan_hash === params.enforcementPlanHash,
+  );
+
+  for (const att of params.requiredAttestations) {
+    const req = params.approvalRequirements.find((r) => r.attestation_type === att);
+
+    if (!req) {
+      return { ok: false, reason: 'UNKNOWN_REQUIRED_ATTESTATION', detail: att };
+    }
+
+    if (!requirementSatisfied(req, valid, params.actorId)) {
+      return { ok: false, reason: 'APPROVAL_NOT_SATISFIED', detail: att };
+    }
+  }
+
+  return { ok: true };
 }
 
 export function evaluate(input: DecisionEngineInput): EnforcementResult {
@@ -95,6 +137,7 @@ export function evaluate(input: DecisionEngineInput): EnforcementResult {
     hardDeny = true;
     reasons.add('ACTION_TYPE_NOT_PROTECTED');
     results.push({ control_id: 'PLAN-SCOPE', status: 'FAIL', reason_code: 'ACTION_TYPE_NOT_PROTECTED' });
+
     return finish();
   }
 
@@ -125,7 +168,12 @@ export function evaluate(input: DecisionEngineInput): EnforcementResult {
     results.push({ control_id: id, status: 'REQUIRE_APPROVAL', reason_code: rc });
   };
 
-  const approvalCheck = (id: string, adapter: 'OWNER_ATTESTATION' | 'PROD_APPROVAL' | 'PREVIEW_ONLY' | 'DUAL_CONTROL', prodOnly: boolean, rc: ReasonCode) => {
+  const approvalCheck = (
+    id: string,
+    adapter: 'OWNER_ATTESTATION' | 'PROD_APPROVAL' | 'PREVIEW_ONLY' | 'DUAL_CONTROL',
+    prodOnly: boolean,
+    rc: ReasonCode,
+  ) => {
     if (prodOnly && environment !== 'PRODUCTION') {
       pass(id);
       return;
@@ -194,7 +242,10 @@ export function evaluate(input: DecisionEngineInput): EnforcementResult {
 
         break;
       case 'EGRESS_ALLOWLIST':
-        if (plan.allowlists.integrations.length > 0 && !plan.allowlists.integrations.includes(hostOf(request.target_resource))) {
+        if (
+          plan.allowlists.integrations.length > 0 &&
+          !plan.allowlists.integrations.includes(hostOf(request.target_resource))
+        ) {
           fail(id, 'EGRESS_DENIED');
         } else {
           pass(id);
@@ -210,7 +261,10 @@ export function evaluate(input: DecisionEngineInput): EnforcementResult {
 
         break;
       case 'TENANT_ISOLATION':
-        if (request.target_resource.startsWith('tenant:') && request.target_resource.split(':')[1] !== request.tenant_id) {
+        if (
+          request.target_resource.startsWith('tenant:') &&
+          request.target_resource.split(':')[1] !== request.tenant_id
+        ) {
           fail(id, 'TENANT_MISMATCH');
         } else {
           pass(id);

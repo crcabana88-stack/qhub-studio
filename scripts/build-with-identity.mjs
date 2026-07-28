@@ -93,6 +93,62 @@ if (untracked.length > 0 && !process.env.QHUB_ALLOW_DIRTY_BUILD) {
   die(`untracked build-context files present — commit or remove before building:\n  ${untracked.join('\n  ')}`);
 }
 
+/*
+ * 1b. Reject Vite-loaded .env files that are INVISIBLE to `git status` (ignored),
+ *     at repo root or under functions/ — they can silently change the artifact.
+ */
+function viteLoadedEnvFiles(paths) {
+  return paths
+    .map((p) => p.replace(/\\/g, '/').trim())
+    .filter((p) => p.length > 0)
+    .filter((p) => {
+      const base = p.split('/').pop() ?? '';
+
+      if (base.endsWith('.example') || base.endsWith('.sample') || base.endsWith('.d.ts')) {
+        return false;
+      }
+
+      return /^\.env(\.[A-Za-z0-9_-]+)*$/.test(base);
+    });
+}
+
+/*
+ * NON-TRACKED (ignored OR untracked) files are invisible to review yet Vite loads
+ * them. Tracked .env templates are reviewable build inputs (part of source_commit)
+ * and allowed; only non-tracked Vite env files at root or functions/ fail.
+ */
+let nonTracked = [];
+
+try {
+  nonTracked = [
+    ...sh('git ls-files --others --ignored --exclude-standard').split(/\r?\n/),
+    ...sh('git ls-files --others --exclude-standard').split(/\r?\n/),
+  ];
+} catch {
+  nonTracked = [];
+}
+
+const loadedEnv = [...new Set(viteLoadedEnvFiles(nonTracked))].filter(
+  (p) => !p.includes('/') || p.startsWith('functions/'),
+);
+
+if (loadedEnv.length > 0) {
+  die(
+    `non-tracked Vite-loaded .env file(s) present — a verified build must not read invisible env inputs:\n  ${loadedEnv.join('\n  ')}`,
+  );
+}
+
+// 1c. Sanitized build environment: reject VITE_*/PUBLIC_*/QHUB_BUILD_* that would
+//     inline into or alter the artifact (identity is injected at DEPLOY, not build).
+const BUILD_ENV_ALLOWLIST = new Set(['NODE_OPTIONS', 'QHUB_ALLOW_DIRTY_BUILD']);
+const badEnv = Object.keys(process.env).filter(
+  (k) => (/^VITE_/.test(k) || /^PUBLIC_/.test(k) || /^QHUB_BUILD_/.test(k)) && !BUILD_ENV_ALLOWLIST.has(k),
+);
+
+if (badEnv.length > 0) {
+  die(`unexpected build-time env vars present (would alter the artifact): ${badEnv.join(', ')}`);
+}
+
 const sourceCommit = sh('git rev-parse HEAD').trim();
 const lockfileHash = createHash('sha256')
   .update(readFileSync(join(ROOT, 'pnpm-lock.yaml')))

@@ -166,3 +166,47 @@ export function untrackedBuildInputs(porcelainLines: string[]): string[] {
     .filter((p) => p && !BUILD_CONTEXT_ALLOWLIST_UNTRACKED.test(p))
     .filter((p) => BUILD_RELEVANT_UNTRACKED.test(p));
 }
+
+/**
+ * From a filesystem/`git ls-files --others --ignored` path list, the .env files
+ * VITE ACTUALLY LOADS — `.env`, `.env.local`, `.env.[mode]`, `.env.[mode].local`
+ * (at repo root or under functions/). These can change the built artifact while
+ * remaining invisible to `git status`, so a verified build must fail when any is
+ * present. Non-loaded templates (`.env.example`, `.sample`) and `.env.d.ts` type
+ * files are NOT flagged.
+ */
+export function viteLoadedEnvFiles(paths: string[]): string[] {
+  return paths
+    .map((p) => p.replace(/\\/g, '/').trim())
+    .filter((p) => p.length > 0)
+    .filter((p) => {
+      const base = p.split('/').pop() ?? '';
+
+      if (base.endsWith('.example') || base.endsWith('.sample') || base.endsWith('.d.ts')) {
+        return false;
+      }
+
+      // .env, or .env.<mode>[.local] — but not .env.example (handled above).
+      return /^\.env(\.[A-Za-z0-9_-]+)*$/.test(base);
+    });
+}
+
+/** Build-env variables that inline into the artifact and must be an explicit allowlist. */
+const BUILD_ENV_ALLOWLIST = new Set<string>([
+  // Non-inlining build controls (documented, safe):
+  'NODE_OPTIONS',
+  'QHUB_ALLOW_DIRTY_BUILD',
+]);
+
+/**
+ * Unexpected build-time environment variables that could alter the built
+ * artifact: any `VITE_*` or `PUBLIC_*` (Vite inlines these) or build-time
+ * `QHUB_BUILD_*` (identity is injected at DEPLOY, never at build) not on the
+ * explicit allowlist. A verified build runs under a sanitized environment and
+ * fails when any is present.
+ */
+export function unexpectedBuildEnv(envKeys: string[]): string[] {
+  return envKeys.filter(
+    (k) => (/^VITE_/.test(k) || /^PUBLIC_/.test(k) || /^QHUB_BUILD_/.test(k)) && !BUILD_ENV_ALLOWLIST.has(k),
+  );
+}

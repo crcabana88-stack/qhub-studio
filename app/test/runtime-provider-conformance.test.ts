@@ -35,6 +35,42 @@ import {
 
 const localFactory = () => new LocalSimulationProvider();
 
+// ── STRUCTURAL exclusion: provider modules cannot import prohibited capabilities ─
+
+describe('A0. PROVIDER CONTRACT CONFORMANCE — structural capability exclusion', () => {
+  const providerModules = [
+    'app/lib/qhub/agent/runtime/provider.ts',
+    'app/lib/qhub/agent/runtime/local-simulation-provider.ts',
+    'app/lib/qhub/agent/reference/commission-reconciliation.ts',
+  ];
+
+  /*
+   * A provider must not be able to reach a DB client, a Gate/adapter/evidence
+   * executor, a model/connector client, the network, or the filesystem.
+   */
+  const PROHIBITED = [
+    /from ['"][^'"]*\.server['"]/, // any server-only executor (Gate 04, stores, adapters, evidence)
+    /@supabase/, // database client
+    /node:http\b/,
+    /node:https\b/,
+    /node:net\b/,
+    /node:dns\b/,
+    /node:fs\b/,
+    /node:child_process\b/,
+    /openai|anthropic|@ai-sdk|langchain|langgraph|langsmith/i, // model/connector clients
+  ];
+
+  for (const mod of providerModules) {
+    it(`${mod} imports no prohibited capability`, async () => {
+      const fs = await import('node:fs');
+      const src = fs.readFileSync(mod, 'utf8');
+      const importLines = src.split('\n').filter((l) => /^\s*import\b/.test(l) || /require\(/.test(l));
+      const violations = importLines.filter((l) => PROHIBITED.some((re) => re.test(l)));
+      expect(violations).toEqual([]);
+    });
+  }
+});
+
 // ── A. PROVIDER CONTRACT CONFORMANCE (only what the provider itself proves) ───
 
 describe('A. PROVIDER CONTRACT CONFORMANCE — local deterministic provider', () => {

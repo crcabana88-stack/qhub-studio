@@ -695,13 +695,19 @@ export async function providerContractConformance(
     'COMPLETE.output_summary is a string with no secret markers',
   );
 
-  // INSTRUMENTED purity — zero network + never executes inside step().
+  /*
+   * INSTRUMENTED (behavioural) purity — the network entry point used by
+   * fetch-based clients (incl. LangChain/LangSmith) is spied and must not be
+   * called; step() returns only PROPOSE/COMPLETE/FAIL. Model/tool/adapter/
+   * evidence/DB capabilities are proven absent STRUCTURALLY (import-boundary
+   * test), not claimed as behaviourally instrumented here.
+   */
   const purity = await instrumentedPurity(providerFactory, inputs);
   add(
     10,
-    'no side effects inside provider.step() (instrumented)',
+    'no global fetch network call inside provider.step() (behavioural)',
     purity.ok,
-    'fetch/http/https spied → zero calls; only PROPOSE/COMPLETE/FAIL',
+    'globalThis.fetch spied → zero calls during a full step() drive; only PROPOSE/COMPLETE/FAIL',
     purity.detail,
   );
 

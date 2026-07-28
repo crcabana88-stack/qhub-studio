@@ -31,7 +31,8 @@ import {
   type PersistedEvaluation,
 } from './runtime/run-reconstruction';
 import { assertBuildIntegrity } from '~/lib/qhub/build-integrity.server';
-import { getEvaluationById } from '~/lib/qhub/enforcement-store.server';
+import { getEvaluationById, gatherApprovals, getActivePlan } from '~/lib/qhub/enforcement-store.server';
+import { checkApprovalSet } from '~/lib/qhub/enforcement-decision';
 
 const sha256 = (s: string) => createHash('sha256').update(s).digest('hex');
 
@@ -841,6 +842,34 @@ export async function resumeAgentRun(input: {
   });
 
   if (!binding.ok) {
+    return { ok: false, run_id: input.run_id, state: 'BLOCKED', reason_codes: ['RECONSTRUCTION_FAILED'] };
+  }
+
+  /*
+   * EXACT APPROVAL SET (pre-E2): load the ACTIVE plan + the approvals for the exact
+   * persisted action_digest, and require the full required-attestation set to be
+   * satisfied by valid GRANTED approvals scoped to this exact digest + policy +
+   * plan (expired/revoked/consumed excluded; distinct-signer/SoD enforced) — using
+   * the SAME quorum logic Gate 04 uses. If not satisfied, submit NO E2 request.
+   */
+  const activePlan = await getActivePlan(run.qhub_app_id as string, session.orgId, env);
+  const gathered = activePlan
+    ? await gatherApprovals(run.qhub_app_id as string, session.orgId, persistedEval.action_digest, env)
+    : [];
+  const approvalOk =
+    !!activePlan &&
+    checkApprovalSet({
+      requiredAttestations: (persistedEval.required_attestations as string[]) ?? [],
+      approvalRequirements: activePlan.plan.approval_requirements,
+      gathered,
+      actionDigest: persistedEval.action_digest,
+      policyProfileHash: run.policy_profile_hash as string,
+      enforcementPlanHash: run.enforcement_plan_hash as string,
+      actorId: run.initiating_user_id as string,
+    }).ok;
+
+  if (!approvalOk) {
+    // Fail closed BEFORE Gate 04: no submission, no approval consumption, no receipt.
     return { ok: false, run_id: input.run_id, state: 'BLOCKED', reason_codes: ['RECONSTRUCTION_FAILED'] };
   }
 
