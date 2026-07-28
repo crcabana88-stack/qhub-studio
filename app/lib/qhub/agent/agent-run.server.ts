@@ -24,8 +24,14 @@ import { canRunInState } from './agent-lifecycle';
 import { selectRuntimeProvider } from './runtime/provider-registry.server';
 import { canonicalRunString, type AgentRunState } from './agent-run';
 import type { GovernedActionResult, ProposedAction, RuntimeManifestView } from './runtime/provider';
-import { reconstructForResume, type StoredRunStep } from './runtime/run-reconstruction';
+import {
+  reconstructForResume,
+  verifyPausedActionBinding,
+  type StoredRunStep,
+  type PersistedEvaluation,
+} from './runtime/run-reconstruction';
 import { assertBuildIntegrity } from '~/lib/qhub/build-integrity.server';
+import { getEvaluationById } from '~/lib/qhub/enforcement-store.server';
 
 const sha256 = (s: string) => createHash('sha256').update(s).digest('hex');
 
@@ -789,6 +795,52 @@ export async function resumeAgentRun(input: {
      * Fail closed: no provider step ran, no Gate 04 request, no approval consumed,
      * no adapter executed, no receipt, no partial persistence.
      */
+    return { ok: false, run_id: input.run_id, state: 'BLOCKED', reason_codes: ['RECONSTRUCTION_FAILED'] };
+  }
+
+  /*
+   * COMPLETE pre-Gate-04 binding: load the authoritative persisted Gate 04
+   * evaluation (via the paused step's evaluation_id) and verify the full
+   * run/version/release/provider/policy/plan/action-digest binding — the
+   * re-derived action MUST reproduce the persisted server-owned action_digest.
+   * Any mismatch fails closed BEFORE any E2 Gate 04 submission.
+   */
+  const persistedEval = await getEvaluationById(input.approved_evaluation_id, session.orgId, env);
+
+  if (!persistedEval) {
+    return { ok: false, run_id: input.run_id, state: 'BLOCKED', reason_codes: ['RECONSTRUCTION_FAILED'] };
+  }
+
+  const binding = verifyPausedActionBinding({
+    run: {
+      org_id: session.orgId,
+      qhub_app_id: run.qhub_app_id as string,
+      run_id: input.run_id,
+      agent_id: run.agent_id as string,
+      agent_version_id: run.agent_version_id as string,
+      release_candidate_hash: (run.release_candidate_hash as string) ?? null,
+      runtime_provider: run.runtime_provider as string,
+      runtime_provider_version: run.runtime_provider_version as string,
+      policy_profile_hash: run.policy_profile_hash as string,
+      enforcement_plan_hash: run.enforcement_plan_hash as string,
+    },
+    version: {
+      agent_version_id: version.agent_version_id,
+      manifest_hash: version.manifest_hash,
+      execution_environment: version.manifest.execution_environment,
+      release_candidate_hash: version.release_candidate_hash,
+    },
+    provider: {
+      provider_id: selection.provider.provider_id,
+      provider_version: selection.provider.provider_version,
+    },
+    evaluation: persistedEval as unknown as PersistedEvaluation,
+    pausedAction: reconstruction.paused_action,
+    approvedEvaluationId: input.approved_evaluation_id,
+    conversationId,
+  });
+
+  if (!binding.ok) {
     return { ok: false, run_id: input.run_id, state: 'BLOCKED', reason_codes: ['RECONSTRUCTION_FAILED'] };
   }
 

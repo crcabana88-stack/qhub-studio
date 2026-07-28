@@ -19,8 +19,21 @@ import { evaluateBuildIntegrity, type BuildIdentityTriple, type BuildIntegrityRe
 
 type Env = Record<string, string | undefined>;
 
+/**
+ * The supported assurance claim for this phase: the deployed image matches the
+ * exact recorded build artifact, source commit, lockfile, and build environment.
+ * It is NOT a claim that an independent rebuild produces byte-identical output —
+ * see docs/reproducible-build-initiative.md.
+ */
+export const ASSURANCE_MODEL = 'DEPLOYED_IMAGE_INTEGRITY' as const;
+
 function readEnv(env: Env, key: string): string | null {
   return env[key] ?? process.env[key] ?? null;
+}
+
+/** Non-secret build-environment fingerprint (expected side), for provenance. */
+export function buildEnvironmentFingerprint(env: Env): string | null {
+  return readEnv(env, 'QHUB_BUILD_ENVIRONMENT');
 }
 
 export function readBuildIntegrity(env: Env): BuildIntegrityResult {

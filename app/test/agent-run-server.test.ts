@@ -8,8 +8,78 @@
  */
 
 import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { createHash } from 'node:crypto';
 import { syntheticCommissionDatasets } from '~/lib/qhub/agent/reference/commission-reconciliation';
-import { LOCAL_SIMULATION_PROVIDER_ID } from '~/lib/qhub/agent/runtime/local-simulation-provider';
+import {
+  LOCAL_SIMULATION_PROVIDER_ID,
+  LocalSimulationProvider,
+} from '~/lib/qhub/agent/runtime/local-simulation-provider';
+import { stableStringify } from '~/lib/qhub/agent/runtime/run-reconstruction';
+import { canonicalActionRequestString } from '~/lib/qhub/enforcement-plan';
+
+/**
+ * Build the persisted Gate 04 evaluation the resume path will load — with the exact
+ * server-owned action_digest the re-derived connector action reproduces. Mirrors
+ * how resumeAgentRun resolves conversationId (falls back to qhub_app_id) + env.
+ */
+async function pausedEvalForConnector(inputs: any) {
+  const sha256 = (s: string) => createHash('sha256').update(s).digest('hex');
+  const p = new LocalSimulationProvider();
+  await p.init({
+    manifest: {
+      agent_id: 'agent-1',
+      agent_version_id: 'ver-1',
+      operating_mode: 'SUPERVISED_ACTION_AGENT',
+      autonomy_level: 'HUMAN_IN_LOOP',
+      primary_model: 'anthropic:claude-sonnet-5',
+      approved_models: ['anthropic:claude-sonnet-5'],
+      approved_tool_ids: [],
+      approved_connector_ids: [],
+      goal_definition: 'reconcile',
+      execution_environment: 'STAGING',
+    },
+    synthetic_inputs: inputs,
+  });
+
+  const connector = p.plan()[1]; // [model, connector]
+  const actionDigest = sha256(
+    canonicalActionRequestString({
+      tenant_id: 'client-smoke',
+      qhub_app_id: 'app-1',
+      action_request_id: 'areq-1',
+      action_type: connector.action_type,
+      target_resource: connector.target_resource,
+      operation: connector.operation,
+      material_parameters_hash: sha256(stableStringify(connector.material_parameters ?? null)),
+      model_identity: connector.model_identity ?? null,
+      provider_identity: null,
+      tool_identity: null,
+      environment: 'INTERNAL', // STAGING → INTERNAL
+      app_version_ref: 'app-1', // resumeAgentRun falls back to qhub_app_id
+      policy_profile_id: '',
+      policy_profile_version: 1,
+      policy_profile_hash: 'PPHASH',
+      enforcement_plan_id: '',
+      enforcement_plan_version: 1,
+      enforcement_plan_hash: 'EPHASH',
+    }),
+  );
+
+  return {
+    evaluation_id: 'E1',
+    action_request_id: 'areq-1',
+    action_digest: actionDigest,
+    decision: 'REQUIRE_APPROVAL',
+    org_id: 'client-smoke',
+    qhub_app_id: 'app-1',
+    policy_profile_id: 'pp-1',
+    policy_profile_version: 1,
+    policy_profile_hash: 'PPHASH',
+    enforcement_plan_id: 'ep-1',
+    enforcement_plan_version: 1,
+    enforcement_plan_hash: 'EPHASH',
+  };
+}
 
 // ── In-memory fake Supabase (backs run/step writes) ──
 const STORE: { runs: any[]; steps: any[]; failStepInsert: boolean } = { runs: [], steps: [], failStepInsert: false };
@@ -112,6 +182,7 @@ const H = vi.hoisted(() => ({
   checkReleaseBinding: vi.fn(),
   enforce: vi.fn(),
   assertSchema: vi.fn(),
+  getEval: vi.fn(),
 }));
 
 vi.mock('@supabase/supabase-js', () => ({ createClient: () => fakeClient() }));
@@ -119,6 +190,7 @@ vi.mock('~/lib/qhub/agent/agent-registry.server', () => ({ getAgent: H.getAgent,
 vi.mock('~/lib/qhub/agent/agent-release-binding.server', () => ({ checkReleaseBinding: H.checkReleaseBinding }));
 vi.mock('~/lib/qhub/enforcement.server', () => ({ enforceGovernedAction: H.enforce }));
 vi.mock('~/lib/qhub/agent/agent-schema-check.server', () => ({ assertAgentSchemaReady: H.assertSchema }));
+vi.mock('~/lib/qhub/enforcement-store.server', () => ({ getEvaluationById: H.getEval }));
 
 const ENV = { SUPABASE_URL: 'https://p.supabase.co', SUPABASE_SERVICE_ROLE_KEY: 'k' };
 const SESSION = { userId: 'user-1', orgId: 'client-smoke', role: 'owner' };
@@ -296,6 +368,7 @@ describe('agent run orchestrator — Gate 04 routing (tests 17-31)', () => {
 
   it('resume with the exact approved evaluation resumes only that action → COMPLETED (test 21)', async () => {
     await run();
+    H.getEval.mockResolvedValue(await pausedEvalForConnector(syntheticCommissionDatasets()));
 
     const { resumeAgentRun } = await import('~/lib/qhub/agent/agent-run.server');
     const runId = STORE.runs[0].run_id;
@@ -453,6 +526,7 @@ describe('agent run orchestrator — Gate 04 routing (tests 17-31)', () => {
   it('commission reconciliation reference agent completes in simulation with no real effect (tests 29/30)', async () => {
     const started = await run();
     expect(started.state).toBe('AWAITING_APPROVAL');
+    H.getEval.mockResolvedValue(await pausedEvalForConnector(syntheticCommissionDatasets()));
 
     const { resumeAgentRun } = await import('~/lib/qhub/agent/agent-run.server');
     const done = await resumeAgentRun({

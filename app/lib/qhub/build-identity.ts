@@ -125,11 +125,17 @@ export function missingMarkers(bundleText: string, markers: string[] = REQUIRED_
   return markers.filter((m) => !bundleText.includes(m));
 }
 
-/** Paths that are part of the production build/Docker context and must be clean. */
+/** Untracked paths permitted (never enter source/Docker context): narrow allowlist. */
 export const BUILD_CONTEXT_ALLOWLIST_UNTRACKED = /^(\.claude\/|\.pnpm-store\/|build\/|node_modules\/)/;
 
+/**
+ * Every path that can affect the production image or runtime — the union of the
+ * bundler/config discovery surface and the Dockerfile COPY sources
+ * (build, public, FUNCTIONS, wrangler.toml, bindings.sh, worker-configuration.d.ts,
+ * package.json, pnpm-lock.yaml). Kept in sync with scripts/build-with-identity.mjs.
+ */
 const BUILD_RELEVANT_UNTRACKED =
-  /^(app\/|scripts\/|public\/|supabase\/|electron\/|package\.json|package-lock\.json|pnpm-lock\.yaml|tsconfig|vite\.|remix\.|uno\.|wrangler\.toml|worker-configuration\.d\.ts|bindings\.sh|Dockerfile|fly\.toml|\.dockerignore)/;
+  /^(app\/|functions\/|scripts\/|public\/|supabase\/|electron\/|package\.json|package-lock\.json|pnpm-lock\.yaml|tsconfig[^/]*\.json|vite\.config\.|vite-electron\.config\.|remix\.config\.|uno\.config\.|wrangler\.|postcss\.config\.|tailwind\.config\.|worker-configuration\.d\.ts|bindings\.sh|Dockerfile|fly\.toml|\.dockerignore|\.eslintrc|eslint\.config\.)/;
 
 /**
  * From `git status --porcelain` lines, the TRACKED source changes that must block

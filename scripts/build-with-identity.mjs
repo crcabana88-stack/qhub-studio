@@ -42,8 +42,10 @@ const REQUIRED_BUILD_MARKERS = [
   'reconstructForResume',
 ];
 const ALLOWLIST_UNTRACKED = /^(\.claude\/|\.pnpm-store\/|build\/|node_modules\/)/;
+
+// Union of bundler/config discovery + Dockerfile COPY sources (incl. functions/).
 const BUILD_RELEVANT_UNTRACKED =
-  /^(app\/|scripts\/|public\/|supabase\/|electron\/|package\.json|package-lock\.json|pnpm-lock\.yaml|tsconfig|vite\.|remix\.|uno\.|wrangler\.toml|worker-configuration\.d\.ts|bindings\.sh|Dockerfile|fly\.toml|\.dockerignore)/;
+  /^(app\/|functions\/|scripts\/|public\/|supabase\/|electron\/|package\.json|package-lock\.json|pnpm-lock\.yaml|tsconfig[^/]*\.json|vite\.config\.|vite-electron\.config\.|remix\.config\.|uno\.config\.|wrangler\.|postcss\.config\.|tailwind\.config\.|worker-configuration\.d\.ts|bindings\.sh|Dockerfile|fly\.toml|\.dockerignore|\.eslintrc|eslint\.config\.)/;
 
 function dirtySourcePaths(lines) {
   return lines
@@ -138,11 +140,24 @@ const files = [...walk(serverDir), ...walk(clientDir)].map((p) => {
 const artifactHash = canonicalArtifactHash(files);
 const builtAt = new Date().toISOString();
 
+// Non-secret build-environment fingerprint (build provenance, not reproducibility).
+const ua = process.env.npm_config_user_agent ?? '';
+const pnpmVer = (ua.match(/pnpm\/([0-9.]+)/) ?? [, 'unknown'])[1];
+const buildEnvironment = [
+  `node=${process.version}`,
+  `pnpm=${pnpmVer}`,
+  `platform=${process.platform}`,
+  `arch=${process.arch}`,
+  `builder=remix-vite`,
+  `manifest=artifact-manifest-1`,
+].join(';');
+
 const identity = {
   source_commit: sourceCommit,
   built_at: builtAt,
   artifact_hash: artifactHash,
   lockfile_hash: lockfileHash,
+  build_environment: buildEnvironment,
   markers_ok: true,
 };
 writeFileSync(join(ROOT, 'build', 'qhub-build-identity.json'), JSON.stringify(identity, null, 2));
@@ -153,7 +168,9 @@ console.log(`  artifact_hash: ${artifactHash}`);
 console.log(`  lockfile_hash: ${lockfileHash}`);
 console.log(`  markers_ok:    ${REQUIRED_BUILD_MARKERS.length}/${REQUIRED_BUILD_MARKERS.length}`);
 
+console.log(`  build_environment: ${buildEnvironment}`);
+
 // Machine-readable line the deploy step injects as the EXPECTED runtime identity.
 console.log(
-  `BUILD_ENV=-e QHUB_BUILD_SOURCE_COMMIT=${sourceCommit} -e QHUB_BUILD_ARTIFACT_HASH=${artifactHash} -e QHUB_BUILD_LOCKFILE_HASH=${lockfileHash} -e QHUB_BUILD_AT=${builtAt}`,
+  `BUILD_ENV=-e QHUB_BUILD_SOURCE_COMMIT=${sourceCommit} -e QHUB_BUILD_ARTIFACT_HASH=${artifactHash} -e QHUB_BUILD_LOCKFILE_HASH=${lockfileHash} -e QHUB_BUILD_AT=${builtAt} -e "QHUB_BUILD_ENVIRONMENT=${buildEnvironment}"`,
 );

@@ -13,6 +13,7 @@ if [ -f "$IDFILE" ]; then
   export QHUB_IMAGE_ARTIFACT_HASH="$(json_val artifact_hash)"
   export QHUB_IMAGE_LOCKFILE_HASH="$(json_val lockfile_hash)"
   export QHUB_IMAGE_BUILD_AT="$(json_val built_at)"
+  export QHUB_IMAGE_BUILD_ENVIRONMENT="$(json_val build_environment)"
 fi
 
 # Function to extract variable names from the TypeScript interface

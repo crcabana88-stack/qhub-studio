@@ -43,24 +43,62 @@ describe('clean build inputs', () => {
     expect(dirtySourcePaths(porcelain)).toEqual(['app/real.ts']);
   });
 
-  it('rejects untracked build-relevant files (app/scripts/config/Docker)', () => {
+  it('rejects untracked build-relevant files across every category', () => {
     const porcelain = [
       '?? app/routes/api.evil.ts', // untracked route
+      '?? functions/[[path]].ts', // Docker COPY functions/
       '?? scripts/sneaky.mjs', // untracked script
-      '?? Dockerfile.bak', // Dockerfile-prefixed
-      '?? wrangler.toml', // config
+      '?? public/evil.js', // Docker COPY public/
+      '?? supabase/migrations/evil.sql', // supabase
+      '?? postcss.config.js', // PostCSS root config
+      '?? tailwind.config.ts', // Tailwind root config
+      '?? vite.config.ts', // bundler config
+      '?? remix.config.js', // Remix config
+      '?? wrangler.toml', // Wrangler config
+      '?? tsconfig.build.json', // TS config
+      '?? Dockerfile.bak', // Docker
+      '?? fly.toml', // Fly
+      '?? bindings.sh', // bindings
+      '?? worker-configuration.d.ts', // worker types
       '?? .claude/notes.md', // allowed artifact
       '?? .pnpm-store/pkg', // allowed artifact
       '?? build/server/x.js', // build output
       '?? README.notes', // not build-relevant → ignored
     ];
-    expect(untrackedBuildInputs(porcelain).sort()).toEqual(
-      ['Dockerfile.bak', 'app/routes/api.evil.ts', 'scripts/sneaky.mjs', 'wrangler.toml'].sort(),
-    );
+    const flagged = untrackedBuildInputs(porcelain);
+
+    for (const p of [
+      'app/routes/api.evil.ts',
+      'functions/[[path]].ts',
+      'scripts/sneaky.mjs',
+      'public/evil.js',
+      'supabase/migrations/evil.sql',
+      'postcss.config.js',
+      'tailwind.config.ts',
+      'vite.config.ts',
+      'remix.config.js',
+      'wrangler.toml',
+      'tsconfig.build.json',
+      'Dockerfile.bak',
+      'fly.toml',
+      'bindings.sh',
+      'worker-configuration.d.ts',
+    ]) {
+      expect(flagged).toContain(p);
+    }
+    expect(flagged).not.toContain('README.notes');
+  });
+
+  it('untracked functions/** fails the build (Docker COPY source)', () => {
+    expect(untrackedBuildInputs(['?? functions/hello.ts'])).toEqual(['functions/hello.ts']);
+  });
+
+  it('untracked postcss config fails the build', () => {
+    expect(untrackedBuildInputs(['?? postcss.config.js'])).toEqual(['postcss.config.js']);
   });
 
   it('allows only the narrow untracked artifact allowlist', () => {
-    const porcelain = ['?? .claude/', '?? .pnpm-store/', '?? build/server/x.js'];
+    const porcelain = ['?? .claude/', '?? .pnpm-store/', '?? build/server/x.js', '?? node_modules/x'];
     expect(untrackedBuildInputs(porcelain)).toEqual([]);
   });
 });

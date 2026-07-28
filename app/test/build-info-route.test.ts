@@ -58,9 +58,23 @@ describe('/api/system/build-info', () => {
     const b = (await res.json()) as Record<string, unknown>;
     expect(b.ready).toBe(true);
     expect(b.present).toBe(true);
+    expect(b.assurance_model).toBe('DEPLOYED_IMAGE_INTEGRITY');
     expect(b.source_commit).toBe('commit-1');
     expect(b.lockfile_hash).toBe('lock-1');
     expect(b.mismatch_reason_codes).toEqual([]);
+  });
+
+  it('reports the build-environment fingerprint and assurance model', async () => {
+    mockGetSession.mockResolvedValue({ userId: 'u', orgId: 'o', role: 'owner' });
+
+    const res = await call({
+      ...MATCH,
+      QHUB_DEPLOY_ENV: 'staging',
+      QHUB_BUILD_ENVIRONMENT: 'node=v20;pnpm=9;platform=linux',
+    });
+    const b = (await res.json()) as Record<string, unknown>;
+    expect(b.build_environment).toBe('node=v20;pnpm=9;platform=linux');
+    expect(b.assurance_model).toBe('DEPLOYED_IMAGE_INTEGRITY');
   });
 
   it('503 on a source-commit mismatch', async () => {

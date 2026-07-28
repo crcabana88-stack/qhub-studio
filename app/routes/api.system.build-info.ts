@@ -11,7 +11,12 @@
 
 import { json, type LoaderFunctionArgs } from '@remix-run/cloudflare';
 import { getSession } from '~/lib/auth/session';
-import { assertBuildIntegrity, isEnforcedDeployEnv } from '~/lib/qhub/build-integrity.server';
+import {
+  assertBuildIntegrity,
+  isEnforcedDeployEnv,
+  buildEnvironmentFingerprint,
+  ASSURANCE_MODEL,
+} from '~/lib/qhub/build-integrity.server';
 
 export const loader = async ({ request, context }: LoaderFunctionArgs) => {
   const env = (context.cloudflare?.env as unknown as Record<string, string | undefined>) ?? {};
@@ -26,12 +31,14 @@ export const loader = async ({ request, context }: LoaderFunctionArgs) => {
 
   const body = {
     ok: gate.ok,
+    assurance_model: ASSURANCE_MODEL, // DEPLOYED_IMAGE_INTEGRITY (not reproducible build)
     present: r.present,
     ready: r.ready,
     source_commit: r.source_commit,
     artifact_hash: r.artifact_hash,
     lockfile_hash: r.lockfile_hash,
     build_at: r.build_at,
+    build_environment: buildEnvironmentFingerprint(env),
     enforced_env: isEnforcedDeployEnv(env),
     mismatch_reason_codes: r.mismatch_reason_codes,
   };

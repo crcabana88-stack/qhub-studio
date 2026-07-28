@@ -12,7 +12,8 @@
 
 import { describe, it, expect } from 'vitest';
 import {
-  providerConformance,
+  providerContractConformance,
+  instrumentedPurity,
   GovernedRunHarness,
   MockGate,
   ToolProposingProvider,
@@ -34,22 +35,47 @@ import {
 
 const localFactory = () => new LocalSimulationProvider();
 
-// ── PROVIDER CONFORMANCE (genuine provider responsibilities) ─────────────────
+// ── A. PROVIDER CONTRACT CONFORMANCE (only what the provider itself proves) ───
 
-describe('provider conformance — local deterministic provider', () => {
+describe('A. PROVIDER CONTRACT CONFORMANCE — local deterministic provider', () => {
   let outcomes: ConformanceOutcome[];
 
-  it('runs the provider-level suite (all PROVIDER_CONFORMANCE)', async () => {
-    outcomes = await providerConformance(localFactory);
-    expect(outcomes.length).toBeGreaterThanOrEqual(12);
-    expect(outcomes.every((o) => o.category === 'PROVIDER_CONFORMANCE')).toBe(true);
+  it('reports honest provider-contract properties (all PROVIDER_CONTRACT, each with an assertion)', async () => {
+    outcomes = await providerContractConformance(localFactory);
+    expect(outcomes.length).toBe(10);
+    expect(outcomes.every((o) => o.category === 'PROVIDER_CONTRACT')).toBe(true);
+    expect(outcomes.every((o) => typeof o.assertion === 'string' && o.assertion.length > 0)).toBe(true);
   });
 
-  it('passes every provider property with a real assertion', async () => {
-    outcomes = outcomes ?? (await providerConformance(localFactory));
+  it('passes every provider-contract property with a real assertion', async () => {
+    outcomes = outcomes ?? (await providerContractConformance(localFactory));
 
     const failed = outcomes.filter((o) => !o.pass);
     expect(failed.map((f) => `#${f.id} ${f.name}${f.detail ? ` (${f.detail})` : ''}`)).toEqual([]);
+  });
+
+  it('instrumented purity is real: it FAILS for a provider that makes a network call', async () => {
+    class ImpureProvider {
+      readonly provider_id = 'qhub.runtime.test.impure';
+      readonly provider_version = '1.0.0';
+      async init() {
+        return undefined;
+      }
+      async step() {
+        await fetch('https://example.invalid/x');
+        return { kind: 'COMPLETE' as const, output_summary: 'done' };
+      }
+      cancel() {
+        /* no-op */
+      }
+    }
+
+    const impure = await instrumentedPurity(() => new ImpureProvider());
+    expect(impure.ok).toBe(false);
+
+    // …and PASSES for the pure local provider.
+    const pure = await instrumentedPurity(() => new LocalSimulationProvider());
+    expect(pure.ok).toBe(true);
   });
 });
 

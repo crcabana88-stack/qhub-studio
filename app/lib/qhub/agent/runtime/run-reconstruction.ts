@@ -19,6 +19,8 @@
 import { createHash } from 'node:crypto';
 import type { AgentRuntimeProvider, GovernedActionResult, ProposedAction } from './provider';
 import type { RunActionDecision } from '~/lib/qhub/agent/agent-run';
+import { canonicalActionRequestString } from '~/lib/qhub/enforcement-plan';
+import type { CanonicalActionRequest } from '~/lib/qhub/enforcement';
 
 const sha256 = (s: string) => createHash('sha256').update(s).digest('hex');
 
@@ -297,4 +299,163 @@ export async function reconstructForResume(params: {
 
   // Unreachable given ordered.length === pauseIndex + 1, but fail closed.
   return resumeFail('MISSING_PRIOR_STEP');
+}
+
+/*
+ * --------------------------------------------------------------------------
+ * Complete paused-action binding verification (pre-Gate-04)
+ * --------------------------------------------------------------------------
+ */
+
+/** The authoritative Gate 04 evaluation persisted for the paused step. */
+export interface PersistedEvaluation {
+  evaluation_id: string;
+  action_request_id: string | null;
+  action_digest: string;
+  decision: string;
+  org_id: string;
+  qhub_app_id: string;
+  policy_profile_id: string | null;
+  policy_profile_version: number | null;
+  policy_profile_hash: string;
+  enforcement_plan_id: string | null;
+  enforcement_plan_version: number | null;
+  enforcement_plan_hash: string;
+}
+
+/** Run-row identity fields required to verify the complete binding. */
+export interface ResumeBindingRun {
+  org_id: string;
+  qhub_app_id: string;
+  run_id: string;
+  agent_id: string;
+  agent_version_id: string;
+  release_candidate_hash: string | null;
+  runtime_provider: string;
+  runtime_provider_version: string;
+  policy_profile_hash: string;
+  enforcement_plan_hash: string;
+}
+
+/** Version-row identity fields (from getAgentVersion). */
+export interface ResumeBindingVersion {
+  agent_version_id: string;
+  manifest_hash: string;
+  execution_environment: string;
+  release_candidate_hash: string | null;
+}
+
+export type BindingReason =
+  | 'EVALUATION_NOT_PENDING'
+  | 'EVALUATION_MISMATCH'
+  | 'MISSING_ACTION_REQUEST_ID'
+  | 'EVALUATION_TENANT_APP_MISMATCH'
+  | 'RUN_VERSION_MISMATCH'
+  | 'POLICY_PROFILE_MISMATCH'
+  | 'ENFORCEMENT_PLAN_MISMATCH'
+  | 'PROVIDER_IDENTITY_MISMATCH'
+  | 'RELEASE_HASH_MISMATCH'
+  | 'ACTION_DIGEST_MISMATCH';
+
+function mapEnvironment(target: string): 'PREVIEW' | 'INTERNAL' | 'PRODUCTION' {
+  if (target === 'PRODUCTION') {
+    return 'PRODUCTION';
+  }
+
+  if (target === 'STAGING') {
+    return 'INTERNAL';
+  }
+
+  return 'PREVIEW';
+}
+
+/**
+ * Verify the COMPLETE paused-action authorization identity against the persisted,
+ * server-owned Gate 04 evaluation (loaded via the paused step's evaluation_id) and
+ * the run/version rows — BEFORE any E2 Gate 04 submission. The persisted
+ * `action_digest` is the canonical anchor: the re-derived action's digest,
+ * recomputed the exact Gate 04 way from the persisted policy/plan the evaluation
+ * was scoped to, MUST equal it. Any mismatch fails closed (the caller performs no
+ * Gate 04 submission, approval consumption, adapter run, or receipt).
+ */
+export function verifyPausedActionBinding(params: {
+  run: ResumeBindingRun;
+  version: ResumeBindingVersion;
+  provider: { provider_id: string; provider_version: string };
+  evaluation: PersistedEvaluation;
+  pausedAction: ProposedAction;
+  approvedEvaluationId: string;
+  conversationId: string;
+}): { ok: boolean; reason?: BindingReason; recomputed_action_digest?: string } {
+  const { run, version, provider, evaluation, pausedAction, approvedEvaluationId, conversationId } = params;
+
+  if (evaluation.decision !== 'REQUIRE_APPROVAL') {
+    return { ok: false, reason: 'EVALUATION_NOT_PENDING' };
+  }
+
+  if (evaluation.evaluation_id !== approvedEvaluationId) {
+    return { ok: false, reason: 'EVALUATION_MISMATCH' };
+  }
+
+  if (!evaluation.action_request_id) {
+    return { ok: false, reason: 'MISSING_ACTION_REQUEST_ID' };
+  }
+
+  if (evaluation.org_id !== run.org_id || evaluation.qhub_app_id !== run.qhub_app_id) {
+    return { ok: false, reason: 'EVALUATION_TENANT_APP_MISMATCH' };
+  }
+
+  if (version.agent_version_id !== run.agent_version_id) {
+    return { ok: false, reason: 'RUN_VERSION_MISMATCH' };
+  }
+
+  if (evaluation.policy_profile_hash !== run.policy_profile_hash) {
+    return { ok: false, reason: 'POLICY_PROFILE_MISMATCH' };
+  }
+
+  if (evaluation.enforcement_plan_hash !== run.enforcement_plan_hash) {
+    return { ok: false, reason: 'ENFORCEMENT_PLAN_MISMATCH' };
+  }
+
+  if (run.runtime_provider !== provider.provider_id || run.runtime_provider_version !== provider.provider_version) {
+    return { ok: false, reason: 'PROVIDER_IDENTITY_MISMATCH' };
+  }
+
+  if ((version.release_candidate_hash ?? null) !== (run.release_candidate_hash ?? null)) {
+    return { ok: false, reason: 'RELEASE_HASH_MISMATCH' };
+  }
+
+  /*
+   * Recompute the server-owned canonical action digest from the re-derived action
+   * + the persisted policy/plan the evaluation was scoped to. Must equal the anchor.
+   */
+  const request: CanonicalActionRequest = {
+    tenant_id: run.org_id,
+    qhub_app_id: run.qhub_app_id,
+    action_request_id: evaluation.action_request_id, // excluded from the digest
+    action_type: pausedAction.action_type,
+    target_resource: pausedAction.target_resource,
+    operation: pausedAction.operation,
+    material_parameters_hash: sha256(stableStringify(pausedAction.material_parameters ?? null)),
+    model_identity: pausedAction.model_identity ?? null,
+    provider_identity: null,
+    tool_identity: null,
+    environment: mapEnvironment(version.execution_environment),
+    app_version_ref: conversationId,
+
+    // ids are excluded from the digest; versions + hashes bind it.
+    policy_profile_id: evaluation.policy_profile_id ?? '',
+    policy_profile_version: evaluation.policy_profile_version ?? 0,
+    policy_profile_hash: evaluation.policy_profile_hash,
+    enforcement_plan_id: evaluation.enforcement_plan_id ?? '',
+    enforcement_plan_version: evaluation.enforcement_plan_version ?? 0,
+    enforcement_plan_hash: evaluation.enforcement_plan_hash,
+  };
+  const recomputed = sha256(canonicalActionRequestString(request));
+
+  if (recomputed !== evaluation.action_digest) {
+    return { ok: false, reason: 'ACTION_DIGEST_MISMATCH', recomputed_action_digest: recomputed };
+  }
+
+  return { ok: true, recomputed_action_digest: recomputed };
 }
