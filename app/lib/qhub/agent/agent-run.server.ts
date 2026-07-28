@@ -24,6 +24,8 @@ import { canRunInState } from './agent-lifecycle';
 import { selectRuntimeProvider } from './runtime/provider-registry.server';
 import { canonicalRunString, type AgentRunState } from './agent-run';
 import type { GovernedActionResult, ProposedAction, RuntimeManifestView } from './runtime/provider';
+import { reconstructForResume, type StoredRunStep } from './runtime/run-reconstruction';
+import { assertBuildIntegrity } from '~/lib/qhub/build-integrity.server';
 
 const sha256 = (s: string) => createHash('sha256').update(s).digest('hex');
 
@@ -79,6 +81,8 @@ export type RunReasonCode =
   | 'RUNTIME_TIMEOUT'
   | 'GOVERNED_ACTION_DENIED'
   | 'EVIDENCE_WRITE_FAILED'
+  | 'RECONSTRUCTION_FAILED'
+  | 'BUILD_INTEGRITY_FAILED'
   | 'PROVIDER_FAILED';
 
 export interface RunResult {
@@ -131,6 +135,14 @@ export async function runAgent(input: RunAgentInput): Promise<RunResult> {
     await assertAgentSchemaReady(env);
   } catch {
     return blocked('SCHEMA_NOT_READY');
+  }
+
+  /*
+   * Deployment integrity: the running image must match its intended source /
+   * artifact / lockfile identity. Fail closed BEFORE any run row or Gate 04 action.
+   */
+  if (!assertBuildIntegrity(env).ok) {
+    return blocked('BUILD_INTEGRITY_FAILED');
   }
 
   const agent = await getAgent(input.agent_id, session.orgId, env);
@@ -631,6 +643,11 @@ export async function resumeAgentRun(input: {
     return blocked('SCHEMA_NOT_READY');
   }
 
+  // Deployment integrity: fail closed before resuming any governed action.
+  if (!assertBuildIntegrity(env).ok) {
+    return blocked('BUILD_INTEGRITY_FAILED');
+  }
+
   const sb = admin(env);
   const runRow = await sb
     .from('qhub_agent_runs')
@@ -674,6 +691,35 @@ export async function resumeAgentRun(input: {
     return blocked('NO_CURRENT_VERSION');
   }
 
+  // Suspended / retired (or otherwise non-runnable) agents cannot resume.
+  const runnable = canRunInState(agent.current_lifecycle_state);
+
+  if (!runnable.ok) {
+    return {
+      ok: false,
+      run_id: input.run_id,
+      state: 'BLOCKED',
+      reason_codes: [(runnable.reason as RunReasonCode) ?? 'NOT_RUNNABLE_STATE'],
+    };
+  }
+
+  // SUPERVISED / ACTIVE resume requires the current, exact Gate 05 binding.
+  if (agent.current_lifecycle_state === 'SUPERVISED' || agent.current_lifecycle_state === 'ACTIVE') {
+    const binding = await checkReleaseBinding(version, env);
+
+    if (!binding.release_approved) {
+      return { ok: false, run_id: input.run_id, state: 'BLOCKED', reason_codes: ['RELEASE_NOT_APPROVED'] };
+    }
+
+    if (binding.release_stale) {
+      return { ok: false, run_id: input.run_id, state: 'BLOCKED', reason_codes: ['RELEASE_STALE'] };
+    }
+
+    if (!binding.manifest_matches_release) {
+      return { ok: false, run_id: input.run_id, state: 'BLOCKED', reason_codes: ['MANIFEST_CHANGED'] };
+    }
+  }
+
   const selection = selectRuntimeProvider(version.manifest.runtime_provider, version.manifest.runtime_provider_version);
 
   if (!selection.ok || !selection.provider) {
@@ -704,13 +750,46 @@ export async function resumeAgentRun(input: {
   };
 
   /*
-   * Re-drive the pending step: the provider re-proposes the exact action, now
-   * re-enforced with parentEvaluationId (E2) → executes only the approved action.
+   * NO-REPLAY RECONSTRUCTION (production): load the FULL durable step history and
+   * reconstruct state via the shared guard, re-deriving each proposed action with
+   * the provider's PURE step() (which never executes). Fail closed on any
+   * ownership, contiguity, tamper, or paused-action/approval mismatch — BEFORE any
+   * Gate 04 request, approval consumption, adapter run, or receipt.
    */
-  const out = await selection.provider.step({ step_index: stepIndex, prior_results: [] });
+  const stepsRes = await sb
+    .from('qhub_agent_run_steps')
+    .select('run_id, org_id, step_index, action_type, decision, reason_codes, receipt_id, input_hash, evaluation_id')
+    .eq('run_id', input.run_id)
+    .eq('org_id', session.orgId)
+    .order('step_index');
 
-  if (out.kind !== 'PROPOSE' || !out.proposed_actions?.length) {
-    return { ok: false, run_id: input.run_id, state: 'BLOCKED', reason_codes: ['PROVIDER_FAILED'] };
+  if (stepsRes.error) {
+    return { ok: false, run_id: input.run_id, state: 'BLOCKED', reason_codes: ['EVIDENCE_WRITE_FAILED'] };
+  }
+
+  const reconstruction = await reconstructForResume({
+    provider: selection.provider,
+    run: {
+      run_id: input.run_id,
+      org_id: session.orgId,
+      agent_id: run.agent_id as string,
+      agent_version_id: run.agent_version_id as string,
+      release_candidate_hash: (run.release_candidate_hash as string) ?? null,
+      qhub_app_id: run.qhub_app_id as string,
+      current_state: run.current_state as string,
+      current_step: stepIndex,
+      pending_evaluation_id: (run.pending_evaluation_id as string) ?? null,
+    },
+    steps: (stepsRes.data ?? []) as unknown as StoredRunStep[],
+    approvedEvaluationId: input.approved_evaluation_id,
+  });
+
+  if (!reconstruction.ok || !reconstruction.paused_action) {
+    /*
+     * Fail closed: no provider step ran, no Gate 04 request, no approval consumed,
+     * no adapter executed, no receipt, no partial persistence.
+     */
+    return { ok: false, run_id: input.run_id, state: 'BLOCKED', reason_codes: ['RECONSTRUCTION_FAILED'] };
   }
 
   const ctx: DriveContext = {
@@ -727,7 +806,9 @@ export async function resumeAgentRun(input: {
     priorResults: [],
     counters,
   };
-  const action = out.proposed_actions[0];
+
+  // Resume the EXACT canonical action re-derived + hash-verified against storage.
+  const action = reconstruction.paused_action;
   const decision = await routeThroughGate04(ctx, action, stepIndex, input.approved_evaluation_id);
 
   const recorded = await recordStep(sb, {

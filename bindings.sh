@@ -2,6 +2,19 @@
 
 bindings=""
 
+# Read the IMMUTABLE on-image build identity (written into the artifact by
+# build:verified) and export it as independent QHUB_IMAGE_* bindings, so the
+# runtime can compare the deployment-injected QHUB_BUILD_* identity against the
+# image's own identity (never a binding against itself).
+IDFILE="build/qhub-build-identity.json"
+if [ -f "$IDFILE" ]; then
+  json_val() { grep "\"$1\"" "$IDFILE" | head -1 | sed 's/.*: *"\([^"]*\)".*/\1/'; }
+  export QHUB_IMAGE_SOURCE_COMMIT="$(json_val source_commit)"
+  export QHUB_IMAGE_ARTIFACT_HASH="$(json_val artifact_hash)"
+  export QHUB_IMAGE_LOCKFILE_HASH="$(json_val lockfile_hash)"
+  export QHUB_IMAGE_BUILD_AT="$(json_val built_at)"
+fi
+
 # Function to extract variable names from the TypeScript interface
 extract_env_vars() {
   grep -o '[A-Z_][A-Z0-9_]*:' worker-configuration.d.ts | sed 's/://'

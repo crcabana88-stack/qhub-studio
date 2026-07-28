@@ -501,4 +501,112 @@ describe('agent run orchestrator — Gate 04 routing (tests 17-31)', () => {
     }
     expect(STORE.runs[0]).not.toHaveProperty('material_parameters');
   });
+
+  it('build-integrity mismatch in an enforced env fails closed — no run, no Gate 04', async () => {
+    const { runAgent } = await import('~/lib/qhub/agent/agent-run.server');
+    const r = await runAgent({
+      session: SESSION,
+      conversationId: 'conv-1',
+      agent_id: 'agent-1',
+      idempotency_key: 'idem-bi',
+      synthetic_inputs: syntheticCommissionDatasets(),
+      sessionId: 's',
+      env: {
+        ...ENV,
+        QHUB_DEPLOY_ENV: 'staging',
+        QHUB_BUILD_SOURCE_COMMIT: 'c',
+        QHUB_BUILD_ARTIFACT_HASH: 'a',
+        QHUB_BUILD_LOCKFILE_HASH: 'l',
+        QHUB_IMAGE_SOURCE_COMMIT: 'DIFFERENT',
+        QHUB_IMAGE_ARTIFACT_HASH: 'a',
+        QHUB_IMAGE_LOCKFILE_HASH: 'l',
+      },
+    });
+    expect(r.state).toBe('BLOCKED');
+    expect(r.reason_codes).toContain('BUILD_INTEGRITY_FAILED');
+    expect(H.enforce).not.toHaveBeenCalled();
+    expect(STORE.runs.length).toBe(0);
+  });
+
+  // ── Production no-replay reconstruction on resume (Blocker 1) ──────────────
+
+  const resume = async (over: any = {}) => {
+    const { resumeAgentRun } = await import('~/lib/qhub/agent/agent-run.server');
+
+    return resumeAgentRun({
+      session: SESSION,
+      run_id: STORE.runs[0].run_id,
+      approved_evaluation_id: over.eval ?? 'E1',
+      synthetic_inputs: over.inputs ?? syntheticCommissionDatasets(),
+      sessionId: 's',
+      env: ENV,
+    });
+  };
+
+  it('resume fails closed when a stored prior step is tampered — no E2, no receipt', async () => {
+    await run();
+    STORE.steps.find((s) => s.step_index === 0)!.input_hash = 'deadbeef'; // tamper the model step
+
+    const r = await resume();
+    expect(r.state).toBe('BLOCKED');
+    expect(r.reason_codes).toContain('RECONSTRUCTION_FAILED');
+
+    // No approved-action (E2) submission was made.
+    expect(H.enforce.mock.calls.find((c) => c[0].parentEvaluationId)).toBeUndefined();
+
+    // The paused step was not turned into a receipt.
+    expect(STORE.steps.find((s) => s.step_index === 1)!.receipt_id).toBeNull();
+  });
+
+  it('resume fails closed when a prior step is missing (non-contiguous)', async () => {
+    await run();
+    STORE.steps = STORE.steps.filter((s) => s.step_index !== 0); // drop the model step
+
+    const r = await resume();
+    expect(r.state).toBe('BLOCKED');
+    expect(r.reason_codes).toContain('RECONSTRUCTION_FAILED');
+    expect(H.enforce.mock.calls.find((c) => c[0].parentEvaluationId)).toBeUndefined();
+  });
+
+  it('suspended agent cannot resume', async () => {
+    await run();
+    H.getAgent.mockResolvedValue(makeAgent({ current_lifecycle_state: 'SUSPENDED' }));
+
+    const r = await resume();
+    expect(r.state).toBe('BLOCKED');
+    expect(r.reason_codes).toContain('SUSPENDED');
+    expect(H.enforce.mock.calls.find((c) => c[0].parentEvaluationId)).toBeUndefined();
+  });
+
+  it('SUPERVISED resume re-checks Gate 05 binding and fails closed when unapproved', async () => {
+    await run();
+    H.getAgent.mockResolvedValue(makeAgent({ current_lifecycle_state: 'SUPERVISED' }));
+    H.checkReleaseBinding.mockResolvedValue({
+      release_approved: false,
+      release_stale: false,
+      manifest_matches_release: true,
+      reason: ['RELEASE_NOT_APPROVED'],
+    });
+
+    const r = await resume();
+    expect(r.state).toBe('BLOCKED');
+    expect(r.reason_codes).toContain('RELEASE_NOT_APPROVED');
+    expect(H.enforce.mock.calls.find((c) => c[0].parentEvaluationId)).toBeUndefined();
+  });
+
+  it('SUPERVISED resume fails closed when the manifest no longer matches the release', async () => {
+    await run();
+    H.getAgent.mockResolvedValue(makeAgent({ current_lifecycle_state: 'SUPERVISED' }));
+    H.checkReleaseBinding.mockResolvedValue({
+      release_approved: true,
+      release_stale: false,
+      manifest_matches_release: false,
+      reason: ['MANIFEST_CHANGED'],
+    });
+
+    const r = await resume();
+    expect(r.state).toBe('BLOCKED');
+    expect(r.reason_codes).toContain('MANIFEST_CHANGED');
+    expect(H.enforce.mock.calls.find((c) => c[0].parentEvaluationId)).toBeUndefined();
+  });
 });
