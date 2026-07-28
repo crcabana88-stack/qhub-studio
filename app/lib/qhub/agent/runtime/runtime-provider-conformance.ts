@@ -211,6 +211,16 @@ function resultOf(d: GateDecision): GovernedActionResult {
   };
 }
 
+/**
+ * Deterministic stand-in for the server-computed canonical result_hash. The
+ * production hash is computed in the database (qhub_finalize_agent_run_step); this
+ * harness only needs a stable, unique, chain-consistent value so the production
+ * reconstruction guard's continuity + chain-link checks exercise real code.
+ */
+function synthResultHash(runId: string, stepIndex: number, inputHash: string, d: GateDecision): string {
+  return `rh:${runId}:${stepIndex}:${inputHash}:${d.decision}:${d.receipt_id ?? ''}`;
+}
+
 export interface HarnessOptions {
   limits?: RunLimits;
   killSwitch?: () => boolean;
@@ -250,6 +260,39 @@ export class GovernedRunHarness {
     } else {
       state.steps.push(step);
     }
+  }
+
+  /**
+   * Build a stored step, populating server-owned continuity fields for a TERMINAL
+   * decision exactly as the finalization RPC would (result_hash + safe_result +
+   * previous_step_hash chained to the prior finalized step); a REQUIRE_APPROVAL
+   * pause carries no continuity.
+   */
+  private _storedStep(
+    state: HarnessRunState,
+    stepIndex: number,
+    actionType: ProposedAction['action_type'],
+    inputHash: string,
+    d: GateDecision,
+  ): StoredRunStep {
+    const terminal = d.decision !== 'REQUIRE_APPROVAL';
+    const prev =
+      stepIndex === 0 ? null : (state.steps.find((s) => s.step_index === stepIndex - 1)?.result_hash ?? null);
+
+    return {
+      run_id: state.run_id,
+      org_id: ORG_ID,
+      step_index: stepIndex,
+      action_type: actionType,
+      decision: d.decision,
+      reason_codes: [],
+      receipt_id: d.receipt_id,
+      input_hash: inputHash,
+      evaluation_id: d.evaluation_id,
+      result_hash: terminal ? synthResultHash(state.run_id, stepIndex, inputHash, d) : null,
+      safe_result: resultOf(d).safe_result,
+      previous_step_hash: terminal ? prev : null,
+    };
   }
 
   async start(
@@ -346,17 +389,7 @@ export class GovernedRunHarness {
         }
 
         const d = this._gate.enforce(action, `${state.run_id}:${stepIndex}`);
-        this._record(state, {
-          run_id: state.run_id,
-          org_id: ORG_ID,
-          step_index: stepIndex,
-          action_type: action.action_type,
-          decision: d.decision,
-          reason_codes: [],
-          receipt_id: d.receipt_id,
-          input_hash: inputHashOf(action),
-          evaluation_id: d.evaluation_id,
-        });
+        this._record(state, this._storedStep(state, stepIndex, action.action_type, inputHashOf(action), d));
 
         if (d.decision === 'DENY') {
           state.state = 'FAILED';
@@ -416,17 +449,16 @@ export class GovernedRunHarness {
       `${state.run_id}:${pauseIndex}:e2`,
       approvedEvaluationId,
     );
-    this._record(state, {
-      run_id: state.run_id,
-      org_id: ORG_ID,
-      step_index: pauseIndex,
-      action_type: reconstruction.paused_action.action_type,
-      decision: d.decision,
-      reason_codes: [],
-      receipt_id: d.receipt_id,
-      input_hash: inputHashOf(reconstruction.paused_action),
-      evaluation_id: d.evaluation_id,
-    });
+    this._record(
+      state,
+      this._storedStep(
+        state,
+        pauseIndex,
+        reconstruction.paused_action.action_type,
+        inputHashOf(reconstruction.paused_action),
+        d,
+      ),
+    );
 
     if (d.decision === 'REQUIRE_APPROVAL') {
       state.pending_evaluation_id = d.evaluation_id;

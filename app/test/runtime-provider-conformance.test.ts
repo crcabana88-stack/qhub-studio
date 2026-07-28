@@ -323,6 +323,9 @@ describe('reconstructForResume — direct fail-closed unit checks', () => {
         receipt_id: 'rM',
         input_hash: '',
         evaluation_id: 'Emodel',
+        result_hash: 'rh-step-0',
+        safe_result: { execution_status: 'SIMULATED' },
+        previous_step_hash: null,
       },
       {
         run_id: 'r1',
@@ -334,6 +337,9 @@ describe('reconstructForResume — direct fail-closed unit checks', () => {
         receipt_id: null,
         input_hash: '',
         evaluation_id: 'E1',
+        result_hash: null,
+        safe_result: null,
+        previous_step_hash: null,
       },
     ];
     return base.map((s, i) => ({ ...s, ...(over[i] ?? {}) }));
@@ -349,6 +355,42 @@ describe('reconstructForResume — direct fail-closed unit checks', () => {
     expect(r.ok).toBe(true);
     expect(r.paused_action?.action_type).toBe('EXTERNAL_DATA_TRANSMISSION');
     expect(inputHashOf(r.paused_action!)).toBe(h[1]);
+  });
+
+  it('uses the PERSISTED safe_result (no RECONSTRUCTED placeholder)', async () => {
+    const h = await planHashes();
+    const s = steps([{ input_hash: h[0] }, { input_hash: h[1] }]);
+    const p = new LocalSimulationProvider();
+    await p.init({ manifest: referenceManifestView(), synthetic_inputs: inputs });
+
+    const r = await reconstructForResume({ provider: p, run, steps: s, approvedEvaluationId: 'E1' });
+    expect(r.ok).toBe(true);
+    expect(r.prior_results[0].safe_result).toEqual({ execution_status: 'SIMULATED' });
+
+    // The removed placeholder must never appear.
+    expect(JSON.stringify(r.prior_results)).not.toContain('RECONSTRUCTED');
+  });
+
+  it('a legacy prior step with NULL continuity fails closed (non-resumable)', async () => {
+    const h = await planHashes();
+    const s = steps([{ input_hash: h[0], result_hash: null, safe_result: null }, { input_hash: h[1] }]);
+    const p = new LocalSimulationProvider();
+    await p.init({ manifest: referenceManifestView(), synthetic_inputs: inputs });
+
+    const r = await reconstructForResume({ provider: p, run, steps: s, approvedEvaluationId: 'E1' });
+    expect(r.ok).toBe(false);
+    expect(r.reason).toBe('NON_RESUMABLE_LEGACY_CONTINUITY');
+  });
+
+  it('a broken previous-step link fails closed', async () => {
+    const h = await planHashes();
+    const s = steps([{ input_hash: h[0], previous_step_hash: 'not-null-at-step-0' }, { input_hash: h[1] }]);
+    const p = new LocalSimulationProvider();
+    await p.init({ manifest: referenceManifestView(), synthetic_inputs: inputs });
+
+    const r = await reconstructForResume({ provider: p, run, steps: s, approvedEvaluationId: 'E1' });
+    expect(r.ok).toBe(false);
+    expect(r.reason).toBe('CONTINUITY_CHAIN_BROKEN');
   });
 
   it('cross-tenant step ownership fails closed', async () => {

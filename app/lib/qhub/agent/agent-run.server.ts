@@ -30,6 +30,7 @@ import {
   type StoredRunStep,
   type PersistedEvaluation,
 } from './runtime/run-reconstruction';
+import { buildSafeResult, type SafeResult } from './runtime/safe-result';
 import { assertBuildIntegrity } from '~/lib/qhub/build-integrity.server';
 import { getEvaluationById, gatherApprovals, getActivePlan } from '~/lib/qhub/enforcement-store.server';
 import { checkApprovalSet } from '~/lib/qhub/enforcement-decision';
@@ -410,19 +411,23 @@ async function driveRun(ctx: DriveContext): Promise<RunResult> {
 
       const decision = await routeThroughGate04(ctx, action, stepIndex);
 
-      const stepRecorded = await recordStep(sb, {
-        run_id,
-        org_id: session.orgId,
-        step_index: stepIndex,
-        step_kind: action.step_kind,
-        action_type: action.action_type,
-        evaluation_id: decision.evaluation_id,
-        decision: decision.result.decision,
-        reason_codes: decision.result.reason_codes,
-        receipt_id: decision.result.receipt_id,
-        input_hash: sha256(stableStringify(action.material_parameters ?? null)),
-        summary: action.summary,
-      });
+      const stepRecorded = await persistStep(
+        sb,
+        {
+          run_id,
+          org_id: session.orgId,
+          step_index: stepIndex,
+          step_kind: action.step_kind,
+          action_type: action.action_type,
+          evaluation_id: decision.evaluation_id,
+          decision: decision.result.decision,
+          reason_codes: decision.result.reason_codes,
+          receipt_id: decision.result.receipt_id,
+          input_hash: sha256(stableStringify(action.material_parameters ?? null)),
+          summary: action.summary,
+        },
+        decision.result,
+      );
 
       if (!stepRecorded) {
         // Fail closed: an unrecorded governed action must not be treated as done.
@@ -554,27 +559,38 @@ function mapEnvironment(target: string): 'PREVIEW' | 'INTERNAL' | 'PRODUCTION' {
   return 'PREVIEW';
 }
 
-async function recordStep(
-  sb: SupabaseClient,
-  step: {
-    run_id: string;
-    org_id: string;
-    step_index: number;
-    step_kind: string;
-    action_type: string | null;
-    evaluation_id: string | null;
-    decision: string;
-    reason_codes: string[];
-    receipt_id: string | null;
-    input_hash: string;
-    summary: string;
-  },
-): Promise<boolean> {
-  /*
-   * A REQUIRE_APPROVAL step is recorded at pause and updated IN PLACE to its final
-   * decision when the run resumes. Explicit update-or-insert on (run_id,
-   * step_index) — robust regardless of on-conflict target resolution.
-   */
+interface StepRecord {
+  run_id: string;
+  org_id: string;
+  step_index: number;
+  step_kind: string;
+  action_type: string | null;
+  evaluation_id: string | null;
+  decision: string;
+  reason_codes: string[];
+  receipt_id: string | null;
+  input_hash: string;
+  summary: string;
+}
+
+/** The server-owned safe result for a terminal step (allowlisted, never raw). */
+function safeResultForStep(result: GovernedActionResult): SafeResult {
+  const executionStatus =
+    typeof result.safe_result?.execution_status === 'string'
+      ? result.safe_result.execution_status
+      : result.decision === 'DENY'
+        ? 'DENIED'
+        : result.decision;
+
+  return buildSafeResult({ execution_status: executionStatus });
+}
+
+/**
+ * Record a REQUIRE_APPROVAL pause step (non-terminal, no continuity fields). An
+ * explicit update-or-insert on (run_id, step_index) — robust regardless of
+ * on-conflict target resolution — that the defensive trigger permits.
+ */
+async function recordPendingStep(sb: SupabaseClient, step: StepRecord): Promise<boolean> {
   const { data: existing } = await sb
     .from('qhub_agent_run_steps')
     .select('step_id')
@@ -602,6 +618,38 @@ async function recordStep(
   }
 
   const { error } = await sb.from('qhub_agent_run_steps').insert(step);
+
+  return !error;
+}
+
+/**
+ * Persist a governed step. A terminal decision is finalized through the
+ * service-role-only qhub_finalize_agent_run_step RPC, which validates ownership,
+ * the state transition, the strict safe_result, and the previous-step hash chain,
+ * then computes result_hash + previous_step_hash from AUTHORITATIVE records (never
+ * a caller argument). A REQUIRE_APPROVAL pause is a plain pending record. Any
+ * failure returns false so the caller fails closed (an unrecorded governed action
+ * is never treated as done).
+ */
+async function persistStep(sb: SupabaseClient, step: StepRecord, result: GovernedActionResult): Promise<boolean> {
+  if (step.decision === 'REQUIRE_APPROVAL') {
+    return recordPendingStep(sb, step);
+  }
+
+  const { error } = await sb.rpc('qhub_finalize_agent_run_step', {
+    p_run_id: step.run_id,
+    p_org_id: step.org_id,
+    p_step_index: step.step_index,
+    p_step_kind: step.step_kind,
+    p_action_type: step.action_type,
+    p_evaluation_id: step.evaluation_id,
+    p_decision: step.decision,
+    p_reason_codes: step.reason_codes,
+    p_receipt_id: step.receipt_id,
+    p_input_hash: step.input_hash,
+    p_summary: step.summary,
+    p_safe_result: safeResultForStep(result),
+  });
 
   return !error;
 }
@@ -765,7 +813,9 @@ export async function resumeAgentRun(input: {
    */
   const stepsRes = await sb
     .from('qhub_agent_run_steps')
-    .select('run_id, org_id, step_index, action_type, decision, reason_codes, receipt_id, input_hash, evaluation_id')
+    .select(
+      'run_id, org_id, step_index, action_type, decision, reason_codes, receipt_id, input_hash, evaluation_id, result_hash, safe_result, previous_step_hash',
+    )
     .eq('run_id', input.run_id)
     .eq('org_id', session.orgId)
     .order('step_index');
@@ -892,19 +942,23 @@ export async function resumeAgentRun(input: {
   const action = reconstruction.paused_action;
   const decision = await routeThroughGate04(ctx, action, stepIndex, input.approved_evaluation_id);
 
-  const recorded = await recordStep(sb, {
-    run_id: input.run_id,
-    org_id: session.orgId,
-    step_index: stepIndex,
-    step_kind: action.step_kind,
-    action_type: action.action_type,
-    evaluation_id: decision.evaluation_id,
-    decision: decision.result.decision,
-    reason_codes: decision.result.reason_codes,
-    receipt_id: decision.result.receipt_id,
-    input_hash: sha256(stableStringify(action.material_parameters ?? null)),
-    summary: action.summary,
-  });
+  const recorded = await persistStep(
+    sb,
+    {
+      run_id: input.run_id,
+      org_id: session.orgId,
+      step_index: stepIndex,
+      step_kind: action.step_kind,
+      action_type: action.action_type,
+      evaluation_id: decision.evaluation_id,
+      decision: decision.result.decision,
+      reason_codes: decision.result.reason_codes,
+      receipt_id: decision.result.receipt_id,
+      input_hash: sha256(stableStringify(action.material_parameters ?? null)),
+      summary: action.summary,
+    },
+    decision.result,
+  );
 
   if (!recorded) {
     await finishRun(sb, input.run_id, session.orgId, 'FAILED', counters, 'EVIDENCE_WRITE_FAILED');

@@ -57,17 +57,54 @@ export interface StoredRunStep {
   /** sha256(stableStringify(material_parameters)) recorded at execution time. */
   input_hash: string | null;
   evaluation_id: string | null;
+
+  /** Server-computed canonical result hash (NULL only for legacy/pending rows). */
+  result_hash: string | null;
+
+  /** Persisted, server-owned safe result (NULL only for legacy/pending rows). */
+  safe_result: Record<string, unknown> | null;
+
+  /** result_hash of the immediately preceding finalized step (NULL at step 0). */
+  previous_step_hash: string | null;
 }
 
 const EXECUTED: ReadonlySet<RunActionDecision> = new Set<RunActionDecision>(['ALLOW', 'SIMULATED', 'EXECUTED']);
 
+/**
+ * Rebuild a governed result from a PERSISTED, finalized executed step — using the
+ * stored server-owned safe_result (never a RECONSTRUCTED placeholder). Only call
+ * after `executedContinuityReason` has confirmed the step is finalized + linked.
+ */
 function executedResult(step: StoredRunStep): GovernedActionResult {
   return {
     decision: step.decision as RunActionDecision,
     reason_codes: step.reason_codes ?? [],
     receipt_id: step.receipt_id,
-    safe_result: step.receipt_id ? { execution_status: 'RECONSTRUCTED' } : null,
+    safe_result: step.safe_result,
   };
+}
+
+/**
+ * Fail-closed continuity check for one already-executed step, given the result
+ * hash of the immediately preceding executed step (`prevHash`, NULL before the
+ * first). A legacy row (NULL continuity) is NON-resumable; a broken previous-step
+ * link is a tamper/transplant signal. Returns null when the step is sound.
+ */
+function executedContinuityReason(
+  step: StoredRunStep,
+  prevHash: string | null,
+): 'NON_RESUMABLE_LEGACY_CONTINUITY' | 'CONTINUITY_CHAIN_BROKEN' | null {
+  if (step.result_hash === null || step.safe_result === null) {
+    return 'NON_RESUMABLE_LEGACY_CONTINUITY';
+  }
+
+  const expectedPrev = step.step_index === 0 ? null : prevHash;
+
+  if ((step.previous_step_hash ?? null) !== expectedPrev) {
+    return 'CONTINUITY_CHAIN_BROKEN';
+  }
+
+  return null;
 }
 
 /*
@@ -80,6 +117,8 @@ export type ReconstructionReason =
   | 'NON_CONTIGUOUS_STEPS'
   | 'MISSING_PRIOR_STEP'
   | 'PRIOR_RESULT_TAMPERED'
+  | 'NON_RESUMABLE_LEGACY_CONTINUITY'
+  | 'CONTINUITY_CHAIN_BROKEN'
   | 'INCONSISTENT_DECISION';
 
 export type RunTerminal = 'NONE' | 'DENIED' | 'AWAITING_APPROVAL';
@@ -114,6 +153,7 @@ export function reconstructRunState(
   }
 
   const prior: GovernedActionResult[] = [];
+  let prevHash: string | null = null;
 
   for (const step of ordered) {
     const decision = step.decision;
@@ -129,7 +169,14 @@ export function reconstructRunState(
         return fail('PRIOR_RESULT_TAMPERED');
       }
 
+      const continuity = executedContinuityReason(step, prevHash);
+
+      if (continuity) {
+        return fail(continuity);
+      }
+
       prior.push(executedResult(step));
+      prevHash = step.result_hash;
       continue;
     }
 
@@ -173,6 +220,8 @@ export type ResumeReconstructionReason =
   | 'NON_CONTIGUOUS_STEPS'
   | 'MISSING_PRIOR_STEP'
   | 'PRIOR_RESULT_TAMPERED'
+  | 'NON_RESUMABLE_LEGACY_CONTINUITY'
+  | 'CONTINUITY_CHAIN_BROKEN'
   | 'INCONSISTENT_DECISION'
   | 'PAUSED_STEP_MISMATCH'
   | 'PAUSED_STEP_NOT_PENDING'
@@ -251,6 +300,7 @@ export async function reconstructForResume(params: {
   }
 
   const priorResults: GovernedActionResult[] = [];
+  let prevHash: string | null = null;
 
   for (let i = 0; i <= pauseIndex; i++) {
     const stored = ordered[i];
@@ -273,7 +323,18 @@ export async function reconstructForResume(params: {
         return resumeFail('PRIOR_RESULT_TAMPERED');
       }
 
+      /*
+       * Persisted continuity: legacy rows are non-resumable; a broken previous-step
+       * link is a tamper/transplant signal. Uses the PERSISTED safe_result.
+       */
+      const continuity = executedContinuityReason(stored, prevHash);
+
+      if (continuity) {
+        return resumeFail(continuity);
+      }
+
       priorResults.push(executedResult(stored));
+      prevHash = stored.result_hash;
       continue;
     }
 

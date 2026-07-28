@@ -173,7 +173,56 @@ function fakeClient() {
     return b;
   };
 
-  return { from };
+  /**
+   * Simulates the service-role-only qhub_finalize_agent_run_step RPC: update-or-insert
+   * the terminal step with server-owned continuity (result_hash, previous_step_hash,
+   * safe_result) chained onto the prior finalized step. Honors failStepInsert.
+   */
+  const rpc = (fn: string, args: any) => {
+    if (fn !== 'qhub_finalize_agent_run_step') {
+      return Promise.resolve({ data: null, error: { message: `unknown rpc ${fn}` } });
+    }
+
+    if (STORE.failStepInsert) {
+      return Promise.resolve({ data: null, error: { message: 'forced finalize failure' } });
+    }
+
+    const prev =
+      args.p_step_index === 0
+        ? null
+        : (STORE.steps.find((s) => s.run_id === args.p_run_id && s.step_index === args.p_step_index - 1)?.result_hash ??
+          null);
+    const resultHash = `rh:${args.p_run_id}:${args.p_step_index}:${args.p_decision}:${args.p_receipt_id ?? ''}`;
+    const row = {
+      run_id: args.p_run_id,
+      org_id: args.p_org_id,
+      step_index: args.p_step_index,
+      step_kind: args.p_step_kind,
+      action_type: args.p_action_type,
+      evaluation_id: args.p_evaluation_id,
+      decision: args.p_decision,
+      reason_codes: args.p_reason_codes ?? [],
+      receipt_id: args.p_receipt_id,
+      input_hash: args.p_input_hash,
+      summary: args.p_summary,
+      safe_result: args.p_safe_result,
+      previous_step_hash: prev,
+      result_hash: resultHash,
+      result_hash_schema_version: 'agent-step-result-1.0.0',
+      finalized_at: new Date().toISOString(),
+    };
+    const idx = STORE.steps.findIndex((x) => x.run_id === row.run_id && x.step_index === row.step_index);
+
+    if (idx >= 0) {
+      STORE.steps[idx] = { ...STORE.steps[idx], ...row };
+    } else {
+      STORE.steps.push(row);
+    }
+
+    return Promise.resolve({ data: { finalized: true, result_hash: resultHash }, error: null });
+  };
+
+  return { from, rpc };
 }
 
 const H = vi.hoisted(() => ({

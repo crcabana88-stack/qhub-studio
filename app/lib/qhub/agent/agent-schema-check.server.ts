@@ -20,7 +20,7 @@ import {
 } from '~/lib/qhub/schema-check.server';
 import { projectRefFromUrl, type RequiredSchemaObject } from '~/lib/qhub/schema-contract';
 
-export const EXPECTED_AGENT_SCHEMA_VERSION = '2026-07-27.agent-foundation';
+export const EXPECTED_AGENT_SCHEMA_VERSION = '2026-07-28.agent-result-continuity';
 export const AGENT_SCHEMA_VERIFIER_RPC = 'qhub_verify_agent_schema';
 
 /** One representative column per Agent Framework table (first-line existence probe). */
@@ -48,6 +48,12 @@ export const AGENT_REQUIRED_OBJECTS: RequiredSchemaObject[] = [
     column: 'step_index',
     migration: '20260727_agent_framework_foundation',
     requiredBy: 'Governed run step evidence',
+  },
+  {
+    table: 'qhub_agent_run_steps',
+    column: 'result_hash',
+    migration: '20260728_agent_run_step_result_continuity',
+    requiredBy: 'Agent run-step result continuity (server-owned terminalization)',
   },
 ];
 
