@@ -1,3 +1,4 @@
+// @qhub-boundary: PUBLIC_SAFE — read-only non-secret status (booleans / provider names / model list); returns no key values.
 import { createScopedLogger } from '~/utils/logger';
 import { MCPService } from '~/lib/services/mcpService';
 

@@ -1,3 +1,4 @@
+// @qhub-boundary: PUBLIC_SAFE — read-only non-secret status (booleans / provider names / model list); returns no key values.
 import type { LoaderFunction } from '@remix-run/cloudflare';
 import { LLMManager } from '~/lib/modules/llm/manager';
 import { getApiKeysFromCookie } from '~/lib/api/cookies';

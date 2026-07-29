@@ -1,3 +1,4 @@
+// @qhub-boundary: PUBLIC_SAFE — proxies the caller's OWN connection using their own cookie/header token; no server secret, self-scoped.
 import { json } from '@remix-run/cloudflare';
 import { getApiKeysFromCookie } from '~/lib/api/cookies';
 import { withSecurity } from '~/lib/security';

@@ -280,6 +280,23 @@ export class StripeBillingProvider implements BillingProvider {
     };
   }
 
+  async retrieveCheckoutSessionPriceIds(sessionId: string): Promise<BillingResult<string[]>> {
+    if (!this.isConfigured()) {
+      return fail('BILLING_NOT_CONFIGURED', 'Billing is not configured.');
+    }
+
+    const res = await this._get(`/v1/checkout/sessions/${encodeURIComponent(sessionId)}/line_items?limit=100`);
+
+    if (!res.ok) {
+      return fail('STRIPE_ERROR', res.error);
+    }
+
+    const body = res.body as { data?: Array<{ price?: { id?: string } }> };
+    const ids = (body.data ?? []).map((li) => li.price?.id).filter((x): x is string => !!x);
+
+    return { ok: true, value: ids };
+  }
+
   // ─── HTTP ─────────────────────────────────────────────────────────────────────
 
   private async _get(path: string): Promise<{ ok: true; body: unknown } | { ok: false; error: string }> {
@@ -481,6 +498,8 @@ export function normalizeStripeEvent(event: unknown): NormalizedBillingEvent | n
     stripeAccount: typeof e.account === 'string' ? e.account : undefined,
     eventCreated: typeof e.created === 'number' ? e.created : 0,
     checkoutIntentId: metadata.checkout_intent_id ?? undefined,
+    checkoutSessionId:
+      e.type === 'checkout.session.completed' && typeof obj.id === 'string' ? (obj.id as string) : undefined,
   };
 }
 

@@ -1,4 +1,5 @@
 import { type ActionFunctionArgs } from '@remix-run/cloudflare';
+import { requireStaff } from '~/lib/qhub/commercial/commercial-context.server';
 import { streamText } from '~/lib/.server/llm/stream-text';
 import { stripIndents } from '~/utils/stripIndent';
 import type { ProviderInfo } from '~/types/model';
@@ -6,6 +7,18 @@ import { getApiKeysFromCookie, getProviderSettingsFromCookie } from '~/lib/api/c
 import { createScopedLogger } from '~/utils/logger';
 
 export async function action(args: ActionFunctionArgs) {
+  // R4: the prompt-enhancer is a model-invocation surface — Quantex-STAFF-ONLY.
+  const env = (args.context?.cloudflare?.env as unknown as Record<string, string | undefined>) ?? {};
+  const guard = await requireStaff(args.request, env);
+
+  if (!guard.ok) {
+    return guard.response;
+  }
+
+  return enhancerActionGuarded(args);
+}
+
+async function enhancerActionGuarded(args: ActionFunctionArgs) {
   return enhancerAction(args);
 }
 

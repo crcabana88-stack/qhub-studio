@@ -11,7 +11,7 @@
 
 import { json, type ActionFunctionArgs } from '@remix-run/cloudflare';
 import { requireStaff } from '~/lib/qhub/commercial/commercial-context.server';
-import { decideReviewRequest } from '~/lib/qhub/commercial/review.server';
+import { decideReviewAtomic } from '~/lib/qhub/commercial/commercial-store.server';
 import { checkRateLimit, isSameOrigin, readBoundedJson } from '~/lib/qhub/commercial/request-guards.server';
 
 export async function action({ request, context, params }: ActionFunctionArgs) {
@@ -50,10 +50,15 @@ export async function action({ request, context, params }: ActionFunctionArgs) {
     return json({ ok: false, error: 'invalid_decision' }, { status: 400 });
   }
 
-  const result = await decideReviewRequest(
-    ctx,
+  /*
+   * ONE atomic RPC: request + Governance Essentials + immutable audit, all-or-nothing.
+   * The actor is the authoritative staff context; the policy version is server-owned.
+   */
+  const result = await decideReviewAtomic(
     {
       requestId: params.requestId,
+      actor: ctx.userId,
+      isStaff: ctx.isStaff,
       decision: body.decision,
       reason: body.reason,
       policyVersion: body.policyVersion ?? 'v1',
@@ -62,8 +67,8 @@ export async function action({ request, context, params }: ActionFunctionArgs) {
   );
 
   if (!result.ok) {
-    const status = result.error === 'staff_required' ? 403 : result.error === 'not_found' ? 404 : 409;
-    return json({ ok: false, error: result.error }, { status });
+    const status = result.reason === 'staff_required' ? 403 : result.reason === 'not_found' ? 404 : 409;
+    return json({ ok: false, error: result.reason }, { status });
   }
 
   return json({ ok: true });

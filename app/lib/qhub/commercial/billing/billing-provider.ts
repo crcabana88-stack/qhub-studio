@@ -98,6 +98,9 @@ export interface NormalizedBillingEvent {
 
   /** The opaque checkout-intent id carried in metadata (checkout.completed). */
   checkoutIntentId?: string;
+
+  /** The Checkout Session id (checkout.session.completed object id). */
+  checkoutSessionId?: string;
 }
 
 export type WebhookVerifyResult =
@@ -153,4 +156,7 @@ export interface BillingProvider {
 
   /** True when the given recurring price id is one of the server-configured prices. */
   isConfiguredPrice(priceId: string): boolean;
+
+  /** Retrieve a Checkout Session's line-item price ids (to validate the setup line). */
+  retrieveCheckoutSessionPriceIds(sessionId: string): Promise<BillingResult<string[]>>;
 }

@@ -2,7 +2,7 @@
 -- QHUB Commercial Launch Foundation — R3 HARDENING
 -- Migration: 20260729_commercial_launch_foundation  (replaces the rejected
 --            4b42555a… contents IN PLACE — one authoritative commercial migration)
--- Schema version: 2026-07-30.commercial-launch-r3
+-- Schema version: 2026-07-30.commercial-launch-r4
 --
 -- Central commercial security boundary: authoritative membership/staff, real
 -- project ownership, checkout-intent binding (metadata is never tenant authority),
@@ -353,7 +353,7 @@ $$;
 DO $$
 DECLARE
   t TEXT;
-  tables TEXT[] := ARRAY['qhub_acknowledgments','qhub_usage_ledger'];
+  tables TEXT[] := ARRAY['qhub_acknowledgments','qhub_usage_ledger','qhub_entitlement_audit'];
 BEGIN
   FOREACH t IN ARRAY tables LOOP
     IF NOT EXISTS (
@@ -519,12 +519,13 @@ BEGIN
 END;
 $$;
 
--- ─── Transactional invitation acceptance with seat-limit enforcement (R3) ────
--- Locks the org's memberships, counts ACTIVE seats, and admits the invitee only
--- while under the plan cap. Concurrent acceptances serialize on the lock, so the
--- cap can never be exceeded. Returns ACCEPTED | SEAT_LIMIT | INVALID | ALREADY.
+-- ─── Transactional invitation acceptance (R4 — identity + plan-derived cap) ──
+-- The caller supplies NO seat cap: the RPC verifies the recipient email + token,
+-- derives the plan + seat cap from the org's authoritative active subscription, and
+-- admits the invitee only under the cap, all under a lock. Returns
+-- ACCEPTED | SEAT_LIMIT | INVALID | EMAIL_MISMATCH | TOKEN_MISMATCH | INELIGIBLE | ALREADY.
 CREATE OR REPLACE FUNCTION public.qhub_accept_invitation(
-  p_invitation_id UUID, p_user_id TEXT, p_max_seats INTEGER
+  p_invitation_id UUID, p_user_id TEXT, p_user_email TEXT, p_token_hash TEXT
 ) RETURNS TEXT
 LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, public AS $$
 DECLARE
@@ -532,9 +533,15 @@ DECLARE
   v_role TEXT;
   v_status TEXT;
   v_expires TIMESTAMPTZ;
+  v_email TEXT;
+  v_token TEXT;
+  v_plan TEXT;
+  v_sub_status TEXT;
+  v_cap INTEGER;
   v_seats INTEGER;
 BEGIN
-  SELECT org_id, role, status, expires_at INTO v_org, v_role, v_status, v_expires
+  SELECT org_id, role, status, expires_at, lower(email), token_hash
+    INTO v_org, v_role, v_status, v_expires, v_email, v_token
     FROM public.qhub_org_invitations WHERE id = p_invitation_id FOR UPDATE;
 
   IF NOT FOUND OR v_status <> 'invited' THEN
@@ -546,17 +553,35 @@ BEGIN
     RETURN 'INVALID';
   END IF;
 
+  -- The accepting user's verified email must match the invitation recipient.
+  IF v_email IS DISTINCT FROM lower(coalesce(p_user_email, '')) THEN
+    RETURN 'EMAIL_MISMATCH';
+  END IF;
+
+  IF v_token IS DISTINCT FROM p_token_hash THEN
+    RETURN 'TOKEN_MISMATCH';
+  END IF;
+
   -- Already a member? Idempotent no-op.
   IF EXISTS (SELECT 1 FROM public.qhub_org_members WHERE user_id = p_user_id AND org_id = v_org) THEN
     UPDATE public.qhub_org_invitations SET status='accepted', accepted_by=p_user_id WHERE id = p_invitation_id;
     RETURN 'ALREADY';
   END IF;
 
+  -- Derive plan + seat cap from the org's authoritative active subscription (locked).
+  SELECT plan_id, status INTO v_plan, v_sub_status FROM public.qhub_subscriptions WHERE org_id = v_org FOR UPDATE;
+
+  IF v_plan IS NULL OR v_sub_status NOT IN ('active','trialing') THEN
+    RETURN 'INELIGIBLE';
+  END IF;
+
+  v_cap := CASE v_plan WHEN 'builder_beta' THEN 1 WHEN 'guided_builder' THEN 5 ELSE 0 END;
+
   -- Lock the org's members and count active seats under the lock.
   PERFORM 1 FROM public.qhub_org_members WHERE org_id = v_org FOR UPDATE;
   SELECT count(*) INTO v_seats FROM public.qhub_org_members WHERE org_id = v_org AND status = 'active';
 
-  IF v_seats >= p_max_seats THEN
+  IF v_seats >= v_cap THEN
     RETURN 'SEAT_LIMIT';
   END IF;
 
@@ -564,6 +589,10 @@ BEGIN
   VALUES (p_user_id, v_org, v_role, 'active', NOW());
 
   UPDATE public.qhub_org_invitations SET status='accepted', accepted_by=p_user_id WHERE id = p_invitation_id;
+
+  INSERT INTO public.qhub_entitlement_audit (org_id, actor, change_type, after_state, reason)
+  VALUES (v_org, p_user_id, 'INVITATION_ACCEPTED',
+          jsonb_build_object('invitation_id', p_invitation_id::text, 'role', v_role), 'accepted');
 
   RETURN 'ACCEPTED';
 END;
@@ -625,6 +654,277 @@ BEGIN
 END;
 $$;
 
+-- ─── Lease-owner-bound webhook state transition (R4) ─────────────────────────
+-- Only the current processing_owner (with a non-expired lease) may transition an
+-- event to PROCESSED / FAILED_RETRYABLE / FAILED_PERMANENT. Returns OK | LEASE_LOST.
+CREATE OR REPLACE FUNCTION public.qhub_mark_webhook_state(
+  p_provider TEXT, p_event_id TEXT, p_owner TEXT, p_state TEXT, p_error_code TEXT
+) RETURNS TEXT
+LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, public AS $$
+DECLARE
+  v_owner TEXT;
+  v_lease TIMESTAMPTZ;
+BEGIN
+  SELECT processing_owner, lease_expires_at INTO v_owner, v_lease
+    FROM public.qhub_billing_webhook_events
+   WHERE provider = p_provider AND provider_event_id = p_event_id
+   FOR UPDATE;
+
+  IF NOT FOUND OR v_owner IS DISTINCT FROM p_owner OR v_lease IS NULL OR v_lease < NOW() THEN
+    RETURN 'LEASE_LOST';
+  END IF;
+
+  UPDATE public.qhub_billing_webhook_events
+     SET state = p_state,
+         last_error_code = p_error_code,
+         last_error_at = CASE WHEN p_state LIKE 'FAILED%' THEN NOW() ELSE last_error_at END,
+         processed_at = CASE WHEN p_state = 'PROCESSED' THEN NOW() ELSE processed_at END
+   WHERE provider = p_provider AND provider_event_id = p_event_id;
+
+  RETURN 'OK';
+END;
+$$;
+
+-- ─── ATOMIC checkout reconciliation (R4) ─────────────────────────────────────
+-- The full checkout.session.completed reconciliation as ONE transaction: verify the
+-- caller owns the active lease, lock + validate the intent against the retrieved
+-- Stripe objects (session/customer/subscription/price/setup-price/mode/account),
+-- bind customer→org and subscription→customer/org/plan, write normalized state with
+-- provider ordering, consume the intent, and mark the event PROCESSED — all commit or
+-- roll back together. Returns jsonb {ok, reason?, idempotent?, org?}.
+CREATE OR REPLACE FUNCTION public.qhub_reconcile_checkout(
+  p_provider TEXT, p_event_id TEXT, p_owner TEXT, p_intent_id UUID,
+  p_session_id TEXT, p_customer_id TEXT, p_subscription_id TEXT, p_recurring_price TEXT,
+  p_setup_present BOOLEAN, p_mode TEXT, p_account TEXT, p_status TEXT,
+  p_current_period_end BIGINT, p_event_created BIGINT
+) RETURNS JSONB
+LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, public AS $$
+DECLARE
+  v_ev_owner TEXT;
+  v_ev_lease TIMESTAMPTZ;
+  r RECORD;
+  v_map_org TEXT;
+  v_last BIGINT;
+BEGIN
+  -- 1-2. Lock the inbox event; caller must own the active, non-expired lease.
+  SELECT processing_owner, lease_expires_at INTO v_ev_owner, v_ev_lease
+    FROM public.qhub_billing_webhook_events
+   WHERE provider = p_provider AND provider_event_id = p_event_id
+   FOR UPDATE;
+
+  IF NOT FOUND OR v_ev_owner IS DISTINCT FROM p_owner OR v_ev_lease IS NULL OR v_ev_lease < NOW() THEN
+    RETURN jsonb_build_object('ok', false, 'reason', 'lease_lost');
+  END IF;
+
+  -- 3. Lock the intent.
+  SELECT * INTO r FROM public.qhub_checkout_intents WHERE id = p_intent_id FOR UPDATE;
+
+  IF NOT FOUND THEN
+    RETURN jsonb_build_object('ok', false, 'reason', 'unknown_intent');
+  END IF;
+
+  -- Exact-retry idempotency: same session + subscription already reconciled.
+  IF r.status = 'consumed' THEN
+    IF r.checkout_session_id IS NOT DISTINCT FROM p_session_id
+       AND r.subscription_id IS NOT DISTINCT FROM p_subscription_id THEN
+      UPDATE public.qhub_billing_webhook_events SET state='PROCESSED', processed_at=NOW()
+        WHERE provider=p_provider AND provider_event_id=p_event_id;
+      RETURN jsonb_build_object('ok', true, 'idempotent', true, 'org', r.org_id);
+    END IF;
+
+    RETURN jsonb_build_object('ok', false, 'reason', 'intent_object_mismatch');
+  END IF;
+
+  IF r.status <> 'pending' THEN
+    RETURN jsonb_build_object('ok', false, 'reason', 'intent_not_pending');
+  END IF;
+
+  -- 4. Expiration + bound-expectation validation.
+  IF r.expires_at < NOW() THEN
+    UPDATE public.qhub_checkout_intents SET status='expired' WHERE id = p_intent_id;
+    RETURN jsonb_build_object('ok', false, 'reason', 'intent_expired');
+  END IF;
+
+  IF r.expected_recurring_price_id IS DISTINCT FROM p_recurring_price
+     OR r.expected_mode IS DISTINCT FROM p_mode
+     OR (r.expected_account IS NOT NULL AND r.expected_account IS DISTINCT FROM p_account)
+     -- 9. Guided requires the one-time setup price to be present on the session.
+     OR (r.plan_id = 'guided_builder' AND NOT p_setup_present) THEN
+    UPDATE public.qhub_checkout_intents
+       SET status='failed', failure_code='binding_mismatch', checkout_session_id=p_session_id
+     WHERE id = p_intent_id;
+    RETURN jsonb_build_object('ok', false, 'reason', 'binding_mismatch');
+  END IF;
+
+  -- 10. Bind/validate customer→org (a customer mapped to another org is a mismatch).
+  SELECT org_id INTO v_map_org FROM public.qhub_billing_customers
+    WHERE provider = p_provider AND provider_customer_id = p_customer_id FOR UPDATE;
+
+  IF v_map_org IS NOT NULL AND v_map_org IS DISTINCT FROM r.org_id THEN
+    RETURN jsonb_build_object('ok', false, 'reason', 'customer_org_mismatch');
+  END IF;
+
+  INSERT INTO public.qhub_billing_customers (org_id, provider, provider_customer_id, livemode, stripe_account)
+  VALUES (r.org_id, p_provider, p_customer_id, (p_mode = 'live'), p_account)
+  ON CONFLICT (org_id, provider) DO UPDATE
+     SET provider_customer_id = EXCLUDED.provider_customer_id, updated_at = NOW();
+
+  -- 11-12. Bind subscription→customer/org/plan with an out-of-order guard.
+  SELECT last_event_created INTO v_last FROM public.qhub_subscriptions
+    WHERE org_id = r.org_id AND provider = p_provider FOR UPDATE;
+
+  IF v_last IS NULL OR p_event_created > v_last THEN
+    INSERT INTO public.qhub_subscriptions
+      (org_id, plan_id, status, provider, provider_customer_id, provider_subscription_id,
+       provider_price_id, livemode, stripe_account, current_period_end, last_event_created, last_provider_event_id)
+    VALUES
+      (r.org_id, r.plan_id, p_status, p_provider, p_customer_id, p_subscription_id,
+       p_recurring_price, (p_mode='live'), p_account, p_current_period_end, p_event_created, p_event_id)
+    ON CONFLICT (org_id, provider) DO UPDATE SET
+       plan_id = EXCLUDED.plan_id, status = EXCLUDED.status,
+       provider_customer_id = EXCLUDED.provider_customer_id,
+       provider_subscription_id = EXCLUDED.provider_subscription_id,
+       provider_price_id = EXCLUDED.provider_price_id,
+       current_period_end = EXCLUDED.current_period_end,
+       last_event_created = EXCLUDED.last_event_created,
+       last_provider_event_id = EXCLUDED.last_provider_event_id,
+       updated_at = NOW();
+  END IF;
+
+  -- 13. Consume the intent.
+  UPDATE public.qhub_checkout_intents
+     SET status='consumed', consumed_at=NOW(), checkout_session_id=p_session_id,
+         customer_id=p_customer_id, subscription_id=p_subscription_id
+   WHERE id = p_intent_id;
+
+  -- 14. Mark the event PROCESSED (same transaction).
+  UPDATE public.qhub_billing_webhook_events SET state='PROCESSED', processed_at=NOW()
+    WHERE provider=p_provider AND provider_event_id=p_event_id;
+
+  RETURN jsonb_build_object('ok', true, 'idempotent', false, 'org', r.org_id);
+END;
+$$;
+
+-- ─── ATOMIC review decision (R4) ─────────────────────────────────────────────
+-- One transaction: lock + validate the PENDING request, verify the staff actor and
+-- exact org/project scope, apply the decision, update Governance Essentials, and
+-- append ONE immutable audit row. Prohibited categories are non-overridable. Returns
+-- jsonb {ok, reason?, idempotent?}.
+CREATE OR REPLACE FUNCTION public.qhub_decide_review(
+  p_request_id UUID, p_actor TEXT, p_is_staff BOOLEAN, p_decision TEXT, p_reason TEXT, p_policy_version TEXT
+) RETURNS JSONB
+LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, public AS $$
+DECLARE
+  r RECORD;
+BEGIN
+  IF NOT p_is_staff THEN
+    RETURN jsonb_build_object('ok', false, 'reason', 'staff_required');
+  END IF;
+
+  IF p_decision NOT IN ('approved','rejected') OR coalesce(btrim(p_reason),'') = '' THEN
+    RETURN jsonb_build_object('ok', false, 'reason', 'invalid_decision');
+  END IF;
+
+  SELECT * INTO r FROM public.qhub_manual_review_requests WHERE id = p_request_id FOR UPDATE;
+
+  IF NOT FOUND THEN
+    RETURN jsonb_build_object('ok', false, 'reason', 'not_found');
+  END IF;
+
+  -- Exact-repeat idempotency: same terminal decision by the same actor.
+  IF r.status <> 'pending' THEN
+    IF r.status = p_decision AND r.decided_by IS NOT DISTINCT FROM p_actor THEN
+      RETURN jsonb_build_object('ok', true, 'idempotent', true);
+    END IF;
+
+    RETURN jsonb_build_object('ok', false, 'reason', 'not_pending');
+  END IF;
+
+  IF p_decision = 'approved' AND r.category IN ('secrets','credentials','mnpi','regulated_records','consequential_action','external_write','autonomous_agent') THEN
+    RETURN jsonb_build_object('ok', false, 'reason', 'prohibited_cannot_approve');
+  END IF;
+
+  UPDATE public.qhub_manual_review_requests
+     SET status = p_decision, decided_by = p_actor, decision_reason = p_reason,
+         policy_version = p_policy_version, decided_at = NOW()
+   WHERE id = p_request_id;
+
+  IF r.project_id IS NOT NULL THEN
+    UPDATE public.qhub_governance_essentials
+       SET review_state = CASE WHEN p_decision='approved' THEN 'approved' ELSE 'rejected' END,
+           reviewed_by = p_actor, reviewed_at = NOW(), review_policy_version = p_policy_version, updated_at = NOW()
+     WHERE project_id = r.project_id AND org_id = r.org_id;
+  END IF;
+
+  INSERT INTO public.qhub_entitlement_audit (org_id, actor, change_type, before_state, after_state, reason)
+  VALUES (r.org_id, p_actor, 'REVIEW_DECISION',
+          jsonb_build_object('request_id', p_request_id::text, 'prev_status', r.status),
+          jsonb_build_object('decision', p_decision, 'policy_version', p_policy_version), p_reason);
+
+  RETURN jsonb_build_object('ok', true, 'idempotent', false);
+END;
+$$;
+
+-- ─── ATOMIC project creation with transactional cap (R4) ─────────────────────
+-- Derives + locks org/subscription/active-project-count and inserts under the plan
+-- cap (Builder 5, Guided 1) in one transaction. Idempotent by (org, idempotency_key)
+-- via the ledger-style request hash; a changed hash under the same key fails. Returns
+-- jsonb {ok, reason?, project_id?, idempotent?}.
+CREATE OR REPLACE FUNCTION public.qhub_create_project(
+  p_org_id TEXT, p_created_by TEXT, p_idempotency_key TEXT, p_request_hash TEXT
+) RETURNS JSONB
+LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, public AS $$
+DECLARE
+  v_plan TEXT;
+  v_status TEXT;
+  v_cap INTEGER;
+  v_active INTEGER;
+  v_existing RECORD;
+  v_pid UUID;
+BEGIN
+  -- Idempotency: a prior creation for this key returns the same project.
+  SELECT after_state, reason INTO v_existing FROM public.qhub_entitlement_audit
+    WHERE org_id = p_org_id AND change_type = 'PROJECT_CREATE'
+      AND after_state->>'idempotency_key' = p_idempotency_key LIMIT 1;
+
+  IF FOUND THEN
+    IF v_existing.reason IS DISTINCT FROM p_request_hash THEN
+      RETURN jsonb_build_object('ok', false, 'reason', 'idempotency_conflict');
+    END IF;
+
+    RETURN jsonb_build_object('ok', true, 'idempotent', true, 'project_id', v_existing.after_state->>'project_id');
+  END IF;
+
+  -- Lock subscription + derive plan/eligibility.
+  SELECT plan_id, status INTO v_plan, v_status FROM public.qhub_subscriptions
+    WHERE org_id = p_org_id FOR UPDATE;
+
+  IF v_plan IS NULL OR v_status NOT IN ('active','trialing') THEN
+    RETURN jsonb_build_object('ok', false, 'reason', 'ineligible_subscription');
+  END IF;
+
+  v_cap := CASE v_plan WHEN 'builder_beta' THEN 5 WHEN 'guided_builder' THEN 1 ELSE 0 END;
+
+  -- Lock active projects and count under the lock.
+  PERFORM 1 FROM public.qhub_project_entitlements WHERE org_id = p_org_id FOR UPDATE;
+  SELECT count(*) INTO v_active FROM public.qhub_project_entitlements WHERE org_id = p_org_id AND active;
+
+  IF v_active >= v_cap THEN
+    RETURN jsonb_build_object('ok', false, 'reason', 'project_limit_reached');
+  END IF;
+
+  v_pid := gen_random_uuid();
+  INSERT INTO public.qhub_project_entitlements (project_id, org_id, created_by, plan_id, active)
+  VALUES (v_pid, p_org_id, p_created_by, v_plan, true);
+
+  INSERT INTO public.qhub_entitlement_audit (org_id, actor, change_type, after_state, reason)
+  VALUES (p_org_id, p_created_by, 'PROJECT_CREATE',
+          jsonb_build_object('project_id', v_pid::text, 'idempotency_key', p_idempotency_key), p_request_hash);
+
+  RETURN jsonb_build_object('ok', true, 'idempotent', false, 'project_id', v_pid::text);
+END;
+$$;
+
 -- ─── RLS: RESTRICTIVE service-only on every commercial table ─────────────────
 DO $$
 DECLARE
@@ -657,8 +957,16 @@ REVOKE ALL ON FUNCTION public.qhub_consume_build_credit(UUID, TEXT, TEXT, INTEGE
 GRANT EXECUTE ON FUNCTION public.qhub_consume_build_credit(UUID, TEXT, TEXT, INTEGER) TO service_role;
 REVOKE ALL ON FUNCTION public.qhub_claim_webhook_event(TEXT, TEXT, TEXT, BOOLEAN, TEXT, BIGINT, TEXT, TEXT, INTEGER) FROM PUBLIC, anon, authenticated;
 GRANT EXECUTE ON FUNCTION public.qhub_claim_webhook_event(TEXT, TEXT, TEXT, BOOLEAN, TEXT, BIGINT, TEXT, TEXT, INTEGER) TO service_role;
-REVOKE ALL ON FUNCTION public.qhub_accept_invitation(UUID, TEXT, INTEGER) FROM PUBLIC, anon, authenticated;
-GRANT EXECUTE ON FUNCTION public.qhub_accept_invitation(UUID, TEXT, INTEGER) TO service_role;
+REVOKE ALL ON FUNCTION public.qhub_accept_invitation(UUID, TEXT, TEXT, TEXT) FROM PUBLIC, anon, authenticated;
+GRANT EXECUTE ON FUNCTION public.qhub_accept_invitation(UUID, TEXT, TEXT, TEXT) TO service_role;
+REVOKE ALL ON FUNCTION public.qhub_mark_webhook_state(TEXT, TEXT, TEXT, TEXT, TEXT) FROM PUBLIC, anon, authenticated;
+GRANT EXECUTE ON FUNCTION public.qhub_mark_webhook_state(TEXT, TEXT, TEXT, TEXT, TEXT) TO service_role;
+REVOKE ALL ON FUNCTION public.qhub_reconcile_checkout(TEXT, TEXT, TEXT, UUID, TEXT, TEXT, TEXT, TEXT, BOOLEAN, TEXT, TEXT, TEXT, BIGINT, BIGINT) FROM PUBLIC, anon, authenticated;
+GRANT EXECUTE ON FUNCTION public.qhub_reconcile_checkout(TEXT, TEXT, TEXT, UUID, TEXT, TEXT, TEXT, TEXT, BOOLEAN, TEXT, TEXT, TEXT, BIGINT, BIGINT) TO service_role;
+REVOKE ALL ON FUNCTION public.qhub_decide_review(UUID, TEXT, BOOLEAN, TEXT, TEXT, TEXT) FROM PUBLIC, anon, authenticated;
+GRANT EXECUTE ON FUNCTION public.qhub_decide_review(UUID, TEXT, BOOLEAN, TEXT, TEXT, TEXT) TO service_role;
+REVOKE ALL ON FUNCTION public.qhub_create_project(TEXT, TEXT, TEXT, TEXT) FROM PUBLIC, anon, authenticated;
+GRANT EXECUTE ON FUNCTION public.qhub_create_project(TEXT, TEXT, TEXT, TEXT) TO service_role;
 REVOKE ALL ON FUNCTION public.qhub_consume_checkout_intent(UUID, TEXT, TEXT, TEXT, TEXT, TEXT, TEXT, TEXT) FROM PUBLIC, anon, authenticated;
 GRANT EXECUTE ON FUNCTION public.qhub_consume_checkout_intent(UUID, TEXT, TEXT, TEXT, TEXT, TEXT, TEXT, TEXT) TO service_role;
 
@@ -818,13 +1126,67 @@ BEGIN
       AND p.prosecdef AND p.proconfig @> ARRAY['search_path=pg_catalog, public'];
   IF NOT FOUND THEN v_failed := v_failed || 'checkout_consume_rpc_contract'::text; END IF;
 
-  IF has_function_privilege('anon','public.qhub_accept_invitation(uuid,text,integer)','EXECUTE')
-     OR has_function_privilege('authenticated','public.qhub_accept_invitation(uuid,text,integer)','EXECUTE') THEN
+  IF has_function_privilege('anon','public.qhub_accept_invitation(uuid,text,text,text)','EXECUTE')
+     OR has_function_privilege('authenticated','public.qhub_accept_invitation(uuid,text,text,text)','EXECUTE') THEN
     v_failed := v_failed || 'seat_rpc_browser_exec'::text;
   END IF;
 
+  -- R4: seat RPC must NOT accept a caller-supplied cap (identity + plan-derived cap).
+  IF EXISTS (
+    SELECT 1 FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace
+    WHERE n.nspname='public' AND p.proname='qhub_accept_invitation'
+      AND pg_get_function_identity_arguments(p.oid) = 'p_invitation_id uuid, p_user_id text, p_max_seats integer'
+  ) THEN
+    v_failed := v_failed || 'seat_rpc_caller_cap'::text;
+  END IF;
+
+  -- R4 atomic RPC contracts: each exists, SECURITY DEFINER, fixed search_path,
+  -- and is denied to browser roles.
+  PERFORM 1 FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace
+    WHERE n.nspname='public' AND p.proname='qhub_reconcile_checkout'
+      AND p.prosecdef AND p.proconfig @> ARRAY['search_path=pg_catalog, public'] AND p.prorettype='jsonb'::regtype;
+  IF NOT FOUND THEN v_failed := v_failed || 'reconcile_rpc_contract'::text; END IF;
+
+  PERFORM 1 FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace
+    WHERE n.nspname='public' AND p.proname='qhub_decide_review'
+      AND p.prosecdef AND p.proconfig @> ARRAY['search_path=pg_catalog, public'] AND p.prorettype='jsonb'::regtype;
+  IF NOT FOUND THEN v_failed := v_failed || 'review_rpc_contract'::text; END IF;
+
+  PERFORM 1 FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace
+    WHERE n.nspname='public' AND p.proname='qhub_create_project'
+      AND p.prosecdef AND p.proconfig @> ARRAY['search_path=pg_catalog, public'] AND p.prorettype='jsonb'::regtype;
+  IF NOT FOUND THEN v_failed := v_failed || 'project_rpc_contract'::text; END IF;
+
+  PERFORM 1 FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace
+    WHERE n.nspname='public' AND p.proname='qhub_mark_webhook_state'
+      AND p.prosecdef AND p.proconfig @> ARRAY['search_path=pg_catalog, public'];
+  IF NOT FOUND THEN v_failed := v_failed || 'lease_mark_rpc_contract'::text; END IF;
+
+  IF has_function_privilege('anon','public.qhub_reconcile_checkout(text,text,text,uuid,text,text,text,text,boolean,text,text,text,bigint,bigint)','EXECUTE')
+     OR has_function_privilege('anon','public.qhub_decide_review(uuid,text,boolean,text,text,text)','EXECUTE')
+     OR has_function_privilege('anon','public.qhub_create_project(text,text,text,text)','EXECUTE') THEN
+    v_failed := v_failed || 'r4_rpc_browser_exec'::text;
+  END IF;
+
+  -- Immutable review-decision audit (append-only qhub_entitlement_audit).
+  IF NOT EXISTS (SELECT 1 FROM pg_trigger WHERE tgname='trg_qhub_entitlement_audit_immutable'
+                   AND tgrelid='public.qhub_entitlement_audit'::regclass) THEN
+    v_failed := v_failed || 'review_audit_immutable'::text;
+  END IF;
+
+  -- Checkout intent must carry the Checkout Session + setup-price contract fields.
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_attribute WHERE attrelid='public.qhub_checkout_intents'::regclass
+      AND attname='checkout_session_id' AND NOT attisdropped
+  ) OR NOT EXISTS (
+    SELECT 1 FROM pg_attribute WHERE attrelid='public.qhub_checkout_intents'::regclass
+      AND attname='expected_setup_price_id' AND NOT attisdropped
+  ) THEN
+    v_failed := v_failed || 'checkout_session_setup_contract'::text;
+  END IF;
+
   RETURN jsonb_build_object(
-    'expected_version', '2026-07-30.commercial-launch-r3',
+    'expected_version', '2026-07-30.commercial-launch-r4',
     'ready', (cardinality(v_failed) = 0),
     'failed', to_jsonb(v_failed)
   );

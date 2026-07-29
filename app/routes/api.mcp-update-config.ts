@@ -1,10 +1,20 @@
 import { type ActionFunctionArgs } from '@remix-run/cloudflare';
+import { requireStaff } from '~/lib/qhub/commercial/commercial-context.server';
 import { createScopedLogger } from '~/utils/logger';
 import { MCPService, type MCPConfig } from '~/lib/services/mcpService';
 
 const logger = createScopedLogger('api.mcp-update-config');
 
-export async function action({ request }: ActionFunctionArgs) {
+export async function action({ request, context }: ActionFunctionArgs) {
+  const _g = await requireStaff(
+    request,
+    (context?.cloudflare?.env as unknown as Record<string, string | undefined>) ?? {},
+  );
+
+  if (!_g.ok) {
+    return _g.response;
+  }
+
   try {
     const mcpConfig = (await request.json()) as MCPConfig;
 

@@ -1,4 +1,5 @@
 import { type ActionFunctionArgs, type LoaderFunctionArgs, json } from '@remix-run/cloudflare';
+import { requireStaff } from '~/lib/qhub/commercial/commercial-context.server';
 import type { VercelProjectInfo } from '~/types/vercel';
 
 // Function to detect framework from project files
@@ -173,7 +174,16 @@ const detectFramework = (files: Record<string, string>): string => {
 };
 
 // Add loader function to handle GET requests
-export async function loader({ request }: LoaderFunctionArgs) {
+export async function loader({ request, context }: LoaderFunctionArgs) {
+  const _g = await requireStaff(
+    request,
+    (context?.cloudflare?.env as unknown as Record<string, string | undefined>) ?? {},
+  );
+
+  if (!_g.ok) {
+    return _g.response;
+  }
+
   const url = new URL(request.url);
   const projectId = url.searchParams.get('projectId');
   const token = url.searchParams.get('token');
@@ -240,7 +250,16 @@ interface DeployRequestBody {
 }
 
 // Existing action function for POST requests
-export async function action({ request }: ActionFunctionArgs) {
+export async function action({ request, context }: ActionFunctionArgs) {
+  const _g = await requireStaff(
+    request,
+    (context?.cloudflare?.env as unknown as Record<string, string | undefined>) ?? {},
+  );
+
+  if (!_g.ok) {
+    return _g.response;
+  }
+
   try {
     const { projectId, files, sourceFiles, token, chatId, framework } = (await request.json()) as DeployRequestBody & {
       token: string;

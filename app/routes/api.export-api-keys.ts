@@ -1,44 +1,41 @@
-import type { LoaderFunction } from '@remix-run/cloudflare';
+/**
+ * QHUB Commercial Launch R4 — GET /api/export-api-keys  (STAFF-ONLY, no secrets)
+ * app/routes/api.export-api-keys.ts
+ *
+ * SECURITY: this route previously returned server environment API-key VALUES to the
+ * browser. R4 removes that capability entirely. It is Quantex-STAFF-ONLY and returns
+ * ONLY the configured provider NAMES and a boolean "configured" status — never any
+ * key value from the environment or cookies.
+ */
+
+import { json, type LoaderFunctionArgs } from '@remix-run/cloudflare';
+import { requireStaff } from '~/lib/qhub/commercial/commercial-context.server';
 import { LLMManager } from '~/lib/modules/llm/manager';
-import { getApiKeysFromCookie } from '~/lib/api/cookies';
 
-export const loader: LoaderFunction = async ({ context, request }) => {
-  // Get API keys from cookie
-  const cookieHeader = request.headers.get('Cookie');
-  const apiKeysFromCookie = getApiKeysFromCookie(cookieHeader);
+export async function loader({ context, request }: LoaderFunctionArgs) {
+  const env = (context?.cloudflare?.env as unknown as Record<string, string | undefined>) ?? {};
+  const guard = await requireStaff(request, env);
 
-  // Initialize the LLM manager to access environment variables
-  const llmManager = LLMManager.getInstance(context?.cloudflare?.env as any);
-
-  // Get all provider instances to find their API token keys
-  const providers = llmManager.getAllProviders();
-
-  // Create a comprehensive API keys object
-  const apiKeys: Record<string, string> = { ...apiKeysFromCookie };
-
-  // For each provider, check all possible sources for API keys
-  for (const provider of providers) {
-    if (!provider.config.apiTokenKey) {
-      continue;
-    }
-
-    const envVarName = provider.config.apiTokenKey;
-
-    // Skip if we already have this provider's key from cookies
-    if (apiKeys[provider.name]) {
-      continue;
-    }
-
-    // Check environment variables in order of precedence
-    const envValue =
-      (context?.cloudflare?.env as Record<string, any>)?.[envVarName] ||
-      process.env[envVarName] ||
-      llmManager.env[envVarName];
-
-    if (envValue) {
-      apiKeys[provider.name] = envValue;
-    }
+  if (!guard.ok) {
+    return guard.response;
   }
 
-  return Response.json(apiKeys);
-};
+  const llmManager = LLMManager.getInstance(context?.cloudflare?.env as never);
+  const providers = llmManager.getAllProviders();
+
+  // NON-SECRET status only: provider name + whether a key is configured server-side.
+  const configured = providers
+    .filter((p) => p.config.apiTokenKey)
+    .map((p) => {
+      const name = p.config.apiTokenKey as string;
+      const present = !!(
+        (context?.cloudflare?.env as unknown as Record<string, unknown>)?.[name] ||
+        process.env[name] ||
+        llmManager.env[name]
+      );
+
+      return { provider: p.name, configured: present };
+    });
+
+  return json({ providers: configured });
+}

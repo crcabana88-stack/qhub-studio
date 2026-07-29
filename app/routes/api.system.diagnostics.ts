@@ -1,7 +1,9 @@
 import { json, type LoaderFunction, type LoaderFunctionArgs } from '@remix-run/cloudflare';
+import { requireStaff } from '~/lib/qhub/commercial/commercial-context.server';
 
 /**
- * Diagnostic API for troubleshooting connection issues
+ * Diagnostic API for troubleshooting connection issues. R4: STAFF-ONLY — it reveals
+ * server-side token presence and system internals.
  */
 
 interface AppContext {
@@ -12,6 +14,14 @@ interface AppContext {
 }
 
 export const loader: LoaderFunction = async ({ request, context }: LoaderFunctionArgs & { context: AppContext }) => {
+  const guardEnv =
+    ((context as { cloudflare?: { env?: unknown } })?.cloudflare?.env as Record<string, string | undefined>) ?? {};
+  const guard = await requireStaff(request, guardEnv);
+
+  if (!guard.ok) {
+    return guard.response;
+  }
+
   // Get environment variables
   const envVars = {
     hasGithubToken: Boolean(process.env.GITHUB_ACCESS_TOKEN || context.env?.GITHUB_ACCESS_TOKEN),

@@ -89,7 +89,7 @@ describe('commercial-launch R3 migration', () => {
       await db.exec(sql);
 
       const v = await verify(db);
-      expect(v.expected_version).toBe('2026-07-30.commercial-launch-r3');
+      expect(v.expected_version).toBe('2026-07-30.commercial-launch-r4');
       expect(v.failed).toEqual([]);
       expect(v.ready).toBe(true);
     } finally {
@@ -303,16 +303,32 @@ describe('commercial-launch R3 migration', () => {
 
       const i1 = '10000000-0000-0000-0000-000000000001';
       const i2 = '10000000-0000-0000-0000-000000000002';
+
+      // Builder Beta subscription → the RPC derives seat cap = 1 (never caller-supplied).
       await db.exec(`
+        insert into public.qhub_subscriptions (org_id, plan_id, status, provider)
+          values ('o1','builder_beta','active','stripe');
         insert into public.qhub_org_invitations (id, org_id, email, role, token_hash, expires_at)
-          values ('${i1}','o1','a@x.com','builder','t', now()+interval '1 day'),
-                 ('${i2}','o1','b@x.com','builder','t', now()+interval '1 day');
+          values ('${i1}','o1','a@x.com','builder','tok1', now()+interval '1 day'),
+                 ('${i2}','o1','b@x.com','builder','tok2', now()+interval '1 day');
       `);
 
-      const a1 = await db.query<{ s: string }>(`select public.qhub_accept_invitation('${i1}','u1',1) s`);
+      // Wrong email / wrong token are rejected.
+      const em = await db.query<{ s: string }>(
+        `select public.qhub_accept_invitation('${i1}','u1','WRONG@x.com','tok1') s`,
+      );
+      expect(em.rows[0].s).toBe('EMAIL_MISMATCH');
+
+      const tk = await db.query<{ s: string }>(
+        `select public.qhub_accept_invitation('${i1}','u1','a@x.com','WRONG') s`,
+      );
+      expect(tk.rows[0].s).toBe('TOKEN_MISMATCH');
+
+      const a1 = await db.query<{ s: string }>(`select public.qhub_accept_invitation('${i1}','u1','a@x.com','tok1') s`);
       expect(a1.rows[0].s).toBe('ACCEPTED');
 
-      const a2 = await db.query<{ s: string }>(`select public.qhub_accept_invitation('${i2}','u2',1) s`);
+      // Plan-derived cap = 1 → the second acceptance is rejected (no caller cap).
+      const a2 = await db.query<{ s: string }>(`select public.qhub_accept_invitation('${i2}','u2','b@x.com','tok2') s`);
       expect(a2.rows[0].s).toBe('SEAT_LIMIT');
 
       const n = await db.query<{ c: number }>(
@@ -397,11 +413,200 @@ describe('commercial-launch R3 migration', () => {
 
     try {
       await db.exec(sql);
-      await db.exec(`GRANT EXECUTE ON FUNCTION public.qhub_accept_invitation(uuid,text,integer) TO anon`);
+      await db.exec(`GRANT EXECUTE ON FUNCTION public.qhub_accept_invitation(uuid,text,text,text) TO anon`);
 
       const v = await verify(db);
       expect(v.ready).toBe(false);
       expect(v.failed).toContain('seat_rpc_browser_exec');
+    } finally {
+      await db.close();
+    }
+  });
+
+  it('atomic checkout reconciliation: lease-bound, binds + consumes + PROCESSED in one txn', async () => {
+    const db = await freshDb();
+
+    try {
+      await db.exec(sql);
+
+      const iid = '30000000-0000-0000-0000-000000000001';
+      await db.exec(`
+        insert into public.qhub_billing_webhook_events (provider, provider_event_id, event_type, state, processing_owner, claimed_at, lease_expires_at, attempt_count)
+          values ('stripe','evt_r','checkout.session.completed','PROCESSING','worker_a', now(), now()+interval '5 min', 1);
+        insert into public.qhub_checkout_intents (id, org_id, requested_by, plan_id, expected_recurring_price_id, expected_mode, expected_app_origin, idempotency_key, nonce, expires_at)
+          values ('${iid}','o1','u1','builder_beta','price_r','test','https://x','k','n', now()+interval '10 min');
+      `);
+
+      // Wrong owner → lease_lost, nothing mutated.
+      const bad = await db.query<{ v: { ok: boolean; reason: string } }>(
+        `select public.qhub_reconcile_checkout('stripe','evt_r','worker_B','${iid}','sess','cus','sub','price_r',false,'test',null,'active',123,100) v`,
+      );
+      expect(bad.rows[0].v.reason).toBe('lease_lost');
+
+      // Correct owner → binds customer+subscription, consumes intent, marks PROCESSED.
+      const ok = await db.query<{ v: { ok: boolean; org: string } }>(
+        `select public.qhub_reconcile_checkout('stripe','evt_r','worker_a','${iid}','sess','cus','sub','price_r',false,'test',null,'active',123,100) v`,
+      );
+      expect(ok.rows[0].v.ok).toBe(true);
+      expect(ok.rows[0].v.org).toBe('o1');
+
+      const sub = await db.query<{ status: string; sid: string }>(
+        `select status, provider_subscription_id sid from public.qhub_subscriptions where org_id='o1'`,
+      );
+      expect(sub.rows[0].status).toBe('active');
+      expect(sub.rows[0].sid).toBe('sub');
+
+      const ev = await db.query<{ state: string }>(
+        `select state from public.qhub_billing_webhook_events where provider_event_id='evt_r'`,
+      );
+      expect(ev.rows[0].state).toBe('PROCESSED');
+
+      const it = await db.query<{ status: string }>(
+        `select status from public.qhub_checkout_intents where id='${iid}'`,
+      );
+      expect(it.rows[0].status).toBe('consumed');
+
+      // Exact replay is idempotent.
+      const replay = await db.query<{ v: { ok: boolean; idempotent: boolean } }>(
+        `select public.qhub_reconcile_checkout('stripe','evt_r','worker_a','${iid}','sess','cus','sub','price_r',false,'test',null,'active',123,100) v`,
+      );
+      expect(replay.rows[0].v.idempotent).toBe(true);
+    } finally {
+      await db.close();
+    }
+  });
+
+  it('atomic checkout reconciliation: Guided requires the setup line + rejects binding mismatch', async () => {
+    const db = await freshDb();
+
+    try {
+      await db.exec(sql);
+
+      const iid = '30000000-0000-0000-0000-000000000002';
+      await db.exec(`
+        insert into public.qhub_billing_webhook_events (provider, provider_event_id, event_type, state, processing_owner, lease_expires_at)
+          values ('stripe','evt_g','checkout.session.completed','PROCESSING','w', now()+interval '5 min');
+        insert into public.qhub_checkout_intents (id, org_id, requested_by, plan_id, expected_recurring_price_id, expected_mode, expected_app_origin, idempotency_key, nonce, expires_at)
+          values ('${iid}','o2','u1','guided_builder','price_g','test','https://x','k','n', now()+interval '10 min');
+      `);
+
+      // Guided with setup line missing → binding_mismatch.
+      const miss = await db.query<{ v: { ok: boolean; reason: string } }>(
+        `select public.qhub_reconcile_checkout('stripe','evt_g','w','${iid}','sess','cus','sub','price_g',false,'test',null,'active',1,1) v`,
+      );
+      expect(miss.rows[0].v.reason).toBe('binding_mismatch');
+
+      const it = await db.query<{ status: string }>(
+        `select status from public.qhub_checkout_intents where id='${iid}'`,
+      );
+      expect(it.rows[0].status).toBe('failed');
+    } finally {
+      await db.close();
+    }
+  });
+
+  it('atomic review decision: updates request + governance + immutable audit in one txn', async () => {
+    const db = await freshDb();
+
+    try {
+      await db.exec(sql);
+
+      const rid = '40000000-0000-0000-0000-000000000001';
+      const pid = '50000000-0000-0000-0000-000000000001';
+      await db.exec(`
+        insert into public.qhub_project_entitlements (project_id, org_id, plan_id, active) values ('${pid}','o1','builder_beta', true);
+        insert into public.qhub_governance_essentials (project_id, org_id, disposition, review_state) values ('${pid}','o1','manual_review','requested');
+        insert into public.qhub_quantex_staff (user_id, staff_role, active) values ('staff1','reviewer', true);
+        insert into public.qhub_manual_review_requests (id, org_id, project_id, request_type, category, reason, request_hash, status)
+          values ('${rid}','o1','${pid}','data_review','personal','sensitive','h','pending');
+      `);
+
+      const nonStaff = await db.query<{ v: { ok: boolean; reason: string } }>(
+        `select public.qhub_decide_review('${rid}','u1',false,'approved','ok','v1') v`,
+      );
+      expect(nonStaff.rows[0].v.reason).toBe('staff_required');
+
+      const ok = await db.query<{ v: { ok: boolean } }>(
+        `select public.qhub_decide_review('${rid}','staff1',true,'approved','looks fine','v1') v`,
+      );
+      expect(ok.rows[0].v.ok).toBe(true);
+
+      const req = await db.query<{ status: string }>(
+        `select status from public.qhub_manual_review_requests where id='${rid}'`,
+      );
+      expect(req.rows[0].status).toBe('approved');
+
+      const gov = await db.query<{ rs: string }>(
+        `select review_state rs from public.qhub_governance_essentials where project_id='${pid}'`,
+      );
+      expect(gov.rows[0].rs).toBe('approved');
+
+      const aud = await db.query<{ n: number }>(
+        `select count(*)::int n from public.qhub_entitlement_audit where change_type='REVIEW_DECISION'`,
+      );
+      expect(aud.rows[0].n).toBe(1);
+
+      // Exact repeat is idempotent; the audit row is immutable.
+      const rep = await db.query<{ v: { idempotent: boolean } }>(
+        `select public.qhub_decide_review('${rid}','staff1',true,'approved','looks fine','v1') v`,
+      );
+      expect(rep.rows[0].v.idempotent).toBe(true);
+      await expect(db.exec(`update public.qhub_entitlement_audit set reason='x'`)).rejects.toThrow(/immutable/);
+    } finally {
+      await db.close();
+    }
+  });
+
+  it('atomic project creation: transactional cap + idempotency', async () => {
+    const db = await freshDb();
+
+    try {
+      await db.exec(sql);
+      await db.exec(
+        `insert into public.qhub_subscriptions (org_id, plan_id, status, provider) values ('o1','guided_builder','active','stripe')`,
+      );
+
+      const p1 = await db.query<{ v: { ok: boolean; project_id: string } }>(
+        `select public.qhub_create_project('o1','u1','k1','h1') v`,
+      );
+      expect(p1.rows[0].v.ok).toBe(true);
+
+      // Guided cap = 1 → the second (different key) is rejected.
+      const p2 = await db.query<{ v: { ok: boolean; reason: string } }>(
+        `select public.qhub_create_project('o1','u1','k2','h2') v`,
+      );
+      expect(p2.rows[0].v.reason).toBe('project_limit_reached');
+
+      // Exact idempotent retry returns the same project.
+      const retry = await db.query<{ v: { idempotent: boolean; project_id: string } }>(
+        `select public.qhub_create_project('o1','u1','k1','h1') v`,
+      );
+      expect(retry.rows[0].v.idempotent).toBe(true);
+      expect(retry.rows[0].v.project_id).toBe(p1.rows[0].v.project_id);
+
+      // Changed hash under the same key fails.
+      const conflict = await db.query<{ v: { ok: boolean; reason: string } }>(
+        `select public.qhub_create_project('o1','u1','k1','DIFFERENT') v`,
+      );
+      expect(conflict.rows[0].v.reason).toBe('idempotency_conflict');
+    } finally {
+      await db.close();
+    }
+  });
+
+  it('verifier fails when a caller-supplied-cap seat RPC is reintroduced', async () => {
+    const db = await freshDb();
+
+    try {
+      await db.exec(sql);
+
+      // Reintroduce the old (caller-cap) overload alongside the R4 one.
+      await db.exec(`CREATE FUNCTION public.qhub_accept_invitation(p_invitation_id uuid, p_user_id text, p_max_seats integer)
+                     RETURNS text LANGUAGE sql AS $f$ SELECT 'X' $f$`);
+
+      const v = await verify(db);
+      expect(v.ready).toBe(false);
+      expect(v.failed).toContain('seat_rpc_caller_cap');
     } finally {
       await db.close();
     }

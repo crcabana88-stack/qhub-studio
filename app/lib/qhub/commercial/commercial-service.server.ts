@@ -135,8 +135,9 @@ export async function invokeCommercialModel<T>(
 
 export async function createCommercialProject(
   ctx: CommercialExecutionContext | Omit<CommercialExecutionContext, 'projectId' | 'projectOrgId'>,
+  input: { idempotencyKey: string; requestHash: string },
   env: Record<string, string | undefined>,
-): Promise<ServiceOutcome<{ projectId: string }>> {
+): Promise<ServiceOutcome<{ projectId: string; idempotent?: boolean }>> {
   if (!ctx.capabilities || !hasCapability(ctx.capabilities, 'PROJECT_CREATE')) {
     return { ok: false, reason: 'capability_denied' };
   }
@@ -145,22 +146,21 @@ export async function createCommercialProject(
     return { ok: false, reason: 'no_org_context' };
   }
 
-  const { createProjectEntitlement } = await import('~/lib/qhub/commercial/commercial-store.server');
-  const created = await createProjectEntitlement(
-    {
-      orgId: ctx.orgId,
-      createdBy: ctx.userId,
-      planId: ctx.resolved.planId,
-      maxProjects: ctx.resolved.entitlements.maxProjects,
-    },
+  /*
+   * ONE atomic RPC: derives + locks org/subscription/active-count, enforces the plan
+   * cap and idempotency, inserts project + entitlement, appends audit — all-or-nothing.
+   */
+  const { createProjectAtomic } = await import('~/lib/qhub/commercial/commercial-store.server');
+  const created = await createProjectAtomic(
+    { orgId: ctx.orgId, createdBy: ctx.userId, idempotencyKey: input.idempotencyKey, requestHash: input.requestHash },
     env,
   );
 
-  if (!created.ok) {
-    return { ok: false, reason: created.reason };
+  if (!created.ok || !created.project_id) {
+    return { ok: false, reason: created.reason ?? 'create_failed' };
   }
 
-  return { ok: true, value: { projectId: created.projectId } };
+  return { ok: true, value: { projectId: created.project_id, idempotent: created.idempotent } };
 }
 
 export function exportCommercialProject(ctx: CommercialExecutionContext): ServiceOutcome<{ projectId: string }> {

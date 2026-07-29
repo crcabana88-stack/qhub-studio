@@ -1,3 +1,4 @@
+// @qhub-boundary: SIGNATURE_AUTH — authenticated by the verified Stripe signature (raw-byte HMAC), not a user session.
 /**
  * QHUB Commercial Launch R2 — POST /api/billing/webhook
  * app/routes/api.billing.webhook.ts
@@ -22,11 +23,9 @@ import { createBillingProvider, planIdForConfiguredPrice } from '~/lib/qhub/comm
 import {
   applySubscriptionEvent,
   claimWebhookEvent,
-  consumeCheckoutIntent,
-  getCheckoutIntent,
   getOrgByCustomer,
+  reconcileCheckout,
   setWebhookState,
-  upsertBillingCustomer,
 } from '~/lib/qhub/commercial/commercial-store.server';
 import type { NormalizedBillingEvent } from '~/lib/qhub/commercial/billing/billing-provider';
 import type { SubscriptionStatus } from '~/lib/qhub/commercial/entitlements.server';
@@ -58,7 +57,8 @@ export async function action({ request, context }: ActionFunctionArgs) {
 
   const event = verified.event;
 
-  // 2. Atomically claim (idempotency + state machine).
+  // 2. Atomically claim/reclaim the lease (idempotency + crash recovery).
+  const owner = crypto.randomUUID(); // this worker's lease owner
   const payloadHash = await sha256Hex(rawBody);
   const claim = await claimWebhookEvent(
     {
@@ -69,7 +69,7 @@ export async function action({ request, context }: ActionFunctionArgs) {
       account: event.stripeAccount ?? null,
       eventCreated: event.eventCreated,
       payloadHash,
-      owner: crypto.randomUUID(), // this worker's lease owner
+      owner,
       leaseSeconds: 120,
     },
     env,
@@ -83,10 +83,20 @@ export async function action({ request, context }: ActionFunctionArgs) {
     return json({ received: true, inProgress: true });
   }
 
-  // 3 + 4. Reconcile + apply.
+  /*
+   * 3 + 4. Reconcile. checkout.completed goes through the ONE atomic reconciliation
+   * RPC (which marks PROCESSED itself); other events mutate then mark PROCESSED via
+   * the lease-bound transition.
+   */
   try {
-    await reconcileAndApply(event, provider, env);
-    await setWebhookState({ provider: provider.id, providerEventId: event.providerEventId, state: 'PROCESSED' }, env);
+    const handledInRpc = await reconcileAndApply(event, provider, env, owner);
+
+    if (!handledInRpc) {
+      await setWebhookState(
+        { provider: provider.id, providerEventId: event.providerEventId, owner, state: 'PROCESSED' },
+        env,
+      );
+    }
 
     return json({ received: true });
   } catch (err) {
@@ -95,11 +105,12 @@ export async function action({ request, context }: ActionFunctionArgs) {
         {
           provider: provider.id,
           providerEventId: event.providerEventId,
+          owner,
           state: 'FAILED_PERMANENT',
           errorCode: err.message,
         },
         env,
-      );
+      ).catch(() => undefined);
 
       // Acknowledge (200) — a permanently invalid event must not be retried forever.
       return json({ received: true, rejected: err.message });
@@ -110,11 +121,12 @@ export async function action({ request, context }: ActionFunctionArgs) {
       {
         provider: provider.id,
         providerEventId: event.providerEventId,
+        owner,
         state: 'FAILED_RETRYABLE',
         errorCode: 'transient',
       },
       env,
-    );
+    ).catch(() => undefined);
 
     return json({ ok: false, error: 'processing_failed' }, { status: 500 });
   }
@@ -124,7 +136,8 @@ async function reconcileAndApply(
   event: NormalizedBillingEvent,
   provider: ReturnType<typeof createBillingProvider>,
   env: Record<string, string | undefined>,
-): Promise<void> {
+  owner: string,
+): Promise<boolean> {
   // Deletion / payment failure: no reactivation possible; apply a downgrade only.
   if (event.type === 'subscription.deleted' || event.type === 'invoice.payment_failed') {
     const status: SubscriptionStatus = event.type === 'subscription.deleted' ? 'canceled' : 'past_due';
@@ -154,78 +167,62 @@ async function reconcileAndApply(
       env,
     );
 
-    return;
+    return false;
   }
 
   /*
-   * checkout.completed: the tenant comes ONLY from the opaque checkout intent —
-   * never from metadata. Retrieve + validate the authoritative Stripe subscription,
-   * then load and CONSUME the intent (which validates org/price/mode/account) and
-   * bind the customer/subscription to the intent's org.
+   * checkout.completed: the tenant comes ONLY from the opaque checkout intent. After
+   * retrieving + validating the authoritative Stripe subscription and the Checkout
+   * Session line items (for the Guided setup price), the ENTIRE reconciliation —
+   * intent validation/consume, customer+subscription binding, normalized state, and
+   * event PROCESSED — happens in ONE atomic RPC bound to this worker's lease.
    */
   if (event.type === 'checkout.completed') {
-    if (!event.checkoutIntentId) {
+    if (!event.checkoutIntentId || !event.checkoutSessionId) {
       throw new PermanentError('missing_checkout_intent');
     }
 
     const sub = await retrieveValidSubscription(event, provider);
-    const intent = await getCheckoutIntent(event.checkoutIntentId, env);
 
-    if (!intent) {
-      throw new PermanentError('unknown_checkout_intent');
+    // Independently confirm the Guided one-time setup price on the Session.
+    const setupPriceId = env.STRIPE_PRICE_GUIDED_BUILDER_SETUP ?? process.env.STRIPE_PRICE_GUIDED_BUILDER_SETUP ?? '';
+    const lines = await provider.retrieveCheckoutSessionPriceIds(event.checkoutSessionId);
+
+    if (!lines.ok) {
+      throw new Error(lines.error); // transient
     }
 
-    const consume = await consumeCheckoutIntent(
+    const setupPresent = !!setupPriceId && lines.value.includes(setupPriceId);
+
+    const result = await reconcileCheckout(
       {
+        provider: provider.id,
+        eventId: event.providerEventId,
+        owner,
         intentId: event.checkoutIntentId,
-        orgId: intent.orgId,
-        recurringPriceId: sub.priceId as string,
-        mode: sub.livemode ? 'live' : 'test',
-        account: event.stripeAccount ?? null,
-        sessionId: event.providerSubscriptionId ?? '',
+        sessionId: event.checkoutSessionId,
         customerId: sub.customerId,
         subscriptionId: sub.id,
-      },
-      env,
-    );
-
-    if (consume === 'ALREADY') {
-      return; // exact replay — already bound this subscription
-    }
-
-    if (consume !== 'CONSUMED') {
-      throw new PermanentError(`checkout_intent_${consume.toLowerCase()}`);
-    }
-
-    await upsertBillingCustomer(
-      {
-        orgId: intent.orgId,
-        provider: provider.id,
-        providerCustomerId: sub.customerId,
-        email: '',
-        livemode: sub.livemode,
-        stripeAccount: event.stripeAccount,
-      },
-      env,
-    );
-    await applySubscriptionEvent(
-      {
-        orgId: intent.orgId,
-        planId: (planIdForConfiguredPrice(sub.priceId as string, env) ?? intent.planId) as never,
+        recurringPrice: sub.priceId as string,
+        setupPresent,
+        mode: sub.livemode ? 'live' : 'test',
+        account: event.stripeAccount ?? null,
         status: sub.status,
-        provider: provider.id,
-        providerCustomerId: sub.customerId,
-        providerSubscriptionId: sub.id,
-        providerPriceId: sub.priceId ?? undefined,
-        currentPeriodEnd: sub.currentPeriodEnd ?? undefined,
+        currentPeriodEnd: sub.currentPeriodEnd,
         eventCreated: event.eventCreated,
-        livemode: sub.livemode,
-        stripeAccount: event.stripeAccount,
       },
       env,
     );
 
-    return;
+    if (result.ok) {
+      return true; // the RPC marked the event PROCESSED atomically
+    }
+
+    if (result.reason === 'lease_lost') {
+      return true; // another worker owns this event — do not mutate
+    }
+
+    throw new PermanentError(result.reason ?? 'reconcile_failed');
   }
 
   /*
@@ -257,13 +254,14 @@ async function reconcileAndApply(
       env,
     );
 
-    return;
+    return false;
   }
 
   /*
    * invoice.paid / unknown: nothing to apply (paid does not itself reactivate —
    * subscription.updated carries the authoritative active state).
    */
+  return false;
 }
 
 /** Retrieve + validate the authoritative Stripe subscription (mode/customer/price). */

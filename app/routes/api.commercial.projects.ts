@@ -10,7 +10,7 @@
 import { json, type ActionFunctionArgs } from '@remix-run/cloudflare';
 import { requireCommercialContext } from '~/lib/qhub/commercial/commercial-context.server';
 import { createCommercialProject } from '~/lib/qhub/commercial/commercial-service.server';
-import { checkRateLimit, isSameOrigin } from '~/lib/qhub/commercial/request-guards.server';
+import { checkRateLimit, isSameOrigin, readBoundedJson } from '~/lib/qhub/commercial/request-guards.server';
 
 export async function action({ request, context }: ActionFunctionArgs) {
   if (request.method !== 'POST') {
@@ -37,11 +37,23 @@ export async function action({ request, context }: ActionFunctionArgs) {
     return json({ ok: false, error: 'rate_limited' }, { status: 429 });
   }
 
-  const created = await createCommercialProject(ctx, env);
+  let body: { idempotencyKey?: string; requestHash?: string };
+
+  try {
+    body = await readBoundedJson(request, 2048);
+  } catch (e) {
+    return json({ ok: false, error: e instanceof Error ? e.message : 'invalid_json' }, { status: 400 });
+  }
+
+  const idempotencyKey =
+    typeof body.idempotencyKey === 'string' && body.idempotencyKey ? body.idempotencyKey : crypto.randomUUID();
+  const requestHash = typeof body.requestHash === 'string' && body.requestHash ? body.requestHash : idempotencyKey;
+
+  const created = await createCommercialProject(ctx, { idempotencyKey, requestHash }, env);
 
   if (!created.ok) {
     return json({ ok: false, error: created.reason }, { status: 409 });
   }
 
-  return json({ ok: true, projectId: created.value.projectId });
+  return json({ ok: true, projectId: created.value.projectId, idempotent: created.value.idempotent });
 }

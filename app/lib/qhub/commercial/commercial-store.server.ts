@@ -191,20 +191,28 @@ export async function claimWebhookEvent(
   return (data as WebhookClaim) ?? 'IN_PROGRESS';
 }
 
+/**
+ * Lease-bound webhook state transition: only the current processing_owner (with a
+ * non-expired lease) may mutate the event. Returns 'OK' | 'LEASE_LOST'.
+ */
 export async function setWebhookState(
-  input: { provider: string; providerEventId: string; state: string; errorCode?: string },
+  input: { provider: string; providerEventId: string; owner: string; state: string; errorCode?: string },
   env: Record<string, string | undefined>,
-): Promise<void> {
+): Promise<'OK' | 'LEASE_LOST'> {
   const sb = admin(env);
-  await sb
-    .from('qhub_billing_webhook_events')
-    .update({
-      state: input.state,
-      last_error_code: input.errorCode ?? null,
-      processed_at: input.state === 'PROCESSED' ? new Date().toISOString() : null,
-    })
-    .eq('provider', input.provider)
-    .eq('provider_event_id', input.providerEventId);
+  const { data, error } = await sb.rpc('qhub_mark_webhook_state', {
+    p_provider: input.provider,
+    p_event_id: input.providerEventId,
+    p_owner: input.owner,
+    p_state: input.state,
+    p_error_code: input.errorCode ?? null,
+  });
+
+  if (error) {
+    throw new Error(`[Webhook] mark state failed: ${error.message}`);
+  }
+
+  return (data as 'OK' | 'LEASE_LOST') ?? 'LEASE_LOST';
 }
 
 /**
@@ -690,18 +698,30 @@ export async function createInvitation(
   return { ok: true, invitationId: data.id as string };
 }
 
-export type AcceptResult = 'ACCEPTED' | 'SEAT_LIMIT' | 'INVALID' | 'ALREADY';
+export type AcceptResult =
+  | 'ACCEPTED'
+  | 'SEAT_LIMIT'
+  | 'INVALID'
+  | 'EMAIL_MISMATCH'
+  | 'TOKEN_MISMATCH'
+  | 'INELIGIBLE'
+  | 'ALREADY';
 
-/** Transactionally accept an invitation under the plan seat cap via the guarded RPC. */
+/**
+ * Transactionally accept an invitation via the guarded RPC. The caller supplies NO
+ * seat cap — the RPC verifies the recipient email + token and derives the plan +
+ * seat cap from the org's authoritative active subscription under a lock.
+ */
 export async function acceptInvitation(
-  input: { invitationId: string; userId: string; maxSeats: number },
+  input: { invitationId: string; userId: string; userEmail: string; tokenHash: string },
   env: Record<string, string | undefined>,
 ): Promise<AcceptResult> {
   const sb = admin(env);
   const { data, error } = await sb.rpc('qhub_accept_invitation', {
     p_invitation_id: input.invitationId,
     p_user_id: input.userId,
-    p_max_seats: input.maxSeats,
+    p_user_email: input.userEmail,
+    p_token_hash: input.tokenHash,
   });
 
   if (error) {
@@ -709,6 +729,108 @@ export async function acceptInvitation(
   }
 
   return (data as AcceptResult) ?? 'INVALID';
+}
+
+export interface RpcResult {
+  ok: boolean;
+  reason?: string;
+  idempotent?: boolean;
+  org?: string;
+  project_id?: string;
+}
+
+/** ONE atomic checkout reconciliation (lease-bound; binds+consumes+PROCESSED together). */
+export async function reconcileCheckout(
+  input: {
+    provider: string;
+    eventId: string;
+    owner: string;
+    intentId: string;
+    sessionId: string;
+    customerId: string;
+    subscriptionId: string;
+    recurringPrice: string;
+    setupPresent: boolean;
+    mode: string;
+    account: string | null;
+    status: string;
+    currentPeriodEnd: number | null;
+    eventCreated: number;
+  },
+  env: Record<string, string | undefined>,
+): Promise<RpcResult> {
+  const sb = admin(env);
+  const { data, error } = await sb.rpc('qhub_reconcile_checkout', {
+    p_provider: input.provider,
+    p_event_id: input.eventId,
+    p_owner: input.owner,
+    p_intent_id: input.intentId,
+    p_session_id: input.sessionId,
+    p_customer_id: input.customerId,
+    p_subscription_id: input.subscriptionId,
+    p_recurring_price: input.recurringPrice,
+    p_setup_present: input.setupPresent,
+    p_mode: input.mode,
+    p_account: input.account,
+    p_status: input.status,
+    p_current_period_end: input.currentPeriodEnd,
+    p_event_created: input.eventCreated,
+  });
+
+  if (error) {
+    throw new Error(`[Checkout] reconcile failed: ${error.message}`);
+  }
+
+  return (data as RpcResult) ?? { ok: false, reason: 'rpc_error' };
+}
+
+/** ONE atomic review decision (request + governance + immutable audit). */
+export async function decideReviewAtomic(
+  input: {
+    requestId: string;
+    actor: string;
+    isStaff: boolean;
+    decision: string;
+    reason: string;
+    policyVersion: string;
+  },
+  env: Record<string, string | undefined>,
+): Promise<RpcResult> {
+  const sb = admin(env);
+  const { data, error } = await sb.rpc('qhub_decide_review', {
+    p_request_id: input.requestId,
+    p_actor: input.actor,
+    p_is_staff: input.isStaff,
+    p_decision: input.decision,
+    p_reason: input.reason,
+    p_policy_version: input.policyVersion,
+  });
+
+  if (error) {
+    throw new Error(`[Review] decide failed: ${error.message}`);
+  }
+
+  return (data as RpcResult) ?? { ok: false, reason: 'rpc_error' };
+}
+
+/** ONE atomic project creation with transactional cap + idempotency. */
+export async function createProjectAtomic(
+  input: { orgId: string; createdBy: string; idempotencyKey: string; requestHash: string },
+  env: Record<string, string | undefined>,
+): Promise<RpcResult> {
+  const sb = admin(env);
+  const { data, error } = await sb.rpc('qhub_create_project', {
+    p_org_id: input.orgId,
+    p_created_by: input.createdBy,
+    p_idempotency_key: input.idempotencyKey,
+    p_request_hash: input.requestHash,
+  });
+
+  if (error) {
+    throw new Error(`[Project] create failed: ${error.message}`);
+  }
+
+  return (data as RpcResult) ?? { ok: false, reason: 'rpc_error' };
 }
 
 /** Load a checkout intent's authoritative org + bound expectations (or null). */

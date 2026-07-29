@@ -11,8 +11,7 @@
 
 import { json, type ActionFunctionArgs } from '@remix-run/cloudflare';
 import { getVerifiedUser } from '~/lib/auth/session';
-import { acceptInvitation, getInvitationOrg } from '~/lib/qhub/commercial/commercial-store.server';
-import { loadOrgEntitlements } from '~/lib/qhub/commercial/entitlements.server';
+import { acceptInvitation } from '~/lib/qhub/commercial/commercial-store.server';
 import { checkRateLimit, isSameOrigin, readBoundedJson } from '~/lib/qhub/commercial/request-guards.server';
 
 export async function action({ request, context }: ActionFunctionArgs) {
@@ -42,7 +41,7 @@ export async function action({ request, context }: ActionFunctionArgs) {
     return json({ ok: false, error: 'rate_limited' }, { status: 429 });
   }
 
-  let body: { invitationId?: string };
+  let body: { invitationId?: string; token?: string };
 
   try {
     body = await readBoundedJson(request, 2048);
@@ -50,29 +49,38 @@ export async function action({ request, context }: ActionFunctionArgs) {
     return json({ ok: false, error: e instanceof Error ? e.message : 'invalid_json' }, { status: 400 });
   }
 
-  if (!body.invitationId) {
-    return json({ ok: false, error: 'missing_invitation' }, { status: 400 });
+  if (!body.invitationId || !body.token) {
+    return json({ ok: false, error: 'missing_invitation_or_token' }, { status: 400 });
   }
 
-  // Resolve the seat cap from the invitation's org plan (authoritative).
-  const org = await getInvitationOrg(body.invitationId, env);
+  // Hash the presented token the same way it was stored at invitation time.
+  const tokenHash = await sha256Hex(body.token);
 
-  if (!org) {
-    return json({ ok: false, error: 'invalid_invitation' }, { status: 404 });
-  }
+  /*
+   * The RPC verifies email + token and derives the plan-based seat cap internally —
+   * the caller supplies NO seat cap.
+   */
+  const result = await acceptInvitation(
+    { invitationId: body.invitationId, userId: user.userId, userEmail: user.email, tokenHash },
+    env,
+  );
 
-  const resolved = await loadOrgEntitlements(org, env);
-  const maxSeats = resolved.entitlements.seats;
+  const map: Record<string, number> = {
+    SEAT_LIMIT: 409,
+    INELIGIBLE: 402,
+    EMAIL_MISMATCH: 403,
+    TOKEN_MISMATCH: 403,
+    INVALID: 400,
+  };
 
-  const result = await acceptInvitation({ invitationId: body.invitationId, userId: user.userId, maxSeats }, env);
-
-  if (result === 'SEAT_LIMIT') {
-    return json({ ok: false, error: 'seat_limit_reached' }, { status: 409 });
-  }
-
-  if (result === 'INVALID') {
-    return json({ ok: false, error: 'invalid_invitation' }, { status: 400 });
+  if (result !== 'ACCEPTED' && result !== 'ALREADY') {
+    return json({ ok: false, error: result.toLowerCase() }, { status: map[result] ?? 400 });
   }
 
   return json({ ok: true, result });
+}
+
+async function sha256Hex(s: string): Promise<string> {
+  const buf = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(s));
+  return [...new Uint8Array(buf)].map((b) => b.toString(16).padStart(2, '0')).join('');
 }

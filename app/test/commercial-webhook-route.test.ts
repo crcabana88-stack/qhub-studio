@@ -16,8 +16,8 @@ const H = vi.hoisted(() => ({
   upsertCustomer: vi.fn(),
   verify: vi.fn(),
   retrieve: vi.fn(),
-  getIntent: vi.fn(),
-  consumeIntent: vi.fn(),
+  reconcile: vi.fn(),
+  lines: vi.fn(),
 }));
 
 vi.mock('~/lib/qhub/commercial/billing/stripe-provider.server', () => ({
@@ -30,8 +30,7 @@ vi.mock('~/lib/qhub/commercial/commercial-store.server', () => ({
   getOrgByCustomer: H.getOrgByCustomer,
   setWebhookState: H.setState,
   upsertBillingCustomer: H.upsertCustomer,
-  getCheckoutIntent: H.getIntent,
-  consumeCheckoutIntent: H.consumeIntent,
+  reconcileCheckout: H.reconcile,
 }));
 
 import { action } from '~/routes/api.billing.webhook';
@@ -59,6 +58,7 @@ function provider() {
     expectedLivemode: () => false,
     isConfiguredPrice: (p: string) => p === 'price_ok',
     retrieveSubscription: H.retrieve,
+    retrieveCheckoutSessionPriceIds: H.lines,
     verifyAndParseWebhook: H.verify,
   };
 }
@@ -99,14 +99,8 @@ beforeEach(() => {
     },
   });
   H.getOrgByCustomer.mockResolvedValue('org_1');
-  H.getIntent.mockResolvedValue({
-    orgId: 'org_1',
-    planId: 'builder_beta',
-    recurringPriceId: 'price_ok',
-    mode: 'test',
-    account: null,
-  });
-  H.consumeIntent.mockResolvedValue('CONSUMED');
+  H.lines.mockResolvedValue({ ok: true, value: ['price_ok'] });
+  H.reconcile.mockResolvedValue({ ok: true, idempotent: false, org: 'org_1' });
 });
 
 describe('webhook verification failures', () => {
@@ -229,19 +223,28 @@ describe('authoritative reconciliation', () => {
     expect(res.status).toBe(200);
   });
 
-  it('checkout.completed binds the tenant ONLY via the consumed checkout intent', async () => {
-    verifyOk(evt({ type: 'checkout.completed', rawType: 'checkout.session.completed', checkoutIntentId: 'intent_1' }));
+  const checkoutEvt = () =>
+    evt({
+      type: 'checkout.completed',
+      rawType: 'checkout.session.completed',
+      checkoutIntentId: 'intent_1',
+      checkoutSessionId: 'cs_1',
+    });
+
+  it('checkout.completed reconciles ONLY through the atomic reconcile RPC (which marks PROCESSED)', async () => {
+    verifyOk(checkoutEvt());
     H.claim.mockResolvedValue('CLAIMED');
 
     const res = (await action(req())) as Response;
     expect(res.status).toBe(200);
-    expect(H.getIntent).toHaveBeenCalledWith('intent_1', expect.anything());
-    expect(H.consumeIntent).toHaveBeenCalledTimes(1);
-    expect(H.apply).toHaveBeenCalledWith(expect.objectContaining({ orgId: 'org_1' }), expect.anything());
-    expect(H.setState).toHaveBeenCalledWith(expect.objectContaining({ state: 'PROCESSED' }), expect.anything());
+    expect(H.reconcile).toHaveBeenCalledTimes(1);
+    expect(H.reconcile.mock.calls[0][0]).toMatchObject({ intentId: 'intent_1', sessionId: 'cs_1' });
+
+    // The RPC marks PROCESSED atomically — the handler must NOT double-mark.
+    expect(H.setState).not.toHaveBeenCalled();
   });
 
-  it('checkout.completed without an intent id is a permanent failure', async () => {
+  it('checkout.completed without an intent/session id is a permanent failure', async () => {
     verifyOk(evt({ type: 'checkout.completed', rawType: 'checkout.session.completed', checkoutIntentId: undefined }));
     H.claim.mockResolvedValue('CLAIMED');
 
@@ -250,32 +253,31 @@ describe('authoritative reconciliation', () => {
       expect.objectContaining({ state: 'FAILED_PERMANENT', errorCode: 'missing_checkout_intent' }),
       expect.anything(),
     );
+    expect(H.reconcile).not.toHaveBeenCalled();
     expect(res.status).toBe(200);
   });
 
-  it('checkout.completed rejects an intent binding mismatch permanently', async () => {
-    verifyOk(evt({ type: 'checkout.completed', rawType: 'checkout.session.completed', checkoutIntentId: 'intent_1' }));
+  it('checkout.completed reconcile binding mismatch fails permanently', async () => {
+    verifyOk(checkoutEvt());
     H.claim.mockResolvedValue('CLAIMED');
-    H.consumeIntent.mockResolvedValue('MISMATCH');
+    H.reconcile.mockResolvedValue({ ok: false, reason: 'binding_mismatch' });
 
     const res = (await action(req())) as Response;
     expect(H.setState).toHaveBeenCalledWith(
-      expect.objectContaining({ state: 'FAILED_PERMANENT', errorCode: 'checkout_intent_mismatch' }),
+      expect.objectContaining({ state: 'FAILED_PERMANENT', errorCode: 'binding_mismatch' }),
       expect.anything(),
     );
-    expect(H.apply).not.toHaveBeenCalled();
     expect(res.status).toBe(200);
   });
 
-  it('checkout.completed exact replay (ALREADY) is idempotent', async () => {
-    verifyOk(evt({ type: 'checkout.completed', rawType: 'checkout.session.completed', checkoutIntentId: 'intent_1' }));
+  it('checkout.completed lease_lost is a no-op (another worker owns it)', async () => {
+    verifyOk(checkoutEvt());
     H.claim.mockResolvedValue('CLAIMED');
-    H.consumeIntent.mockResolvedValue('ALREADY');
+    H.reconcile.mockResolvedValue({ ok: false, reason: 'lease_lost' });
 
     const res = (await action(req())) as Response;
     expect(res.status).toBe(200);
-    expect(H.apply).not.toHaveBeenCalled();
-    expect(H.setState).toHaveBeenCalledWith(expect.objectContaining({ state: 'PROCESSED' }), expect.anything());
+    expect(H.setState).not.toHaveBeenCalled();
   });
 
   it('stays retryable (500) on a transient Stripe retrieval error', async () => {
