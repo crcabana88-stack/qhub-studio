@@ -1,3 +1,4 @@
+// @qhub-route: COMMERCIAL_READY
 /**
  * QHUB Commercial Launch R2 — POST /api/billing/checkout
  * app/routes/api.billing.checkout.ts
@@ -100,6 +101,7 @@ export async function action({ request, context }: ActionFunctionArgs) {
   const idempotencyKey =
     typeof body.idempotencyKey === 'string' && body.idempotencyKey ? body.idempotencyKey : crypto.randomUUID();
   const intent = await createCheckoutIntent(
+    ready.token,
     {
       orgId: ctx.orgId,
       requestedBy: ctx.userId,

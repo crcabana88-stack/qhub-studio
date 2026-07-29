@@ -1,3 +1,4 @@
+// @qhub-route: COMMERCIAL_READY
 /**
  * QHUB Commercial Launch R2 — POST /api/billing/portal
  * app/routes/api.billing.portal.ts

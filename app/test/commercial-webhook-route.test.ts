@@ -39,7 +39,10 @@ vi.mock('~/lib/qhub/commercial/commercial-schema-check.server', () => ({
   requireCommercialReady: H.requireReady,
 }));
 
-const READY_GATE = { ok: true } as const;
+const READY_GATE = {
+  ok: true,
+  token: { schemaVersion: '2026-07-30.commercial-launch-r4', targetKey: 't', checkedAt: '0' },
+} as const;
 const NOT_READY_GATE = {
   ok: false,
   response: new Response(JSON.stringify({ ok: false, error: 'commercial_unavailable' }), { status: 500 }),
@@ -209,7 +212,11 @@ describe('authoritative reconciliation', () => {
     expect(res.status).toBe(200);
     expect(H.retrieve).toHaveBeenCalledWith('sub_1');
     expect(H.apply).toHaveBeenCalledTimes(1);
-    expect(H.setState).toHaveBeenCalledWith(expect.objectContaining({ state: 'PROCESSED' }), expect.anything());
+    expect(H.setState).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({ state: 'PROCESSED' }),
+      expect.anything(),
+    );
   });
 
   it('rejects an unknown price permanently (FAILED_PERMANENT, 200)', async () => {
@@ -232,6 +239,7 @@ describe('authoritative reconciliation', () => {
     expect(res.status).toBe(200);
     expect(H.apply).not.toHaveBeenCalled();
     expect(H.setState).toHaveBeenCalledWith(
+      expect.anything(),
       expect.objectContaining({ state: 'FAILED_PERMANENT', errorCode: 'unknown_price' }),
       expect.anything(),
     );
@@ -255,6 +263,7 @@ describe('authoritative reconciliation', () => {
 
     const res = (await action(req())) as Response;
     expect(H.setState).toHaveBeenCalledWith(
+      expect.anything(),
       expect.objectContaining({ state: 'FAILED_PERMANENT', errorCode: 'customer_mismatch' }),
       expect.anything(),
     );
@@ -268,6 +277,7 @@ describe('authoritative reconciliation', () => {
 
     const res = (await action(req())) as Response;
     expect(H.setState).toHaveBeenCalledWith(
+      expect.anything(),
       expect.objectContaining({ state: 'FAILED_PERMANENT', errorCode: 'unknown_customer' }),
       expect.anything(),
     );
@@ -289,7 +299,7 @@ describe('authoritative reconciliation', () => {
     const res = (await action(req())) as Response;
     expect(res.status).toBe(200);
     expect(H.reconcile).toHaveBeenCalledTimes(1);
-    expect(H.reconcile.mock.calls[0][0]).toMatchObject({ intentId: 'intent_1', sessionId: 'cs_1' });
+    expect(H.reconcile.mock.calls[0][1]).toMatchObject({ intentId: 'intent_1', sessionId: 'cs_1' });
 
     // The RPC marks PROCESSED atomically — the handler must NOT double-mark.
     expect(H.setState).not.toHaveBeenCalled();
@@ -301,6 +311,7 @@ describe('authoritative reconciliation', () => {
 
     const res = (await action(req())) as Response;
     expect(H.setState).toHaveBeenCalledWith(
+      expect.anything(),
       expect.objectContaining({ state: 'FAILED_PERMANENT', errorCode: 'missing_checkout_intent' }),
       expect.anything(),
     );
@@ -315,6 +326,7 @@ describe('authoritative reconciliation', () => {
 
     const res = (await action(req())) as Response;
     expect(H.setState).toHaveBeenCalledWith(
+      expect.anything(),
       expect.objectContaining({ state: 'FAILED_PERMANENT', errorCode: 'binding_mismatch' }),
       expect.anything(),
     );
@@ -338,7 +350,11 @@ describe('authoritative reconciliation', () => {
 
     const res = (await action(req())) as Response;
     expect(res.status).toBe(500);
-    expect(H.setState).toHaveBeenCalledWith(expect.objectContaining({ state: 'FAILED_RETRYABLE' }), expect.anything());
+    expect(H.setState).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({ state: 'FAILED_RETRYABLE' }),
+      expect.anything(),
+    );
   });
 
   it('ignores a stale out-of-order event without error', async () => {
@@ -348,7 +364,11 @@ describe('authoritative reconciliation', () => {
 
     const res = (await action(req())) as Response;
     expect(res.status).toBe(200);
-    expect(H.setState).toHaveBeenCalledWith(expect.objectContaining({ state: 'PROCESSED' }), expect.anything());
+    expect(H.setState).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({ state: 'PROCESSED' }),
+      expect.anything(),
+    );
   });
 
   it('applies a cancellation for subscription.deleted', async () => {
@@ -357,7 +377,11 @@ describe('authoritative reconciliation', () => {
 
     const res = (await action(req())) as Response;
     expect(res.status).toBe(200);
-    expect(H.apply).toHaveBeenCalledWith(expect.objectContaining({ status: 'canceled' }), expect.anything());
+    expect(H.apply).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({ status: 'canceled' }),
+      expect.anything(),
+    );
     expect(H.retrieve).not.toHaveBeenCalled();
   });
 });

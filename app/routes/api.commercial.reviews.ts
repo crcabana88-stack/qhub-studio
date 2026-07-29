@@ -1,3 +1,4 @@
+// @qhub-route: COMMERCIAL_READY
 /**
  * QHUB Commercial Launch R3 — POST /api/commercial/reviews  (customer submit)
  * app/routes/api.commercial.reviews.ts
@@ -62,6 +63,7 @@ export async function action({ request, context }: ActionFunctionArgs) {
   const result = await createReviewRequest(
     ctx,
     { projectId: body.projectId, category: body.category, reason: body.reason },
+    ready.token,
     env,
   );
 

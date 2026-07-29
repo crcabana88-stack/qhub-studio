@@ -1,3 +1,4 @@
+// @qhub-route: COMMERCIAL_READY
 /**
  * QHUB Commercial Launch R3 — POST /api/commercial/invitations/accept
  * app/routes/api.commercial.invitations.accept.ts
@@ -69,6 +70,7 @@ export async function action({ request, context }: ActionFunctionArgs) {
    * the caller supplies NO seat cap.
    */
   const result = await acceptInvitation(
+    ready.token,
     { invitationId: body.invitationId, userId: user.userId, userEmail: user.email, tokenHash },
     env,
   );

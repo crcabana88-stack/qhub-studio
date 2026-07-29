@@ -1,3 +1,4 @@
+// @qhub-route: COMMERCIAL_READY
 /**
  * QHUB Commercial Launch R3 — POST /api/commercial/projects
  * app/routes/api.commercial.projects.ts
@@ -57,7 +58,7 @@ export async function action({ request, context }: ActionFunctionArgs) {
     typeof body.idempotencyKey === 'string' && body.idempotencyKey ? body.idempotencyKey : crypto.randomUUID();
   const requestHash = typeof body.requestHash === 'string' && body.requestHash ? body.requestHash : idempotencyKey;
 
-  const created = await createCommercialProject(ctx, { idempotencyKey, requestHash }, env);
+  const created = await createCommercialProject(ctx, { idempotencyKey, requestHash }, ready.token, env);
 
   if (!created.ok) {
     return json({ ok: false, error: created.reason }, { status: 409 });

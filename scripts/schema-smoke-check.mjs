@@ -14,8 +14,9 @@
  *     SUPABASE_SERVICE_ROLE_KEY
  *   from process.env, falling back to .env.local / .env in the repo root.
  *
- * Overrides:
- *     QHUB_SKIP_SCHEMA_CHECK=1   skip the gate (emergency escape hatch)
+ * Overrides (LOCAL TEST ONLY — never staging/production):
+ *     QHUB_LOCAL_TEST_SCHEMA_BYPASS=1  + NODE_ENV=test + non-staging/prod QHUB_DEPLOY_ENV
+ *     (a bypass attempt against any deployed target exits nonzero — no staging/prod skip)
  *
  * Output is NON-SECRET: project ref (public) + host only, never keys.
  *
@@ -69,29 +70,47 @@ const REQUIRED_SCHEMA_OBJECTS = [
 const SCHEMA_MISSING_CODES = new Set(['PGRST205', 'PGRST204', '42P01', '42703']);
 
 /**
- * Staging-only predeploy bypass. Mirror of isDeployBypassAuthorized() in
- * app/lib/qhub/schema-contract.ts — KEEP IN SYNC. Requires the skip flag AND a
- * staging marker; an explicit production marker always refuses.
+ * LOCAL-TEST-ONLY predeploy bypass. There is NO staging or production skip: staging and
+ * production ALWAYS run every verifier family. A bypass is authorized ONLY for a local
+ * test process — it requires the explicit test-only flag QHUB_LOCAL_TEST_SCHEMA_BYPASS=1,
+ * NODE_ENV=test, and a deploy environment that is neither staging nor production. Any
+ * bypass ATTEMPT against a deployed target (or without the test conditions) is refused
+ * with a nonzero exit.
  * @param {Record<string,string|undefined>} env
- * @returns {{allowed:boolean, reason:string}}
+ * @returns {{attempted:boolean, allowed:boolean, reason:string}}
  */
-function deployBypassDecision(env) {
-  if (env.QHUB_SKIP_SCHEMA_CHECK !== '1') {
-    return { allowed: false, reason: 'no-skip-flag' };
+function localTestBypassDecision(env) {
+  /*
+   * The legacy QHUB_SKIP_SCHEMA_CHECK is honored ONLY as a bypass ATTEMPT (never allowed
+   * on its own) so a stale staging/prod skip is turned into a hard failure, not a skip.
+   */
+  const attempted = env.QHUB_LOCAL_TEST_SCHEMA_BYPASS === '1' || env.QHUB_SKIP_SCHEMA_CHECK === '1';
+
+  if (!attempted) {
+    return { attempted: false, allowed: false, reason: 'no-flag' };
   }
 
   const deployEnv = (env.QHUB_DEPLOY_ENV ?? '').toLowerCase();
   const flyApp = (env.FLY_APP_NAME ?? '').toLowerCase();
+  const isDeployedTarget =
+    deployEnv === 'staging' ||
+    deployEnv === 'preview' ||
+    deployEnv === 'production' ||
+    deployEnv === 'prod' ||
+    flyApp.includes('staging') ||
+    flyApp.includes('prod');
 
-  if (deployEnv === 'production' || deployEnv === 'prod' || flyApp.includes('prod')) {
-    return { allowed: false, reason: 'production-never-bypasses' };
+  if (isDeployedTarget) {
+    return { attempted: true, allowed: false, reason: 'deployed-target-never-bypasses' };
   }
 
-  if (deployEnv === 'staging' || deployEnv === 'preview' || flyApp.includes('staging')) {
-    return { allowed: true, reason: 'authorized-staging-bypass' };
+  const isLocalTest = (env.NODE_ENV ?? '').toLowerCase() === 'test' && env.QHUB_LOCAL_TEST_SCHEMA_BYPASS === '1';
+
+  if (!isLocalTest) {
+    return { attempted: true, allowed: false, reason: 'local-test-only-requires-node-env-test-and-explicit-flag' };
   }
 
-  return { allowed: false, reason: 'no-staging-marker' };
+  return { attempted: true, allowed: true, reason: 'authorized-local-test-bypass' };
 }
 
 // ─── Minimal .env loader (no dependency) ──────────────────────────────────────
@@ -283,21 +302,27 @@ async function verifyCommercial(url, serviceKey) {
 async function main() {
   loadDotenv();
 
-  if (process.env.QHUB_SKIP_SCHEMA_CHECK === '1') {
-    const decision = deployBypassDecision(process.env);
+  const bypass = localTestBypassDecision(process.env);
 
-    if (decision.allowed) {
+  if (bypass.attempted) {
+    if (bypass.allowed) {
       console.warn(
-        `[schema-smoke-check] SKIPPED — authorized staging bypass (QHUB_DEPLOY_ENV=${process.env.QHUB_DEPLOY_ENV ?? ''} FLY_APP_NAME=${process.env.FLY_APP_NAME ?? ''}). Runtime enforcement is unaffected.`,
+        '[schema-smoke-check] SKIPPED — authorized LOCAL TEST bypass ' +
+          `(NODE_ENV=test, QHUB_LOCAL_TEST_SCHEMA_BYPASS=1, QHUB_DEPLOY_ENV=${process.env.QHUB_DEPLOY_ENV ?? ''}). ` +
+          'This is never honored for staging or production.',
       );
       process.exit(0);
     }
 
+    /*
+     * A bypass ATTEMPT against a deployed target (or without local-test conditions) is a
+     * hard failure — staging and production can NEVER skip the schema verifiers.
+     */
     console.error(
-      `[schema-smoke-check] FAIL: QHUB_SKIP_SCHEMA_CHECK=1 refused (${decision.reason}). ` +
-        'The predeploy bypass is honored ONLY in an authorized staging context ' +
-        '(set QHUB_DEPLOY_ENV=staging, or a FLY_APP_NAME containing "staging"). ' +
-        'Production deploys can never skip the schema check.',
+      `[schema-smoke-check] FAIL: schema-check bypass refused (${bypass.reason}). ` +
+        'Staging and production always run Gate 01–05, Agent Foundation, and Commercial R4 ' +
+        'verifiers. A bypass is honored ONLY for a local test process ' +
+        '(NODE_ENV=test + QHUB_LOCAL_TEST_SCHEMA_BYPASS=1 + a non-staging/non-production QHUB_DEPLOY_ENV).',
     );
     process.exit(1);
   }
@@ -308,7 +333,7 @@ async function main() {
   if (!url || !serviceKey) {
     console.error(
       '[schema-smoke-check] FAIL: SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY are required to verify the target ' +
-        'project before deploy. Set them, or (staging only) skip with QHUB_SKIP_SCHEMA_CHECK=1 + QHUB_DEPLOY_ENV=staging.',
+        'project before deploy. There is no staging or production skip — set them.',
     );
     process.exit(1);
   }

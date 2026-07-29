@@ -17,6 +17,13 @@ import {
   buildEvidenceExport,
   type GovernanceRecord,
 } from '~/lib/qhub/commercial/governance-essentials.server';
+import { testReadyToken } from '~/test/helpers/commercial-ready-token';
+
+/*
+ * These tests only exercise pre-DB guard branches (they return before any write), so a
+ * nominal token is enough to satisfy the signature.
+ */
+const TOKEN = testReadyToken({});
 
 function ctx(over: Partial<CommercialContext> = {}): CommercialContext {
   return {
@@ -39,20 +46,21 @@ const ENV = {}; // never reached in these pre-DB branches
 
 describe('manual review authority (pre-DB guards)', () => {
   it('rejects prohibited categories from the queue', async () => {
-    const r = await createReviewRequest(ctx(), { category: 'mnpi', reason: 'x' }, ENV);
+    const r = await createReviewRequest(ctx(), { category: 'mnpi', reason: 'x' }, TOKEN, ENV);
     expect(r.ok).toBe(false);
     expect(r.ok === false && r.error).toBe('prohibited_category');
   });
 
   it('rejects non-review-eligible categories', async () => {
-    const r = await createReviewRequest(ctx(), { category: 'public', reason: 'x' }, ENV);
+    const r = await createReviewRequest(ctx(), { category: 'public', reason: 'x' }, TOKEN, ENV);
     expect(r.ok === false && r.error).toBe('not_review_eligible');
   });
 
   it('a non-staff caller cannot decide a review', async () => {
     const r = await decideReviewRequest(
       ctx({ isStaff: false }),
-      { requestId: 'r1', decision: 'approved', reason: 'ok', policyVersion: 'v1' },
+      { requestId: 'r1', decision: 'approved', reason: 'ok' },
+      TOKEN,
       ENV,
     );
     expect(r.ok === false && r.error).toBe('staff_required');
@@ -62,6 +70,7 @@ describe('manual review authority (pre-DB guards)', () => {
     const r = await setStaffOverride(
       ctx({ isStaff: false }),
       { orgId: 'org1', reason: 'x', startsAt: 'now', endsAt: 'later' },
+      TOKEN,
       ENV,
     );
     expect(r.ok === false && r.error).toBe('staff_required');

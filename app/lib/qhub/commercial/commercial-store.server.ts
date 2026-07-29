@@ -7,11 +7,22 @@
  * manual review, entitlement audit). All billing writes go through here; the anon/
  * authenticated roles hold no grants (see the migration's RESTRICTIVE RLS).
  *
+ * NON-BYPASSABLE READINESS: every EXPORTED mutation requires a branded
+ * CommercialReadyToken and obtains its privileged client ONLY through mutator(token,env),
+ * which re-validates the token against the current target BEFORE any write. The token
+ * can be produced only by the central readiness service after an exact READY result, so
+ * no mutation can run against an unmigrated / wrong / stale target. Pure reads use
+ * admin(env) directly and are classified INTERNAL_SERVER_ONLY.
+ *
+ * Each exported function is tagged `@qhub-service: <classification>` for the executable
+ * architecture test (commercial-architecture.test.ts).
+ *
  * SECRETS: SUPABASE_URL + SUPABASE_SERVICE_ROLE_KEY, read at call time, never
  * logged. Absent → throws (fail closed).
  */
 
 import { createClient, type SupabaseClient } from '@supabase/supabase-js';
+import { assertReadyToken, type CommercialReadyToken } from '~/lib/qhub/commercial/commercial-schema-check.server';
 import type { ManualOverrides, SubscriptionStatus } from '~/lib/qhub/commercial/entitlements.server';
 import type { PlanId } from '~/lib/qhub/commercial/plans';
 import { currentUsagePeriod, needsReset } from '~/lib/qhub/commercial/usage';
@@ -27,6 +38,18 @@ function admin(env: Record<string, string | undefined>): SupabaseClient {
   return createClient(url, key, { auth: { persistSession: false } });
 }
 
+/**
+ * Privileged client for MUTATIONS ONLY. Re-validates the readiness token against the
+ * current target (throws CommercialNotReadyError on any mismatch) BEFORE returning the
+ * service-role client — the single runtime choke-point that makes readiness
+ * non-bypassable at the store boundary.
+ */
+function mutator(token: CommercialReadyToken, env: Record<string, string | undefined>): SupabaseClient {
+  assertReadyToken(token, env);
+
+  return admin(env);
+}
+
 // ─── Subscription snapshot ──────────────────────────────────────────────────────
 
 export interface SubscriptionSnapshot {
@@ -38,7 +61,10 @@ export interface SubscriptionSnapshot {
   currentPeriodEnd?: number;
 }
 
-/** The active/most-recent subscription for an org, or null when none. */
+/**
+ * @qhub-service: INTERNAL_SERVER_ONLY
+ * The active/most-recent subscription for an org, or null when none.
+ */
 export async function getSubscriptionSnapshot(
   orgId: string,
   env: Record<string, string | undefined>,
@@ -81,12 +107,16 @@ export interface UpsertSubscriptionInput {
   currentPeriodEnd?: number;
 }
 
-/** Upsert the subscription for an org (called from verified webhook processing). */
+/**
+ * @qhub-service: REQUIRES_COMMERCIAL_READY_TOKEN
+ * Upsert the subscription for an org (called from verified webhook processing).
+ */
 export async function upsertSubscription(
+  token: CommercialReadyToken,
   input: UpsertSubscriptionInput,
   env: Record<string, string | undefined>,
 ): Promise<void> {
-  const sb = admin(env);
+  const sb = mutator(token, env);
   await sb.from('qhub_subscriptions').upsert(
     {
       org_id: input.orgId,
@@ -102,7 +132,11 @@ export async function upsertSubscription(
   );
 }
 
+/**
+ * @qhub-service: REQUIRES_COMMERCIAL_READY_TOKEN
+ */
 export async function upsertBillingCustomer(
+  token: CommercialReadyToken,
   input: {
     orgId: string;
     provider: string;
@@ -113,7 +147,7 @@ export async function upsertBillingCustomer(
   },
   env: Record<string, string | undefined>,
 ): Promise<void> {
-  const sb = admin(env);
+  const sb = mutator(token, env);
   await sb.from('qhub_billing_customers').upsert(
     {
       org_id: input.orgId,
@@ -128,7 +162,10 @@ export async function upsertBillingCustomer(
   );
 }
 
-/** The authoritative org mapped to a provider customer id, or null. */
+/**
+ * @qhub-service: INTERNAL_SERVER_ONLY
+ * The authoritative org mapped to a provider customer id, or null.
+ */
 export async function getOrgByCustomer(
   provider: string,
   providerCustomerId: string,
@@ -150,6 +187,7 @@ export async function getOrgByCustomer(
 export type WebhookClaim = 'CLAIMED' | 'DUPLICATE' | 'IN_PROGRESS';
 
 /**
+ * @qhub-service: REQUIRES_COMMERCIAL_READY_TOKEN
  * Atomically claim a webhook event for processing via the guarded RPC. A NEW event
  * (or a retryable one) transitions to PROCESSING and returns CLAIMED; an already-
  * processed/permanently-failed event returns DUPLICATE; an in-flight one returns
@@ -157,6 +195,7 @@ export type WebhookClaim = 'CLAIMED' | 'DUPLICATE' | 'IN_PROGRESS';
  * transient failures throw and stay retryable.
  */
 export async function claimWebhookEvent(
+  token: CommercialReadyToken,
   input: {
     provider: string;
     providerEventId: string;
@@ -170,7 +209,7 @@ export async function claimWebhookEvent(
   },
   env: Record<string, string | undefined>,
 ): Promise<WebhookClaim> {
-  const sb = admin(env);
+  const sb = mutator(token, env);
   const { data, error } = await sb.rpc('qhub_claim_webhook_event', {
     p_provider: input.provider,
     p_event_id: input.providerEventId,
@@ -192,14 +231,16 @@ export async function claimWebhookEvent(
 }
 
 /**
+ * @qhub-service: REQUIRES_COMMERCIAL_READY_TOKEN
  * Lease-bound webhook state transition: only the current processing_owner (with a
  * non-expired lease) may mutate the event. Returns 'OK' | 'LEASE_LOST'.
  */
 export async function setWebhookState(
+  token: CommercialReadyToken,
   input: { provider: string; providerEventId: string; owner: string; state: string; errorCode?: string },
   env: Record<string, string | undefined>,
 ): Promise<'OK' | 'LEASE_LOST'> {
-  const sb = admin(env);
+  const sb = mutator(token, env);
   const { data, error } = await sb.rpc('qhub_mark_webhook_state', {
     p_provider: input.provider,
     p_event_id: input.providerEventId,
@@ -216,11 +257,13 @@ export async function setWebhookState(
 }
 
 /**
+ * @qhub-service: REQUIRES_COMMERCIAL_READY_TOKEN
  * Apply a reconciled subscription mutation with an out-of-order guard: an event
  * whose created time is not newer than the last applied one is ignored ('stale'),
  * so a delayed 'active' event can never resurrect a later 'canceled' state.
  */
 export async function applySubscriptionEvent(
+  token: CommercialReadyToken,
   input: UpsertSubscriptionInput & {
     eventCreated: number;
     providerPriceId?: string;
@@ -229,7 +272,7 @@ export async function applySubscriptionEvent(
   },
   env: Record<string, string | undefined>,
 ): Promise<'applied' | 'stale'> {
-  const sb = admin(env);
+  const sb = mutator(token, env);
   const { data: existing } = await sb
     .from('qhub_subscriptions')
     .select('last_event_created')
@@ -268,6 +311,9 @@ export async function applySubscriptionEvent(
 
 // ─── Counts (for seat/project limits) ────────────────────────────────────────────
 
+/**
+ * @qhub-service: INTERNAL_SERVER_ONLY
+ */
 export async function countProjects(orgId: string, env: Record<string, string | undefined>): Promise<number> {
   const sb = admin(env);
   const { count } = await sb
@@ -279,7 +325,10 @@ export async function countProjects(orgId: string, env: Record<string, string | 
   return count ?? 0;
 }
 
-/** The authoritative owning org of a project, or null when the project is unknown. */
+/**
+ * @qhub-service: INTERNAL_SERVER_ONLY
+ * The authoritative owning org of a project, or null when the project is unknown.
+ */
 export async function getProjectOwnership(
   projectId: string,
   env: Record<string, string | undefined>,
@@ -295,15 +344,17 @@ export async function getProjectOwnership(
 }
 
 /**
+ * @qhub-service: REQUIRES_COMMERCIAL_READY_TOKEN
  * Create a project transactionally under the plan's project cap (enforced by the
  * one-active-guided partial-unique index + an app-level active-count check for
  * Builder Beta). Returns the new project id or a reason.
  */
 export async function createProjectEntitlement(
+  token: CommercialReadyToken,
   input: { orgId: string; createdBy: string; planId: string; maxProjects: number },
   env: Record<string, string | undefined>,
 ): Promise<{ ok: true; projectId: string } | { ok: false; reason: string }> {
-  const sb = admin(env);
+  const sb = mutator(token, env);
   const active = await countProjects(input.orgId, env);
 
   if (active >= input.maxProjects) {
@@ -340,16 +391,19 @@ export interface UsageSnapshot {
 }
 
 /**
- * Fetch (or lazily create/reset) the current-period credit row for an org, using
- * the provided monthly allotment. Resets when the stored period is stale.
+ * @qhub-service: REQUIRES_COMMERCIAL_READY_TOKEN
+ * Fetch (or lazily create/reset) the current-period credit row for an org, using the
+ * provided monthly allotment. Resets when the stored period is stale (a write), so it
+ * requires the readiness token.
  */
 export async function getOrInitUsage(
+  token: CommercialReadyToken,
   orgId: string,
   monthlyAllotment: number,
   env: Record<string, string | undefined>,
   now: Date = new Date(),
 ): Promise<UsageSnapshot> {
-  const sb = admin(env);
+  const sb = mutator(token, env);
   const period = currentUsagePeriod(now);
 
   const { data } = await sb
@@ -392,6 +446,7 @@ export interface CreditResult {
 }
 
 /**
+ * @qhub-service: REQUIRES_COMMERCIAL_READY_TOKEN
  * Consume build credits atomically via the project-derived R3 RPC (single
  * transaction: derive org/ownership/eligibility → lock period → validate → idempotency
  * → decrement → append immutable ledger row). The RPC returns a structured result;
@@ -399,10 +454,11 @@ export interface CreditResult {
  * changed request under the same key is rejected, and overdraw is impossible.
  */
 export async function consumeBuildCredit(
+  token: CommercialReadyToken,
   input: { projectId: string; idempotencyKey: string; canonicalHash: string; units: number },
   env: Record<string, string | undefined>,
 ): Promise<CreditResult> {
-  const sb = admin(env);
+  const sb = mutator(token, env);
   const { data, error } = await sb.rpc('qhub_consume_build_credit', {
     p_project_id: input.projectId,
     p_idempotency_key: input.idempotencyKey,
@@ -417,11 +473,15 @@ export async function consumeBuildCredit(
   return data as CreditResult;
 }
 
+/**
+ * @qhub-service: REQUIRES_COMMERCIAL_READY_TOKEN
+ */
 export async function appendUsageLedger(
+  token: CommercialReadyToken,
   input: { orgId: string; eventType: string; creditsDelta: number; metadata?: Record<string, unknown> },
   env: Record<string, string | undefined>,
 ): Promise<void> {
-  const sb = admin(env);
+  const sb = mutator(token, env);
   await sb.from('qhub_usage_ledger').insert({
     org_id: input.orgId,
     event_type: input.eventType,
@@ -443,6 +503,9 @@ export interface OnboardingState {
   completed: boolean;
 }
 
+/**
+ * @qhub-service: INTERNAL_SERVER_ONLY
+ */
 export async function getOnboardingState(
   orgId: string,
   env: Record<string, string | undefined>,
@@ -471,11 +534,15 @@ export async function getOnboardingState(
   };
 }
 
+/**
+ * @qhub-service: REQUIRES_COMMERCIAL_READY_TOKEN
+ */
 export async function upsertOnboardingState(
+  token: CommercialReadyToken,
   state: OnboardingState,
   env: Record<string, string | undefined>,
 ): Promise<void> {
-  const sb = admin(env);
+  const sb = mutator(token, env);
   await sb.from('qhub_onboarding_state').upsert(
     {
       org_id: state.orgId,
@@ -491,11 +558,15 @@ export async function upsertOnboardingState(
   );
 }
 
+/**
+ * @qhub-service: REQUIRES_COMMERCIAL_READY_TOKEN
+ */
 export async function recordAcknowledgment(
+  token: CommercialReadyToken,
   input: { orgId: string; userId: string; ackType: string; ackVersion: string },
   env: Record<string, string | undefined>,
 ): Promise<void> {
-  const sb = admin(env);
+  const sb = mutator(token, env);
   await sb.from('qhub_acknowledgments').insert({
     org_id: input.orgId,
     user_id: input.userId,
@@ -514,11 +585,15 @@ export interface ManualReviewRequest {
   reason: string;
 }
 
+/**
+ * @qhub-service: REQUIRES_COMMERCIAL_READY_TOKEN
+ */
 export async function createManualReviewRequest(
+  token: CommercialReadyToken,
   input: ManualReviewRequest,
   env: Record<string, string | undefined>,
 ): Promise<void> {
-  const sb = admin(env);
+  const sb = mutator(token, env);
   await sb.from('qhub_manual_review_requests').insert({
     org_id: input.orgId,
     project_id: input.projectId ?? null,
@@ -529,11 +604,15 @@ export async function createManualReviewRequest(
   });
 }
 
+/**
+ * @qhub-service: REQUIRES_COMMERCIAL_READY_TOKEN
+ */
 export async function decideManualReview(
+  token: CommercialReadyToken,
   input: { requestId: string; decision: 'approved' | 'rejected'; actor: string; reason: string },
   env: Record<string, string | undefined>,
 ): Promise<void> {
-  const sb = admin(env);
+  const sb = mutator(token, env);
   await sb
     .from('qhub_manual_review_requests')
     .update({
@@ -547,11 +626,15 @@ export async function decideManualReview(
 
 // ─── Entitlement-change audit ────────────────────────────────────────────────────
 
+/**
+ * @qhub-service: REQUIRES_COMMERCIAL_READY_TOKEN
+ */
 export async function recordEntitlementChange(
+  token: CommercialReadyToken,
   input: { orgId: string; actor: string; changeType: string; before: unknown; after: unknown; reason?: string },
   env: Record<string, string | undefined>,
 ): Promise<void> {
-  const sb = admin(env);
+  const sb = mutator(token, env);
   await sb.from('qhub_entitlement_audit').insert({
     org_id: input.orgId,
     actor: input.actor,
@@ -580,15 +663,17 @@ export interface CheckoutIntentInput {
 }
 
 /**
+ * @qhub-service: REQUIRES_COMMERCIAL_READY_TOKEN
  * Create (or idempotently return) a checkout intent. An exact retry with the same
  * (org, idempotency_key) returns the existing intent; a materially different request
  * under the same key is rejected.
  */
 export async function createCheckoutIntent(
+  token: CommercialReadyToken,
   input: CheckoutIntentInput,
   env: Record<string, string | undefined>,
 ): Promise<{ ok: true; intentId: string; nonce: string; idempotent: boolean } | { ok: false; reason: string }> {
-  const sb = admin(env);
+  const sb = mutator(token, env);
   const nonce = crypto.randomUUID().replace(/-/g, '') + crypto.randomUUID().replace(/-/g, '');
   const row = {
     org_id: input.orgId,
@@ -637,8 +722,12 @@ export async function createCheckoutIntent(
 
 export type IntentConsume = 'CONSUMED' | 'EXPIRED' | 'ALREADY' | 'MISMATCH' | 'NOT_FOUND';
 
-/** Atomically consume a checkout intent via the guarded RPC. */
+/**
+ * @qhub-service: REQUIRES_COMMERCIAL_READY_TOKEN
+ * Atomically consume a checkout intent via the guarded RPC.
+ */
 export async function consumeCheckoutIntent(
+  token: CommercialReadyToken,
   input: {
     intentId: string;
     orgId: string;
@@ -651,7 +740,7 @@ export async function consumeCheckoutIntent(
   },
   env: Record<string, string | undefined>,
 ): Promise<IntentConsume> {
-  const sb = admin(env);
+  const sb = mutator(token, env);
   const { data, error } = await sb.rpc('qhub_consume_checkout_intent', {
     p_intent_id: input.intentId,
     p_org_id: input.orgId,
@@ -672,11 +761,15 @@ export async function consumeCheckoutIntent(
 
 // ─── Invitations + transactional seat acceptance ────────────────────────────────
 
+/**
+ * @qhub-service: REQUIRES_COMMERCIAL_READY_TOKEN
+ */
 export async function createInvitation(
+  token: CommercialReadyToken,
   input: { orgId: string; email: string; role: string; tokenHash: string; invitedBy: string; expiresAt: string },
   env: Record<string, string | undefined>,
 ): Promise<{ ok: true; invitationId: string } | { ok: false; reason: string }> {
-  const sb = admin(env);
+  const sb = mutator(token, env);
   const { data, error } = await sb
     .from('qhub_org_invitations')
     .insert({
@@ -708,15 +801,17 @@ export type AcceptResult =
   | 'ALREADY';
 
 /**
+ * @qhub-service: REQUIRES_COMMERCIAL_READY_TOKEN
  * Transactionally accept an invitation via the guarded RPC. The caller supplies NO
  * seat cap — the RPC verifies the recipient email + token and derives the plan +
  * seat cap from the org's authoritative active subscription under a lock.
  */
 export async function acceptInvitation(
+  token: CommercialReadyToken,
   input: { invitationId: string; userId: string; userEmail: string; tokenHash: string },
   env: Record<string, string | undefined>,
 ): Promise<AcceptResult> {
-  const sb = admin(env);
+  const sb = mutator(token, env);
   const { data, error } = await sb.rpc('qhub_accept_invitation', {
     p_invitation_id: input.invitationId,
     p_user_id: input.userId,
@@ -739,8 +834,12 @@ export interface RpcResult {
   project_id?: string;
 }
 
-/** ONE atomic checkout reconciliation (lease-bound; binds+consumes+PROCESSED together). */
+/**
+ * @qhub-service: REQUIRES_COMMERCIAL_READY_TOKEN
+ * ONE atomic checkout reconciliation (lease-bound; binds+consumes+PROCESSED together).
+ */
 export async function reconcileCheckout(
+  token: CommercialReadyToken,
   input: {
     provider: string;
     eventId: string;
@@ -759,7 +858,7 @@ export async function reconcileCheckout(
   },
   env: Record<string, string | undefined>,
 ): Promise<RpcResult> {
-  const sb = admin(env);
+  const sb = mutator(token, env);
   const { data, error } = await sb.rpc('qhub_reconcile_checkout', {
     p_provider: input.provider,
     p_event_id: input.eventId,
@@ -784,8 +883,12 @@ export async function reconcileCheckout(
   return (data as RpcResult) ?? { ok: false, reason: 'rpc_error' };
 }
 
-/** ONE atomic review decision (request + governance + immutable audit). */
+/**
+ * @qhub-service: REQUIRES_COMMERCIAL_READY_TOKEN
+ * ONE atomic review decision (request + governance + immutable audit).
+ */
 export async function decideReviewAtomic(
+  token: CommercialReadyToken,
   input: {
     requestId: string;
     actor: string;
@@ -796,7 +899,7 @@ export async function decideReviewAtomic(
   },
   env: Record<string, string | undefined>,
 ): Promise<RpcResult> {
-  const sb = admin(env);
+  const sb = mutator(token, env);
   const { data, error } = await sb.rpc('qhub_decide_review', {
     p_request_id: input.requestId,
     p_actor: input.actor,
@@ -813,12 +916,16 @@ export async function decideReviewAtomic(
   return (data as RpcResult) ?? { ok: false, reason: 'rpc_error' };
 }
 
-/** ONE atomic project creation with transactional cap + idempotency. */
+/**
+ * @qhub-service: REQUIRES_COMMERCIAL_READY_TOKEN
+ * ONE atomic project creation with transactional cap + idempotency.
+ */
 export async function createProjectAtomic(
+  token: CommercialReadyToken,
   input: { orgId: string; createdBy: string; idempotencyKey: string; requestHash: string },
   env: Record<string, string | undefined>,
 ): Promise<RpcResult> {
-  const sb = admin(env);
+  const sb = mutator(token, env);
   const { data, error } = await sb.rpc('qhub_create_project', {
     p_org_id: input.orgId,
     p_created_by: input.createdBy,
@@ -833,7 +940,10 @@ export async function createProjectAtomic(
   return (data as RpcResult) ?? { ok: false, reason: 'rpc_error' };
 }
 
-/** Load a checkout intent's authoritative org + bound expectations (or null). */
+/**
+ * @qhub-service: INTERNAL_SERVER_ONLY
+ * Load a checkout intent's authoritative org + bound expectations (or null).
+ */
 export async function getCheckoutIntent(
   intentId: string,
   env: Record<string, string | undefined>,
@@ -858,7 +968,10 @@ export async function getCheckoutIntent(
   };
 }
 
-/** The owning org of an invitation (for seat-cap resolution on acceptance). */
+/**
+ * @qhub-service: INTERNAL_SERVER_ONLY
+ * The owning org of an invitation (for seat-cap resolution on acceptance).
+ */
 export async function getInvitationOrg(
   invitationId: string,
   env: Record<string, string | undefined>,

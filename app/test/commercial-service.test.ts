@@ -11,7 +11,7 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 import type { CommercialExecutionContext } from '~/lib/qhub/commercial/commercial-context.server';
 import type { GovernanceRecord } from '~/lib/qhub/commercial/governance-essentials.server';
 
-const H = vi.hoisted(() => ({ getGov: vi.fn(), consume: vi.fn(), ready: vi.fn() }));
+const H = vi.hoisted(() => ({ getGov: vi.fn(), consume: vi.fn(), assert: vi.fn() }));
 
 vi.mock('~/lib/qhub/commercial/governance-essentials.server', async (importActual) => {
   const actual = await importActual<typeof import('~/lib/qhub/commercial/governance-essentials.server')>();
@@ -19,24 +19,23 @@ vi.mock('~/lib/qhub/commercial/governance-essentials.server', async (importActua
 });
 vi.mock('~/lib/qhub/commercial/commercial-store.server', () => ({ consumeBuildCredit: H.consume }));
 
-// Deterministic readiness injection (no production bypass — the module is mocked).
+/*
+ * Deterministic readiness injection: the service gates on assertReadyToken(). We mock it
+ * (no production bypass — the module is mocked) so a READY case is a no-op and a NOT-READY
+ * case throws, exactly like a target/version mismatch would at runtime.
+ */
 vi.mock('~/lib/qhub/commercial/commercial-schema-check.server', () => ({
-  getCommercialSchemaReadiness: H.ready,
+  assertReadyToken: H.assert,
 }));
 
-const READY = {
-  state: 'READY',
-  expected: '2026-07-30.commercial-launch-r4',
-  version: '2026-07-30.commercial-launch-r4',
-  failed: [],
-  checkedAt: 0,
-};
-const NOT_READY = {
-  state: 'NOT_READY',
-  expected: '2026-07-30.commercial-launch-r4',
-  failed: ['version_mismatch'],
-  checkedAt: 0,
-};
+// A stand-in token — its shape is irrelevant because assertReadyToken is mocked.
+const TOKEN = { schemaVersion: '2026-07-30.commercial-launch-r4', targetKey: 't', checkedAt: '0' } as never;
+
+function makeNotReady() {
+  H.assert.mockImplementation(() => {
+    throw new Error('commercial schema not ready');
+  });
+}
 
 import {
   invokeCommercialModel,
@@ -91,19 +90,19 @@ beforeEach(() => {
   vi.clearAllMocks();
   H.getGov.mockResolvedValue(goodGov);
   H.consume.mockResolvedValue({ ok: true, remaining: 9, ledger_id: 'L1' });
-  H.ready.mockResolvedValue(READY);
+  H.assert.mockReturnValue(undefined); // READY: token valid (no throw)
 });
 
 describe('invokeCommercialModel', () => {
   it('rejects a non-execution context (no project binding)', async () => {
     const bad = { userId: 'u1', capabilities: new Set(['MODEL_INVOKE']) } as never;
-    const r = await invokeCommercialModel(bad, req, 'k1', {}, async () => 'ran');
+    const r = await invokeCommercialModel(bad, req, 'k1', TOKEN, {}, async () => 'ran');
     expect(r.ok).toBe(false);
     expect(r.ok === false && r.reason).toBe('missing_execution_context');
   });
 
   it('rejects without the MODEL_INVOKE capability', async () => {
-    const r = await invokeCommercialModel(execCtx([]), req, 'k1', {}, async () => 'ran');
+    const r = await invokeCommercialModel(execCtx([]), req, 'k1', TOKEN, {}, async () => 'ran');
     expect(r.ok === false && r.reason).toBe('capability_denied');
     expect(H.consume).not.toHaveBeenCalled();
   });
@@ -111,14 +110,14 @@ describe('invokeCommercialModel', () => {
   it('blocks when the Governance Essentials gate is not satisfied', async () => {
     H.getGov.mockResolvedValue({ ...goodGov, acknowledged: false });
 
-    const r = await invokeCommercialModel(execCtx(), req, 'k1', {}, async () => 'ran');
+    const r = await invokeCommercialModel(execCtx(), req, 'k1', TOKEN, {}, async () => 'ran');
     expect(r.ok === false && r.reason).toBe('governance_gate_blocked');
     expect(H.consume).not.toHaveBeenCalled();
   });
 
   it('blocks a suspended context', async () => {
     const ctx = { ...execCtx(), suspended: true };
-    const r = await invokeCommercialModel(ctx, req, 'k1', {}, async () => 'ran');
+    const r = await invokeCommercialModel(ctx, req, 'k1', TOKEN, {}, async () => 'ran');
     expect(r.ok === false && r.reason).toBe('suspended');
   });
 
@@ -129,7 +128,7 @@ describe('invokeCommercialModel', () => {
       return { ok: true, remaining: 5, ledger_id: 'L1' };
     });
 
-    const r = await invokeCommercialModel(execCtx(), req, 'k1', {}, async () => {
+    const r = await invokeCommercialModel(execCtx(), req, 'k1', TOKEN, {}, async () => {
       order.push('model');
       return 'ran';
     });
@@ -141,7 +140,7 @@ describe('invokeCommercialModel', () => {
     H.consume.mockResolvedValue({ ok: false, reason: 'insufficient_credits' });
 
     let ran = false;
-    const r = await invokeCommercialModel(execCtx(), req, 'k1', {}, async () => {
+    const r = await invokeCommercialModel(execCtx(), req, 'k1', TOKEN, {}, async () => {
       ran = true;
       return 'ran';
     });
@@ -159,11 +158,11 @@ describe('invokeCommercialModel', () => {
     expect(a).toBe(c);
   });
 
-  it('fails closed BEFORE credit consumption when the schema is NOT READY', async () => {
-    H.ready.mockResolvedValue(NOT_READY);
+  it('fails closed BEFORE credit consumption when the readiness token is invalid', async () => {
+    makeNotReady();
 
     let ran = false;
-    const r = await invokeCommercialModel(execCtx(), req, 'k1', {}, async () => {
+    const r = await invokeCommercialModel(execCtx(), req, 'k1', TOKEN, {}, async () => {
       ran = true;
       return 'ran';
     });
@@ -175,14 +174,14 @@ describe('invokeCommercialModel', () => {
 
 describe('exportCommercialProject', () => {
   it('requires CODE_EXPORT capability', async () => {
-    expect((await exportCommercialProject(execCtx(['CODE_EXPORT']), {})).ok).toBe(true);
-    expect((await exportCommercialProject(execCtx([]), {})).ok).toBe(false);
+    expect((await exportCommercialProject(execCtx(['CODE_EXPORT']), TOKEN, {})).ok).toBe(true);
+    expect((await exportCommercialProject(execCtx([]), TOKEN, {})).ok).toBe(false);
   });
 
-  it('fails closed when the schema is NOT READY', async () => {
-    H.ready.mockResolvedValue(NOT_READY);
+  it('fails closed when the readiness token is invalid', async () => {
+    makeNotReady();
 
-    const r = await exportCommercialProject(execCtx(['CODE_EXPORT']), {});
+    const r = await exportCommercialProject(execCtx(['CODE_EXPORT']), TOKEN, {});
     expect(r.ok === false && r.reason).toBe('schema_not_ready');
   });
 });

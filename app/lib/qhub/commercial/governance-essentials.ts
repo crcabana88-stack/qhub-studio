@@ -201,6 +201,19 @@ export const GOVERNANCE_ESSENTIALS_FLOW: FlowStep[] = [
 
 // ─── Baseline policy card ────────────────────────────────────────────────────────
 
+/**
+ * The authoritative, server-owned review policy version. This is the ONLY source of a
+ * review's policy version — the browser may never supply or override it. Bump this when
+ * the baseline policy card's material rules change (which forces re-review of requests
+ * submitted under an older version).
+ */
+export const REVIEW_POLICY_VERSION = '2026-07-30.governance-essentials.v1';
+
+/** The current applicable review policy version (server-derived, project-scoped). */
+export function currentReviewPolicyVersion(): string {
+  return REVIEW_POLICY_VERSION;
+}
+
 export interface PolicyCard {
   tier: RiskTier;
   allowedDataClasses: DataClass[];

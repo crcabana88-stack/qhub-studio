@@ -1,19 +1,28 @@
 /**
- * QHUB Commercial Launch R2 — MANUAL REVIEW AUTHORITY (SERVER ONLY)
+ * QHUB Commercial Launch R4 — MANUAL REVIEW AUTHORITY (SERVER ONLY)
  * app/lib/qhub/commercial/review.server.ts
  *
  * Server-authoritative manual review. A request is tenant-scoped to one org/
  * project and may only cover review-eligible categories — prohibited categories
  * can never enter the queue or be overridden. A decision requires an authoritative
  * Quantex staff actor (never supplied by the browser); the actor, reason, policy
- * version, and timestamp are recorded. A materially different repeat is a new
- * request (not silently idempotent). Subscription/entitlement overrides likewise
- * require a staff actor with reason and a validity window, and are audited.
+ * version, and timestamp are recorded. The review policy version is SERVER-DERIVED at
+ * both submission and decision — the browser can never choose or override it. A
+ * materially different repeat is a new request (not silently idempotent).
+ *
+ * NON-BYPASSABLE READINESS: every mutation requires a branded CommercialReadyToken and
+ * obtains its privileged client only through mutator(token,env). Reads are
+ * INTERNAL_SERVER_ONLY. Each export is tagged `@qhub-service: <classification>`.
  */
 
 import { createClient, type SupabaseClient } from '@supabase/supabase-js';
 import type { CommercialContext } from '~/lib/qhub/commercial/commercial-context.server';
-import { REVIEW_DATA_CLASSES, type DataClass } from '~/lib/qhub/commercial/governance-essentials';
+import { assertReadyToken, type CommercialReadyToken } from '~/lib/qhub/commercial/commercial-schema-check.server';
+import {
+  currentReviewPolicyVersion,
+  REVIEW_DATA_CLASSES,
+  type DataClass,
+} from '~/lib/qhub/commercial/governance-essentials';
 
 function admin(env: Record<string, string | undefined>): SupabaseClient {
   const url = env.SUPABASE_URL ?? process.env.SUPABASE_URL ?? '';
@@ -24,6 +33,13 @@ function admin(env: Record<string, string | undefined>): SupabaseClient {
   }
 
   return createClient(url, key, { auth: { persistSession: false } });
+}
+
+/** Privileged MUTATION client — re-validates the readiness token before any write. */
+function mutator(token: CommercialReadyToken, env: Record<string, string | undefined>): SupabaseClient {
+  assertReadyToken(token, env);
+
+  return admin(env);
 }
 
 async function sha256Hex(s: string): Promise<string> {
@@ -50,13 +66,17 @@ function isReviewEligibleCategory(category: string): boolean {
 export type ReviewResult = { ok: true; requestId: string; idempotent: boolean } | { ok: false; error: string };
 
 /**
+ * @qhub-service: REQUIRES_COMMERCIAL_READY_TOKEN
  * Create a manual-review request. Requires an active membership on the request's
  * org (the caller cannot open a request for a tenant they do not belong to).
- * Prohibited categories are rejected; only review-eligible categories may queue.
+ * Prohibited categories are rejected; only review-eligible categories may queue. The
+ * review's policy version is SERVER-DERIVED (currentReviewPolicyVersion) and stored on
+ * the request — the browser never supplies it.
  */
 export async function createReviewRequest(
   ctx: CommercialContext,
   input: { projectId?: string; category: string; reason: string; requestType?: string },
+  token: CommercialReadyToken,
   env: Record<string, string | undefined>,
 ): Promise<ReviewResult> {
   if (!ctx.orgId) {
@@ -76,7 +96,10 @@ export async function createReviewRequest(
     `${ctx.orgId}|${input.projectId ?? ''}|${requestType}|${input.category}|${input.reason}`,
   );
 
-  const sb = admin(env);
+  // SERVER-derived evaluated-under policy version (never from the browser).
+  const policyVersion = currentReviewPolicyVersion();
+
+  const sb = mutator(token, env);
   const { data, error } = await sb
     .from('qhub_manual_review_requests')
     .insert({
@@ -86,6 +109,7 @@ export async function createReviewRequest(
       category: input.category,
       reason: input.reason,
       request_hash: requestHash,
+      policy_version: policyVersion,
       status: 'pending',
     })
     .select('id')
@@ -111,23 +135,27 @@ export async function createReviewRequest(
 }
 
 /**
- * Decide a manual-review request. Requires an authoritative staff actor (the
- * REVIEW_DECIDE capability + isStaff). The actor is derived from the staff context,
- * never the browser. Prohibited categories cannot be approved.
+ * @qhub-service: REQUIRES_COMMERCIAL_READY_TOKEN
+ * Decide a manual-review request. Requires an authoritative staff actor (isStaff). The
+ * actor is derived from the staff context, never the browser. Prohibited categories
+ * cannot be approved. The policy version is SERVER-DERIVED (never the browser): the
+ * decision is bound to the version the request was evaluated under; if the current
+ * policy changed materially, re-review is required.
  */
 export async function decideReviewRequest(
   ctx: CommercialContext,
-  input: { requestId: string; decision: 'approved' | 'rejected'; reason: string; policyVersion: string },
+  input: { requestId: string; decision: 'approved' | 'rejected'; reason: string },
+  token: CommercialReadyToken,
   env: Record<string, string | undefined>,
-): Promise<{ ok: true } | { ok: false; error: string }> {
+): Promise<{ ok: true; policyVersion: string } | { ok: false; error: string }> {
   if (!ctx.isStaff) {
     return { ok: false, error: 'staff_required' };
   }
 
-  const sb = admin(env);
+  const sb = mutator(token, env);
   const { data: req } = await sb
     .from('qhub_manual_review_requests')
-    .select('id,category,status,org_id,project_id')
+    .select('id,category,status,org_id,project_id,policy_version')
     .eq('id', input.requestId)
     .maybeSingle();
 
@@ -143,13 +171,25 @@ export async function decideReviewRequest(
     return { ok: false, error: 'prohibited_cannot_approve' };
   }
 
+  /*
+   * SERVER-derived policy authority. The request's evaluated-under version is the bind
+   * target; a materially changed current policy forces re-review (no silent override).
+   */
+  const evaluatedVersion = (req.policy_version as string) ?? currentReviewPolicyVersion();
+
+  if (evaluatedVersion !== currentReviewPolicyVersion()) {
+    return { ok: false, error: 'policy_version_changed' };
+  }
+
+  const policyVersion = evaluatedVersion;
+
   await sb
     .from('qhub_manual_review_requests')
     .update({
       status: input.decision,
       decided_by: ctx.userId, // authoritative staff user id
       decision_reason: input.reason,
-      policy_version: input.policyVersion,
+      policy_version: policyVersion,
       decided_at: new Date().toISOString(),
     })
     .eq('id', input.requestId);
@@ -162,17 +202,20 @@ export async function decideReviewRequest(
         review_state: input.decision === 'approved' ? 'approved' : 'rejected',
         reviewed_by: ctx.userId,
         reviewed_at: new Date().toISOString(),
-        review_policy_version: input.policyVersion,
+        review_policy_version: policyVersion,
         updated_at: new Date().toISOString(),
       })
       .eq('project_id', req.project_id as string)
       .eq('org_id', req.org_id as string);
   }
 
-  return { ok: true };
+  return { ok: true, policyVersion };
 }
 
-/** Fetch a review request scoped to the caller's org (customer view). */
+/**
+ * @qhub-service: INTERNAL_SERVER_ONLY
+ * Fetch a review request scoped to the caller's org (customer view).
+ */
 export async function getReviewRequestForOrg(
   requestId: string,
   orgId: string,
@@ -199,6 +242,30 @@ export async function getReviewRequestForOrg(
 }
 
 /**
+ * @qhub-service: INTERNAL_SERVER_ONLY
+ * Load the authoritative decision metadata for a request (status + the SERVER-derived
+ * policy version it was evaluated under) for the staff decision path.
+ */
+export async function getReviewDecisionMeta(
+  requestId: string,
+  env: Record<string, string | undefined>,
+): Promise<{ status: string; policyVersion: string | null } | null> {
+  const sb = admin(env);
+  const { data } = await sb
+    .from('qhub_manual_review_requests')
+    .select('status,policy_version')
+    .eq('id', requestId)
+    .maybeSingle();
+
+  if (!data) {
+    return null;
+  }
+
+  return { status: data.status as string, policyVersion: (data.policy_version as string) ?? null };
+}
+
+/**
+ * @qhub-service: REQUIRES_COMMERCIAL_READY_TOKEN
  * Set a subscription/entitlement override. Staff-only; records actor, reason, and
  * a validity window, and writes an audit row.
  */
@@ -212,13 +279,14 @@ export async function setStaffOverride(
     startsAt: string;
     endsAt: string;
   },
+  token: CommercialReadyToken,
   env: Record<string, string | undefined>,
 ): Promise<{ ok: true } | { ok: false; error: string }> {
   if (!ctx.isStaff) {
     return { ok: false, error: 'staff_required' };
   }
 
-  const sb = admin(env);
+  const sb = mutator(token, env);
   const { data: before } = await sb
     .from('qhub_subscriptions')
     .select('override_sensitive_data_review,override_bonus_credits')
@@ -253,10 +321,12 @@ export async function setStaffOverride(
   return { ok: true };
 }
 
+/** @qhub-service: PURE_NO_IO */
 export function isProhibitedCategory(category: string): boolean {
   return PROHIBITED_CATEGORIES.has(category);
 }
 
+/** @qhub-service: PURE_NO_IO */
 export function reviewEligibleCategories(): DataClass[] {
   return [...REVIEW_DATA_CLASSES];
 }

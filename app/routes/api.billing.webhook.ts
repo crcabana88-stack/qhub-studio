@@ -1,4 +1,7 @@
-// @qhub-boundary: SIGNATURE_AUTH — authenticated by the verified Stripe signature (raw-byte HMAC), not a user session.
+/*
+ * @qhub-route: COMMERCIAL_READY
+ * @qhub-boundary: SIGNATURE_AUTH — authenticated by the verified Stripe signature (raw-byte HMAC), not a user session.
+ */
 /**
  * QHUB Commercial Launch R2 — POST /api/billing/webhook
  * app/routes/api.billing.webhook.ts
@@ -20,7 +23,10 @@
 
 import { json, type ActionFunctionArgs } from '@remix-run/cloudflare';
 import { createBillingProvider, planIdForConfiguredPrice } from '~/lib/qhub/commercial/billing/stripe-provider.server';
-import { requireCommercialReady } from '~/lib/qhub/commercial/commercial-schema-check.server';
+import {
+  requireCommercialReady,
+  type CommercialReadyToken,
+} from '~/lib/qhub/commercial/commercial-schema-check.server';
 import {
   applySubscriptionEvent,
   claimWebhookEvent,
@@ -73,6 +79,7 @@ export async function action({ request, context }: ActionFunctionArgs) {
   const owner = crypto.randomUUID(); // this worker's lease owner
   const payloadHash = await sha256Hex(rawBody);
   const claim = await claimWebhookEvent(
+    ready.token,
     {
       provider: provider.id,
       providerEventId: event.providerEventId,
@@ -101,10 +108,11 @@ export async function action({ request, context }: ActionFunctionArgs) {
    * the lease-bound transition.
    */
   try {
-    const handledInRpc = await reconcileAndApply(event, provider, env, owner);
+    const handledInRpc = await reconcileAndApply(event, provider, ready.token, env, owner);
 
     if (!handledInRpc) {
       await setWebhookState(
+        ready.token,
         { provider: provider.id, providerEventId: event.providerEventId, owner, state: 'PROCESSED' },
         env,
       );
@@ -114,6 +122,7 @@ export async function action({ request, context }: ActionFunctionArgs) {
   } catch (err) {
     if (err instanceof PermanentError) {
       await setWebhookState(
+        ready.token,
         {
           provider: provider.id,
           providerEventId: event.providerEventId,
@@ -130,6 +139,7 @@ export async function action({ request, context }: ActionFunctionArgs) {
 
     // Transient: keep retryable so Stripe redelivers.
     await setWebhookState(
+      ready.token,
       {
         provider: provider.id,
         providerEventId: event.providerEventId,
@@ -147,6 +157,7 @@ export async function action({ request, context }: ActionFunctionArgs) {
 async function reconcileAndApply(
   event: NormalizedBillingEvent,
   provider: ReturnType<typeof createBillingProvider>,
+  token: CommercialReadyToken,
   env: Record<string, string | undefined>,
   owner: string,
 ): Promise<boolean> {
@@ -165,6 +176,7 @@ async function reconcileAndApply(
     }
 
     await applySubscriptionEvent(
+      token,
       {
         orgId: org,
         planId: event.planId ?? 'none',
@@ -207,6 +219,7 @@ async function reconcileAndApply(
     const setupPresent = !!setupPriceId && lines.value.includes(setupPriceId);
 
     const result = await reconcileCheckout(
+      token,
       {
         provider: provider.id,
         eventId: event.providerEventId,
@@ -250,6 +263,7 @@ async function reconcileAndApply(
     }
 
     await applySubscriptionEvent(
+      token,
       {
         orgId: org,
         planId: (planIdForConfiguredPrice(sub.priceId as string, env) ?? 'none') as never,

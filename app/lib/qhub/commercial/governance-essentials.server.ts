@@ -13,6 +13,7 @@
 import { createClient, type SupabaseClient } from '@supabase/supabase-js';
 import type { CommercialContext } from '~/lib/qhub/commercial/commercial-context.server';
 import type { RiskTier } from '~/lib/qhub/classification';
+import { assertReadyToken, type CommercialReadyToken } from '~/lib/qhub/commercial/commercial-schema-check.server';
 import {
   evaluateGovernanceEssentials,
   type DataClass,
@@ -29,6 +30,13 @@ function admin(env: Record<string, string | undefined>): SupabaseClient {
   }
 
   return createClient(url, key, { auth: { persistSession: false } });
+}
+
+/** Privileged MUTATION client — re-validates the readiness token before any write. */
+function mutator(token: CommercialReadyToken, env: Record<string, string | undefined>): SupabaseClient {
+  assertReadyToken(token, env);
+
+  return admin(env);
 }
 
 export interface DeclarationInput {
@@ -60,6 +68,7 @@ export interface GovernanceRecord {
 }
 
 /**
+ * @qhub-service: REQUIRES_COMMERCIAL_READY_TOKEN
  * Persist/refresh a project's Governance Essentials declaration. The server
  * recomputes the disposition from the declared signals (a client-provided
  * disposition is never trusted). A manual_review disposition also opens a
@@ -68,6 +77,7 @@ export interface GovernanceRecord {
 export async function upsertDeclaration(
   ctx: CommercialContext,
   input: DeclarationInput,
+  token: CommercialReadyToken,
   env: Record<string, string | undefined>,
 ): Promise<GovernanceRecord> {
   if (!ctx.orgId) {
@@ -91,7 +101,7 @@ export async function upsertDeclaration(
 
   const reviewState = evalResult.disposition === 'manual_review' ? 'requested' : 'none';
 
-  const sb = admin(env);
+  const sb = mutator(token, env);
   await sb.from('qhub_governance_essentials').upsert(
     {
       project_id: input.projectId,
@@ -121,6 +131,7 @@ export async function upsertDeclaration(
       await createReviewRequest(
         ctx,
         { projectId: input.projectId, category: sensitive, reason: 'Sensitive data declared in Governance Essentials' },
+        token,
         env,
       );
     }
@@ -137,17 +148,21 @@ export async function upsertDeclaration(
   };
 }
 
-/** Record the human acknowledgment for a project. Only valid once declaration-complete. */
+/**
+ * @qhub-service: REQUIRES_COMMERCIAL_READY_TOKEN
+ * Record the human acknowledgment for a project. Only valid once declaration-complete.
+ */
 export async function acknowledgeProject(
   ctx: CommercialContext,
   input: { projectId: string; acknowledgmentVersion: string },
+  token: CommercialReadyToken,
   env: Record<string, string | undefined>,
 ): Promise<{ ok: true } | { ok: false; error: string }> {
   if (!ctx.orgId) {
     return { ok: false, error: 'no_org_context' };
   }
 
-  const sb = admin(env);
+  const sb = mutator(token, env);
   const { data: rec } = await sb
     .from('qhub_governance_essentials')
     .select('declaration_complete,disposition')
@@ -187,6 +202,7 @@ export async function acknowledgeProject(
   return { ok: true };
 }
 
+/** @qhub-service: INTERNAL_SERVER_ONLY */
 export async function getGovernanceRecord(
   orgId: string,
   projectId: string,
@@ -215,7 +231,10 @@ export async function getGovernanceRecord(
   };
 }
 
-/** Model invocation requires a complete + acknowledged declaration that may proceed. */
+/**
+ * @qhub-service: PURE_NO_IO
+ * Model invocation requires a complete + acknowledged declaration that may proceed.
+ */
 export function isModelInvocationAllowed(rec: GovernanceRecord | null): boolean {
   if (!rec) {
     return false;
@@ -227,7 +246,10 @@ export function isModelInvocationAllowed(rec: GovernanceRecord | null): boolean 
   return rec.declarationComplete && rec.acknowledged && dispositionOk;
 }
 
-/** Publication requires an approved review (or a clean proceed disposition). */
+/**
+ * @qhub-service: PURE_NO_IO
+ * Publication requires an approved review (or a clean proceed disposition).
+ */
 export function isPublicationAllowed(rec: GovernanceRecord | null): boolean {
   if (!rec) {
     return false;
@@ -240,7 +262,11 @@ export function isPublicationAllowed(rec: GovernanceRecord | null): boolean {
   return rec.reviewState === 'approved' || rec.disposition === 'proceed';
 }
 
-/** Evidence export built ONLY from authoritative persisted fields (no secrets). */
+/**
+ * @qhub-service: PURE_NO_IO
+ * Evidence export built ONLY from authoritative persisted fields (no secrets). Its
+ * readiness-gated wrapper is exportCommercialProject (REQUIRES_COMMERCIAL_READY_TOKEN).
+ */
 export function buildEvidenceExport(rec: GovernanceRecord): Record<string, unknown> {
   return {
     project_id: rec.projectId,

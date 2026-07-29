@@ -1,3 +1,4 @@
+// @qhub-route: COMMERCIAL_READY
 /**
  * QHUB Commercial Launch R3 — POST /api/commercial/build
  * app/routes/api.commercial.build.ts
@@ -84,7 +85,7 @@ export async function action({ request, context }: ActionFunctionArgs) {
    * The governed model runner. The real generation service is wrapped here; the
    * enforcement (context + governance + credit) has already happened in the service.
    */
-  const outcome = await invokeCommercialModel(ctx, req, body.idempotencyKey, env, async () => {
+  const outcome = await invokeCommercialModel(ctx, req, body.idempotencyKey, ready.token, env, async () => {
     return { accepted: true, projectId: ctx.projectId };
   });
 

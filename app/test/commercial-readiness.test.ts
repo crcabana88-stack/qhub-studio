@@ -24,14 +24,20 @@ vi.mock('@supabase/supabase-js', () => ({
 import {
   getCommercialSchemaReadiness,
   assertCommercialSchemaReady,
+  assertReadyToken,
   requireCommercialReady,
   isCommercialReady,
   resetCommercialReadinessCache,
+  commercialTargetKey,
+  safeReasonCode,
   CommercialNotReadyError,
   EXPECTED_COMMERCIAL_SCHEMA_VERSION,
 } from '~/lib/qhub/commercial/commercial-schema-check.server';
 
 const ENV = { SUPABASE_URL: 'https://ref.supabase.co', SUPABASE_SERVICE_ROLE_KEY: 'svc' };
+const ENV_B = { SUPABASE_URL: 'https://other.supabase.co', SUPABASE_SERVICE_ROLE_KEY: 'svc' };
+const ENV_PROD = { ...ENV, QHUB_DEPLOY_ENV: 'production' };
+const ENV_STAGING = { ...ENV, QHUB_DEPLOY_ENV: 'staging' };
 
 function rpcReturns(data: unknown, error: unknown = null) {
   S.rpc.mockResolvedValue({ data, error });
@@ -72,11 +78,11 @@ describe('getCommercialSchemaReadiness — state machine (fail closed)', () => {
   });
 
   it('NOT_READY when any check failed (even if ready=true is claimed)', async () => {
-    rpcReturns({ expected_version: EXPECTED, ready: true, failed: ['reconcile_checkout_signature'] });
+    rpcReturns({ expected_version: EXPECTED, ready: true, failed: ['reconcile_rpc_contract'] });
 
     const r = await getCommercialSchemaReadiness(ENV);
     expect(r.state).toBe('NOT_READY');
-    expect(r.failed).toContain('reconcile_checkout_signature');
+    expect(r.failed).toContain('reconcile_rpc_contract'); // known allowlisted code preserved
   });
 
   it('UNAVAILABLE when the verifier RPC errors (missing verifier / permission / connectivity)', async () => {
@@ -141,9 +147,12 @@ describe('assertCommercialSchemaReady / requireCommercialReady', () => {
     await expect(assertCommercialSchemaReady(ENV)).rejects.toBeInstanceOf(CommercialNotReadyError);
   });
 
-  it('assert resolves when READY', async () => {
+  it('assert resolves to a target-bound token when READY', async () => {
     rpcReturns({ expected_version: EXPECTED, ready: true, failed: [] });
-    await expect(assertCommercialSchemaReady(ENV)).resolves.toMatchObject({ state: 'READY' });
+
+    const token = await assertCommercialSchemaReady(ENV);
+    expect(token.schemaVersion).toBe(EXPECTED);
+    expect(token.targetKey).toBe(commercialTargetKey(ENV)); // bound to this exact target
   });
 
   it('requireCommercialReady returns a generic 503 for user routes when NOT READY', async () => {
@@ -176,6 +185,73 @@ describe('assertCommercialSchemaReady / requireCommercialReady', () => {
   });
 });
 
+describe('safe failed-check allowlist (no adversarial verifier text leaks)', () => {
+  it('maps known verifier check ids to themselves', () => {
+    expect(safeReasonCode('reconcile_rpc_contract')).toBe('reconcile_rpc_contract');
+    expect(safeReasonCode('seat_rpc_caller_cap')).toBe('seat_rpc_caller_cap');
+  });
+
+  it('collapses unknown/malicious failed strings to a single generic code', () => {
+    const malicious = "'; DROP TABLE qhub_subscriptions; -- postgres://user:pw@host";
+    expect(safeReasonCode(malicious)).toBe('commercial_schema_unknown_failure');
+    expect(safeReasonCode('SELECT * FROM secrets')).toBe('commercial_schema_unknown_failure');
+    expect(safeReasonCode(42)).toBe('commercial_schema_unknown_failure');
+  });
+
+  it('readiness output never surfaces raw adversarial failed text', async () => {
+    rpcReturns({
+      expected_version: EXPECTED,
+      ready: false,
+      failed: ['reconcile_rpc_contract', "'; DROP TABLE x; -- https://leak.example"],
+    });
+
+    const r = await getCommercialSchemaReadiness(ENV);
+    expect(r.failed).toContain('reconcile_rpc_contract');
+    expect(r.failed).toContain('commercial_schema_unknown_failure');
+    expect(JSON.stringify(r)).not.toMatch(/DROP TABLE|https:\/\/leak/);
+  });
+});
+
+describe('target-keyed readiness cache + token binding', () => {
+  it('a READY for target A does not satisfy target B (distinct cache entries)', async () => {
+    rpcReturns({ expected_version: EXPECTED, ready: true, failed: [] });
+
+    const a = await getCommercialSchemaReadiness(ENV);
+
+    // Different Supabase host → different target key → a fresh probe (not A's cache).
+    rpcReturns({ expected_version: EXPECTED, ready: false, failed: ['reconcile_rpc_contract'] });
+
+    const b = await getCommercialSchemaReadiness(ENV_B);
+
+    expect(a.state).toBe('READY');
+    expect(b.state).toBe('NOT_READY');
+    expect(a.targetKey).not.toBe(b.targetKey);
+    expect(S.rpc).toHaveBeenCalledTimes(2); // B was not served from A's cache
+  });
+
+  it('staging READY cannot satisfy production (different deploy env → different target)', () => {
+    expect(commercialTargetKey(ENV_STAGING)).not.toBe(commercialTargetKey(ENV_PROD));
+  });
+
+  it('a token minted for target A is rejected against target B', async () => {
+    rpcReturns({ expected_version: EXPECTED, ready: true, failed: [] });
+
+    const tokenA = await assertCommercialSchemaReady(ENV);
+
+    // Same token, different target → must throw (staging token cannot authorize prod).
+    expect(() => assertReadyToken(tokenA, ENV_PROD)).toThrow(CommercialNotReadyError);
+
+    // But it is valid for its own target.
+    expect(() => assertReadyToken(tokenA, ENV)).not.toThrow();
+  });
+
+  it('a forged/empty token is rejected', () => {
+    expect(() => assertReadyToken({ schemaVersion: 'x', targetKey: 'y', checkedAt: 'z' } as never, ENV)).toThrow(
+      CommercialNotReadyError,
+    );
+  });
+});
+
 describe('predeploy schema smoke check wires the commercial verifier (additive)', () => {
   const script = readFileSync(fileURLToPath(new URL('../../scripts/schema-smoke-check.mjs', import.meta.url)), 'utf8');
 
@@ -203,5 +279,20 @@ describe('predeploy schema smoke check wires the commercial verifier (additive)'
     expect(script).toMatch(/qhub_verify_agent_schema/);
     expect(script).toContain('2026-07-26.gate04');
     expect(script).toContain('2026-07-27.agent-foundation');
+  });
+
+  it('has NO staging/production skip — only a local-test bypass exists', () => {
+    // The old staging bypass ("authorized-staging-bypass") must be gone.
+    expect(script).not.toMatch(/authorized-staging-bypass/);
+    expect(script).toMatch(/localTestBypassDecision/);
+    expect(script).toMatch(/QHUB_LOCAL_TEST_SCHEMA_BYPASS/);
+
+    // A deployed target can never bypass.
+    expect(script).toMatch(/deployed-target-never-bypasses/);
+  });
+
+  it('local-test bypass requires NODE_ENV=test AND the explicit test-only flag', () => {
+    expect(script).toMatch(/NODE_ENV.*===.*['"]test['"]/);
+    expect(script).toMatch(/QHUB_LOCAL_TEST_SCHEMA_BYPASS === '1'/);
   });
 });

@@ -1,3 +1,4 @@
+// @qhub-route: STAFF_ONLY
 /**
  * QHUB schema diagnostic — app/routes/api.system.schema-check.ts
  *
@@ -9,12 +10,13 @@
  * closure mismatch immediately (deployed Studio pointed at a project missing
  * the classification migration).
  *
- * ACCESS: requires an authenticated QHUB session. Unauthenticated callers get
- * 401 — the detailed diff (project ref, host, object inventory) is operator
- * information, so the public surface is limited to the generic /api/health.
+ * ACCESS: Quantex-STAFF-ONLY. Unauthenticated / non-staff callers get the generic
+ * guard response; the public surface is limited to the generic /api/health.
  *
- * NEVER returns keys — only the project ref (already public in every API URL)
- * and the Supabase host. Pass ?force=1 to bypass the readiness cache.
+ * PRIVACY: NEVER returns keys, connection details, the raw project URL, the Supabase
+ * host, or the project ref. Identifiers are limited to required schema object names +
+ * safe allowlisted readiness codes + a non-reversible target fingerprint. Pass ?force=1
+ * to bypass the readiness cache.
  *
  * Returns 200 when ready, 503 when the project is behind the code.
  */
@@ -53,8 +55,9 @@ export const loader = async ({ request, context }: LoaderFunctionArgs) => {
       ok: true,
       ready: report.ready,
       expectedSchemaVersion: report.expectedSchemaVersion,
-      projectRef: report.projectRef,
-      supabaseHost: report.supabaseHost,
+
+      // Non-sensitive deployment context (no project ref / host / URL / connection data).
+      deploymentEnvironment: (env.QHUB_DEPLOY_ENV ?? 'unknown').toLowerCase(),
       checkedAt: report.checkedAt,
       objects: report.objects.map((o) => ({
         identifier: o.identifier ?? `${o.table}.${o.column}`,
@@ -85,13 +88,17 @@ export const loader = async ({ request, context }: LoaderFunctionArgs) => {
         ...(agent.error ? { error: agent.error } : {}),
       },
 
-      // Commercial Launch readiness (separate contract; compact, non-secret).
+      /*
+       * Commercial Launch readiness (separate contract; compact, non-secret). Only a
+       * non-reversible target fingerprint is surfaced — never the project URL/host.
+       */
       commercial: {
         state: commercial.state,
         ready: commercial.state === 'READY',
         expectedSchemaVersion: commercial.expected,
         actualSchemaVersion: commercial.version ?? null,
         failed: commercial.failed,
+        targetFingerprint: commercial.targetKey,
         checkedAt: commercial.checkedAt,
         ...(commercial.cacheAgeMs !== undefined ? { cacheAgeMs: commercial.cacheAgeMs } : {}),
       },

@@ -218,8 +218,12 @@ describe('GET /api/system/schema-check requires authentication', () => {
     const body = (await res.json()) as any;
     expect(body.ok).toBe(true);
     expect(body.ready).toBe(true);
-    expect(body.projectRef).toBe('jsjsanmaahvmynblmzkq'); // operator detail is allowed here
     expect(Array.isArray(body.objects)).toBe(true);
+
+    // R4 privacy: the project ref / host / URL are NEVER surfaced in diagnostics.
+    expect(body.projectRef).toBeUndefined();
+    expect(body.supabaseHost).toBeUndefined();
+    expect(JSON.stringify(body)).not.toContain('jsjsanmaahvmynblmzkq');
   });
 
   it('returns 503 to an authenticated caller when the project is behind', async () => {

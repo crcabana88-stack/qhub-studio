@@ -1,17 +1,22 @@
 /**
- * QHUB Commercial Launch R3 — PROTECTED COMMERCIAL SERVICE LAYER (SERVER ONLY)
+ * QHUB Commercial Launch R4 — PROTECTED COMMERCIAL SERVICE LAYER (SERVER ONLY)
  * app/lib/qhub/commercial/commercial-service.server.ts
  *
- * The lowest practical shared boundary for commercial work. Every function REQUIRES
- * a CommercialExecutionContext (produced only by the authoritative resolver +
- * project-ownership binding) and re-checks capability + Governance Essentials +
- * credits before doing protected work. Callers cannot supply raw org/plan/project
- * authority or claim they already passed authorization.
+ * The lowest practical shared boundary for commercial work. Every mutating function
+ * REQUIRES both a CommercialExecutionContext (produced only by the authoritative
+ * resolver + project-ownership binding) AND a branded CommercialReadyToken (produced
+ * only by the central readiness service after an exact READY result). It re-checks
+ * capability + Governance Essentials + readiness token + credits before doing protected
+ * work. Callers cannot supply raw org/plan/project authority, forge the token, or claim
+ * they already passed authorization.
+ *
+ * Each exported function is tagged `@qhub-service: <classification>` for the executable
+ * architecture test (commercial-architecture.test.ts).
  */
 
 import type { CommercialExecutionContext } from '~/lib/qhub/commercial/commercial-context.server';
 import { hasCapability, type Capability } from '~/lib/qhub/commercial/capabilities';
-import { getCommercialSchemaReadiness } from '~/lib/qhub/commercial/commercial-schema-check.server';
+import { assertReadyToken, type CommercialReadyToken } from '~/lib/qhub/commercial/commercial-schema-check.server';
 import {
   getGovernanceRecord,
   isModelInvocationAllowed,
@@ -37,13 +42,17 @@ function requireCap(ctx: CommercialExecutionContext, cap: Capability): boolean {
 }
 
 /**
- * Server-authoritative schema readiness — the lowest-boundary fail-closed check.
- * Returns true only when the commercial schema is fully READY; every non-READY state
- * (NOT_READY / UNAVAILABLE / CONFIGURATION_ERROR) fails closed.
+ * Non-throwing readiness-token check: true only when the token proves an exact READY
+ * result for the CURRENT target. Every non-READY / wrong-target / forged token is false.
  */
-async function schemaReady(env: Record<string, string | undefined>): Promise<boolean> {
-  const r = await getCommercialSchemaReadiness(env);
-  return r.state === 'READY';
+function tokenValid(token: CommercialReadyToken, env: Record<string, string | undefined>): boolean {
+  try {
+    assertReadyToken(token, env);
+
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 // ─── Canonical request hash (binds the MATERIAL build request) ──────────────────
@@ -66,6 +75,7 @@ async function sha256Hex(s: string): Promise<string> {
 }
 
 /**
+ * @qhub-service: PURE_NO_IO
  * Canonical, timestamp-independent request identity binding org/project/user/model/
  * input/action/template/units/governance version. Message count is NOT used.
  */
@@ -86,7 +96,7 @@ export async function canonicalRequestHash(
     req.governanceVersion,
   ];
 
-  return sha256Hex(parts.join(''));
+  return sha256Hex(parts.join(''));
 }
 
 // ─── invokeCommercialModel ──────────────────────────────────────────────────────
@@ -97,15 +107,17 @@ export interface ModelInvokeResult {
 }
 
 /**
+ * @qhub-service: REQUIRES_COMMERCIAL_READY_TOKEN
  * The ONLY commercial path to a model invocation. Enforces (in order): execution
- * context present, MODEL_INVOKE capability, not suspended, Governance Essentials
- * complete + acknowledged + T0/T1 + PROCEED/approved-review, then consumes credit
- * atomically BEFORE the expensive model call via the caller-supplied runner.
+ * context present, MODEL_INVOKE capability, not suspended, readiness token valid,
+ * Governance Essentials complete + acknowledged + T0/T1 + PROCEED/approved-review, then
+ * consumes credit atomically (token re-validated at the store) BEFORE the model runner.
  */
 export async function invokeCommercialModel<T>(
   ctx: CommercialExecutionContext,
   req: CommercialBuildRequest,
   idempotencyKey: string,
+  token: CommercialReadyToken,
   env: Record<string, string | undefined>,
   runner: () => Promise<T>,
 ): Promise<ServiceOutcome<{ result: T; credit: CreditResult }>> {
@@ -121,8 +133,8 @@ export async function invokeCommercialModel<T>(
     return { ok: false, reason: 'capability_denied' };
   }
 
-  // Fail closed on schema readiness BEFORE credit consumption or the model runner.
-  if (!(await schemaReady(env))) {
+  // Fail closed on readiness BEFORE credit consumption or the model runner.
+  if (!tokenValid(token, env)) {
     return { ok: false, reason: 'schema_not_ready' };
   }
 
@@ -134,6 +146,7 @@ export async function invokeCommercialModel<T>(
 
   const hash = await canonicalRequestHash(ctx, req);
   const credit = await consumeBuildCredit(
+    token,
     { projectId: ctx.projectId, idempotencyKey, canonicalHash: hash, units: req.units },
     env,
   );
@@ -149,9 +162,13 @@ export async function invokeCommercialModel<T>(
 
 // ─── createCommercialProject / export / publication request ─────────────────────
 
+/**
+ * @qhub-service: REQUIRES_COMMERCIAL_READY_TOKEN
+ */
 export async function createCommercialProject(
   ctx: CommercialExecutionContext | Omit<CommercialExecutionContext, 'projectId' | 'projectOrgId'>,
   input: { idempotencyKey: string; requestHash: string },
+  token: CommercialReadyToken,
   env: Record<string, string | undefined>,
 ): Promise<ServiceOutcome<{ projectId: string; idempotent?: boolean }>> {
   if (!ctx.capabilities || !hasCapability(ctx.capabilities, 'PROJECT_CREATE')) {
@@ -162,17 +179,19 @@ export async function createCommercialProject(
     return { ok: false, reason: 'no_org_context' };
   }
 
-  // Fail closed on schema readiness BEFORE any project write.
-  if (!(await schemaReady(env))) {
+  // Fail closed on readiness BEFORE any project write.
+  if (!tokenValid(token, env)) {
     return { ok: false, reason: 'schema_not_ready' };
   }
 
   /*
    * ONE atomic RPC: derives + locks org/subscription/active-count, enforces the plan
    * cap and idempotency, inserts project + entitlement, appends audit — all-or-nothing.
+   * The store's mutator() re-validates the token before the write.
    */
   const { createProjectAtomic } = await import('~/lib/qhub/commercial/commercial-store.server');
   const created = await createProjectAtomic(
+    token,
     { orgId: ctx.orgId, createdBy: ctx.userId, idempotencyKey: input.idempotencyKey, requestHash: input.requestHash },
     env,
   );
@@ -184,8 +203,12 @@ export async function createCommercialProject(
   return { ok: true, value: { projectId: created.project_id, idempotent: created.idempotent } };
 }
 
+/**
+ * @qhub-service: REQUIRES_COMMERCIAL_READY_TOKEN
+ */
 export async function exportCommercialProject(
   ctx: CommercialExecutionContext,
+  token: CommercialReadyToken,
   env: Record<string, string | undefined>,
 ): Promise<ServiceOutcome<{ projectId: string }>> {
   if (!isExecutionContext(ctx)) {
@@ -196,16 +219,20 @@ export async function exportCommercialProject(
     return { ok: false, reason: 'capability_denied' };
   }
 
-  // Fail closed on schema readiness BEFORE producing any evidence export.
-  if (!(await schemaReady(env))) {
+  // Fail closed on readiness BEFORE producing any evidence export.
+  if (!tokenValid(token, env)) {
     return { ok: false, reason: 'schema_not_ready' };
   }
 
   return { ok: true, value: { projectId: ctx.projectId } };
 }
 
+/**
+ * @qhub-service: REQUIRES_COMMERCIAL_READY_TOKEN
+ */
 export async function requestCommercialPublication(
   ctx: CommercialExecutionContext,
+  token: CommercialReadyToken,
   env: Record<string, string | undefined>,
 ): Promise<ServiceOutcome<{ projectId: string; publishable: boolean }>> {
   if (!isExecutionContext(ctx)) {
@@ -216,8 +243,8 @@ export async function requestCommercialPublication(
     return { ok: false, reason: 'capability_denied' };
   }
 
-  // Fail closed on schema readiness BEFORE any publication request.
-  if (!(await schemaReady(env))) {
+  // Fail closed on readiness BEFORE any publication request.
+  if (!tokenValid(token, env)) {
     return { ok: false, reason: 'schema_not_ready' };
   }
 
