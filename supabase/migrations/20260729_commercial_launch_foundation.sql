@@ -64,6 +64,10 @@ CREATE TABLE IF NOT EXISTS public.qhub_org_invitations (
   accepted_by  TEXT,
   created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+-- At most one ACTIVE (invited) invitation per org+email (normalized lower-case).
+CREATE UNIQUE INDEX IF NOT EXISTS uq_qhub_invitation_active
+  ON public.qhub_org_invitations (org_id, lower(email))
+  WHERE (status = 'invited');
 
 -- ─── Billing customers (mode/account bound, unique both directions) ──────────
 CREATE TABLE IF NOT EXISTS public.qhub_billing_customers (
@@ -109,20 +113,33 @@ CREATE TABLE IF NOT EXISTS public.qhub_subscriptions (
 );
 
 -- ─── Checkout intents (opaque tenant binding — metadata is never authority) ──
+-- The browser chooses only an internal plan. The server binds all authority here
+-- (org, membership, exact prices, mode, account, origin) BEFORE Stripe is called;
+-- only the opaque id travels in Stripe metadata, and the webhook consumes it.
 CREATE TABLE IF NOT EXISTS public.qhub_checkout_intents (
-  id                UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-  org_id            TEXT NOT NULL,
-  requested_by      TEXT NOT NULL,
-  plan_id           TEXT NOT NULL REFERENCES public.qhub_commercial_plans (plan_id),
-  expected_price_ids TEXT[] NOT NULL DEFAULT ARRAY[]::TEXT[],
-  expected_mode     TEXT NOT NULL DEFAULT 'test' CHECK (expected_mode IN ('test','live')),
-  nonce             TEXT NOT NULL,
-  status            TEXT NOT NULL DEFAULT 'pending'
-                    CHECK (status IN ('pending','consumed','expired')),
-  expires_at        TIMESTAMPTZ NOT NULL,
-  consumed_at       TIMESTAMPTZ,
-  created_at        TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-  UNIQUE (nonce)
+  id                       UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  org_id                   TEXT NOT NULL,
+  requested_by             TEXT NOT NULL,
+  membership_id            TEXT,
+  plan_id                  TEXT NOT NULL REFERENCES public.qhub_commercial_plans (plan_id),
+  expected_recurring_price_id TEXT NOT NULL,
+  expected_setup_price_id  TEXT,
+  expected_mode            TEXT NOT NULL DEFAULT 'test' CHECK (expected_mode IN ('test','live')),
+  expected_account         TEXT,
+  expected_app_origin      TEXT NOT NULL,
+  idempotency_key          TEXT NOT NULL,
+  nonce                    TEXT NOT NULL,
+  status                   TEXT NOT NULL DEFAULT 'pending'
+                           CHECK (status IN ('pending','consumed','expired','failed')),
+  checkout_session_id      TEXT,
+  customer_id              TEXT,
+  subscription_id          TEXT,
+  failure_code             TEXT,
+  expires_at               TIMESTAMPTZ NOT NULL,
+  consumed_at              TIMESTAMPTZ,
+  created_at               TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  UNIQUE (nonce),
+  UNIQUE (org_id, idempotency_key)
 );
 
 -- ─── Webhook inbox (recoverable state machine with LEASES) ───────────────────
@@ -502,6 +519,112 @@ BEGIN
 END;
 $$;
 
+-- ─── Transactional invitation acceptance with seat-limit enforcement (R3) ────
+-- Locks the org's memberships, counts ACTIVE seats, and admits the invitee only
+-- while under the plan cap. Concurrent acceptances serialize on the lock, so the
+-- cap can never be exceeded. Returns ACCEPTED | SEAT_LIMIT | INVALID | ALREADY.
+CREATE OR REPLACE FUNCTION public.qhub_accept_invitation(
+  p_invitation_id UUID, p_user_id TEXT, p_max_seats INTEGER
+) RETURNS TEXT
+LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, public AS $$
+DECLARE
+  v_org  TEXT;
+  v_role TEXT;
+  v_status TEXT;
+  v_expires TIMESTAMPTZ;
+  v_seats INTEGER;
+BEGIN
+  SELECT org_id, role, status, expires_at INTO v_org, v_role, v_status, v_expires
+    FROM public.qhub_org_invitations WHERE id = p_invitation_id FOR UPDATE;
+
+  IF NOT FOUND OR v_status <> 'invited' THEN
+    RETURN 'INVALID';
+  END IF;
+
+  IF v_expires < NOW() THEN
+    UPDATE public.qhub_org_invitations SET status='expired' WHERE id = p_invitation_id;
+    RETURN 'INVALID';
+  END IF;
+
+  -- Already a member? Idempotent no-op.
+  IF EXISTS (SELECT 1 FROM public.qhub_org_members WHERE user_id = p_user_id AND org_id = v_org) THEN
+    UPDATE public.qhub_org_invitations SET status='accepted', accepted_by=p_user_id WHERE id = p_invitation_id;
+    RETURN 'ALREADY';
+  END IF;
+
+  -- Lock the org's members and count active seats under the lock.
+  PERFORM 1 FROM public.qhub_org_members WHERE org_id = v_org FOR UPDATE;
+  SELECT count(*) INTO v_seats FROM public.qhub_org_members WHERE org_id = v_org AND status = 'active';
+
+  IF v_seats >= p_max_seats THEN
+    RETURN 'SEAT_LIMIT';
+  END IF;
+
+  INSERT INTO public.qhub_org_members (user_id, org_id, role, status, accepted_at)
+  VALUES (p_user_id, v_org, v_role, 'active', NOW());
+
+  UPDATE public.qhub_org_invitations SET status='accepted', accepted_by=p_user_id WHERE id = p_invitation_id;
+
+  RETURN 'ACCEPTED';
+END;
+$$;
+
+-- ─── Atomic checkout-intent consumption (R3) ─────────────────────────────────
+-- Loads an intent by opaque id under lock, verifies it is pending + unexpired +
+-- unconsumed and that the resolved Stripe object matches the bound expectations,
+-- then marks it consumed and records the session/customer/subscription. Returns
+-- CONSUMED | EXPIRED | ALREADY | MISMATCH | NOT_FOUND.
+CREATE OR REPLACE FUNCTION public.qhub_consume_checkout_intent(
+  p_intent_id UUID, p_org_id TEXT, p_recurring_price TEXT, p_mode TEXT, p_account TEXT,
+  p_session_id TEXT, p_customer_id TEXT, p_subscription_id TEXT
+) RETURNS TEXT
+LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, public AS $$
+DECLARE
+  r RECORD;
+BEGIN
+  SELECT * INTO r FROM public.qhub_checkout_intents WHERE id = p_intent_id FOR UPDATE;
+
+  IF NOT FOUND THEN
+    RETURN 'NOT_FOUND';
+  END IF;
+
+  IF r.status = 'consumed' THEN
+    -- Idempotent only for the SAME resulting subscription; a different object is a mismatch.
+    IF r.subscription_id IS NOT DISTINCT FROM p_subscription_id THEN
+      RETURN 'ALREADY';
+    END IF;
+
+    RETURN 'MISMATCH';
+  END IF;
+
+  IF r.status <> 'pending' THEN
+    RETURN 'MISMATCH';
+  END IF;
+
+  IF r.expires_at < NOW() THEN
+    UPDATE public.qhub_checkout_intents SET status='expired' WHERE id = p_intent_id;
+    RETURN 'EXPIRED';
+  END IF;
+
+  IF r.org_id IS DISTINCT FROM p_org_id
+     OR r.expected_recurring_price_id IS DISTINCT FROM p_recurring_price
+     OR r.expected_mode IS DISTINCT FROM p_mode
+     OR (r.expected_account IS NOT NULL AND r.expected_account IS DISTINCT FROM p_account) THEN
+    UPDATE public.qhub_checkout_intents
+       SET status='failed', failure_code='binding_mismatch', checkout_session_id=p_session_id
+     WHERE id = p_intent_id;
+    RETURN 'MISMATCH';
+  END IF;
+
+  UPDATE public.qhub_checkout_intents
+     SET status='consumed', consumed_at=NOW(), checkout_session_id=p_session_id,
+         customer_id=p_customer_id, subscription_id=p_subscription_id
+   WHERE id = p_intent_id;
+
+  RETURN 'CONSUMED';
+END;
+$$;
+
 -- ─── RLS: RESTRICTIVE service-only on every commercial table ─────────────────
 DO $$
 DECLARE
@@ -534,6 +657,10 @@ REVOKE ALL ON FUNCTION public.qhub_consume_build_credit(UUID, TEXT, TEXT, INTEGE
 GRANT EXECUTE ON FUNCTION public.qhub_consume_build_credit(UUID, TEXT, TEXT, INTEGER) TO service_role;
 REVOKE ALL ON FUNCTION public.qhub_claim_webhook_event(TEXT, TEXT, TEXT, BOOLEAN, TEXT, BIGINT, TEXT, TEXT, INTEGER) FROM PUBLIC, anon, authenticated;
 GRANT EXECUTE ON FUNCTION public.qhub_claim_webhook_event(TEXT, TEXT, TEXT, BOOLEAN, TEXT, BIGINT, TEXT, TEXT, INTEGER) TO service_role;
+REVOKE ALL ON FUNCTION public.qhub_accept_invitation(UUID, TEXT, INTEGER) FROM PUBLIC, anon, authenticated;
+GRANT EXECUTE ON FUNCTION public.qhub_accept_invitation(UUID, TEXT, INTEGER) TO service_role;
+REVOKE ALL ON FUNCTION public.qhub_consume_checkout_intent(UUID, TEXT, TEXT, TEXT, TEXT, TEXT, TEXT, TEXT) FROM PUBLIC, anon, authenticated;
+GRANT EXECUTE ON FUNCTION public.qhub_consume_checkout_intent(UUID, TEXT, TEXT, TEXT, TEXT, TEXT, TEXT, TEXT) TO service_role;
 
 -- ─── Seed plan identity (idempotent) ────────────────────────────────────────
 INSERT INTO public.qhub_commercial_plans (plan_id, display_name, active)
@@ -661,6 +788,39 @@ BEGIN
   IF NOT EXISTS (SELECT 1 FROM pg_trigger WHERE tgname='trg_qhub_usage_ledger_immutable'
                    AND tgrelid='public.qhub_usage_ledger'::regclass) THEN
     v_failed := v_failed || 'ledger_immutable_contract'::text;
+  END IF;
+
+  -- Checkout-intent idempotency uniqueness (org_id, idempotency_key).
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_constraint WHERE conrelid='public.qhub_checkout_intents'::regclass AND contype='u'
+      AND conkey @> (SELECT ARRAY[attnum] FROM pg_attribute WHERE attrelid='public.qhub_checkout_intents'::regclass AND attname='idempotency_key')
+  ) THEN
+    v_failed := v_failed || 'missing_unique:checkout_intent_idempotency'::text;
+  END IF;
+
+  -- Active-invitation uniqueness (one invited per org+email).
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_indexes WHERE schemaname='public' AND indexname='uq_qhub_invitation_active'
+      AND indexdef LIKE '%UNIQUE%' AND indexdef LIKE '%lower(email)%'
+  ) THEN
+    v_failed := v_failed || 'invitation_active_uniqueness'::text;
+  END IF;
+
+  -- Seat-accept + checkout-intent-consume RPCs: exist, SECURITY DEFINER, fixed
+  -- search_path, and denied to browser roles.
+  PERFORM 1 FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace
+    WHERE n.nspname='public' AND p.proname='qhub_accept_invitation'
+      AND p.prosecdef AND p.proconfig @> ARRAY['search_path=pg_catalog, public'];
+  IF NOT FOUND THEN v_failed := v_failed || 'seat_rpc_contract'::text; END IF;
+
+  PERFORM 1 FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace
+    WHERE n.nspname='public' AND p.proname='qhub_consume_checkout_intent'
+      AND p.prosecdef AND p.proconfig @> ARRAY['search_path=pg_catalog, public'];
+  IF NOT FOUND THEN v_failed := v_failed || 'checkout_consume_rpc_contract'::text; END IF;
+
+  IF has_function_privilege('anon','public.qhub_accept_invitation(uuid,text,integer)','EXECUTE')
+     OR has_function_privilege('authenticated','public.qhub_accept_invitation(uuid,text,integer)','EXECUTE') THEN
+    v_failed := v_failed || 'seat_rpc_browser_exec'::text;
   END IF;
 
   RETURN jsonb_build_object(

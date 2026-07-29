@@ -16,6 +16,8 @@ const H = vi.hoisted(() => ({
   upsertCustomer: vi.fn(),
   verify: vi.fn(),
   retrieve: vi.fn(),
+  getIntent: vi.fn(),
+  consumeIntent: vi.fn(),
 }));
 
 vi.mock('~/lib/qhub/commercial/billing/stripe-provider.server', () => ({
@@ -28,6 +30,8 @@ vi.mock('~/lib/qhub/commercial/commercial-store.server', () => ({
   getOrgByCustomer: H.getOrgByCustomer,
   setWebhookState: H.setState,
   upsertBillingCustomer: H.upsertCustomer,
+  getCheckoutIntent: H.getIntent,
+  consumeCheckoutIntent: H.consumeIntent,
 }));
 
 import { action } from '~/routes/api.billing.webhook';
@@ -95,6 +99,14 @@ beforeEach(() => {
     },
   });
   H.getOrgByCustomer.mockResolvedValue('org_1');
+  H.getIntent.mockResolvedValue({
+    orgId: 'org_1',
+    planId: 'builder_beta',
+    recurringPriceId: 'price_ok',
+    mode: 'test',
+    account: null,
+  });
+  H.consumeIntent.mockResolvedValue('CONSUMED');
 });
 
 describe('webhook verification failures', () => {
@@ -204,29 +216,66 @@ describe('authoritative reconciliation', () => {
     expect(res.status).toBe(200);
   });
 
-  it('rejects an org/customer mismatch permanently', async () => {
+  it('subscription.updated with no authoritative customer mapping fails permanently', async () => {
     verifyOk(evt());
     H.claim.mockResolvedValue('CLAIMED');
-    H.getOrgByCustomer.mockResolvedValue('org_A'); // mapping says A
-    H.retrieve.mockResolvedValue({
-      ok: true,
-      value: {
-        id: 'sub_1',
-        customerId: 'cus_1',
-        status: 'active',
-        priceId: 'price_ok',
-        livemode: false,
-        currentPeriodEnd: 1,
-        metadata: { org_id: 'org_B' },
-      },
-    });
+    H.getOrgByCustomer.mockResolvedValue(null); // no mapping → metadata cannot establish org
 
     const res = (await action(req())) as Response;
     expect(H.setState).toHaveBeenCalledWith(
-      expect.objectContaining({ state: 'FAILED_PERMANENT', errorCode: 'org_customer_mismatch' }),
+      expect.objectContaining({ state: 'FAILED_PERMANENT', errorCode: 'unknown_customer' }),
       expect.anything(),
     );
     expect(res.status).toBe(200);
+  });
+
+  it('checkout.completed binds the tenant ONLY via the consumed checkout intent', async () => {
+    verifyOk(evt({ type: 'checkout.completed', rawType: 'checkout.session.completed', checkoutIntentId: 'intent_1' }));
+    H.claim.mockResolvedValue('CLAIMED');
+
+    const res = (await action(req())) as Response;
+    expect(res.status).toBe(200);
+    expect(H.getIntent).toHaveBeenCalledWith('intent_1', expect.anything());
+    expect(H.consumeIntent).toHaveBeenCalledTimes(1);
+    expect(H.apply).toHaveBeenCalledWith(expect.objectContaining({ orgId: 'org_1' }), expect.anything());
+    expect(H.setState).toHaveBeenCalledWith(expect.objectContaining({ state: 'PROCESSED' }), expect.anything());
+  });
+
+  it('checkout.completed without an intent id is a permanent failure', async () => {
+    verifyOk(evt({ type: 'checkout.completed', rawType: 'checkout.session.completed', checkoutIntentId: undefined }));
+    H.claim.mockResolvedValue('CLAIMED');
+
+    const res = (await action(req())) as Response;
+    expect(H.setState).toHaveBeenCalledWith(
+      expect.objectContaining({ state: 'FAILED_PERMANENT', errorCode: 'missing_checkout_intent' }),
+      expect.anything(),
+    );
+    expect(res.status).toBe(200);
+  });
+
+  it('checkout.completed rejects an intent binding mismatch permanently', async () => {
+    verifyOk(evt({ type: 'checkout.completed', rawType: 'checkout.session.completed', checkoutIntentId: 'intent_1' }));
+    H.claim.mockResolvedValue('CLAIMED');
+    H.consumeIntent.mockResolvedValue('MISMATCH');
+
+    const res = (await action(req())) as Response;
+    expect(H.setState).toHaveBeenCalledWith(
+      expect.objectContaining({ state: 'FAILED_PERMANENT', errorCode: 'checkout_intent_mismatch' }),
+      expect.anything(),
+    );
+    expect(H.apply).not.toHaveBeenCalled();
+    expect(res.status).toBe(200);
+  });
+
+  it('checkout.completed exact replay (ALREADY) is idempotent', async () => {
+    verifyOk(evt({ type: 'checkout.completed', rawType: 'checkout.session.completed', checkoutIntentId: 'intent_1' }));
+    H.claim.mockResolvedValue('CLAIMED');
+    H.consumeIntent.mockResolvedValue('ALREADY');
+
+    const res = (await action(req())) as Response;
+    expect(res.status).toBe(200);
+    expect(H.apply).not.toHaveBeenCalled();
+    expect(H.setState).toHaveBeenCalledWith(expect.objectContaining({ state: 'PROCESSED' }), expect.anything());
   });
 
   it('stays retryable (500) on a transient Stripe retrieval error', async () => {

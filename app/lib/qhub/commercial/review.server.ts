@@ -127,12 +127,16 @@ export async function decideReviewRequest(
   const sb = admin(env);
   const { data: req } = await sb
     .from('qhub_manual_review_requests')
-    .select('id,category,status')
+    .select('id,category,status,org_id,project_id')
     .eq('id', input.requestId)
     .maybeSingle();
 
   if (!req) {
     return { ok: false, error: 'not_found' };
+  }
+
+  if (req.status !== 'pending') {
+    return { ok: false, error: 'not_pending' };
   }
 
   if (input.decision === 'approved' && req.category && PROHIBITED_CATEGORIES.has(req.category as string)) {
@@ -150,7 +154,48 @@ export async function decideReviewRequest(
     })
     .eq('id', input.requestId);
 
+  // Atomically reflect the decision in the project's Governance Essentials workflow.
+  if (req.project_id) {
+    await sb
+      .from('qhub_governance_essentials')
+      .update({
+        review_state: input.decision === 'approved' ? 'approved' : 'rejected',
+        reviewed_by: ctx.userId,
+        reviewed_at: new Date().toISOString(),
+        review_policy_version: input.policyVersion,
+        updated_at: new Date().toISOString(),
+      })
+      .eq('project_id', req.project_id as string)
+      .eq('org_id', req.org_id as string);
+  }
+
   return { ok: true };
+}
+
+/** Fetch a review request scoped to the caller's org (customer view). */
+export async function getReviewRequestForOrg(
+  requestId: string,
+  orgId: string,
+  env: Record<string, string | undefined>,
+): Promise<{ id: string; status: string; category: string | null; projectId: string | null } | null> {
+  const sb = admin(env);
+  const { data } = await sb
+    .from('qhub_manual_review_requests')
+    .select('id,status,category,project_id')
+    .eq('id', requestId)
+    .eq('org_id', orgId)
+    .maybeSingle();
+
+  if (!data) {
+    return null;
+  }
+
+  return {
+    id: data.id as string,
+    status: data.status as string,
+    category: (data.category as string) ?? null,
+    projectId: (data.project_id as string) ?? null,
+  };
 }
 
 /**

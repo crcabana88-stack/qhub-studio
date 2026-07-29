@@ -22,6 +22,8 @@ import { createBillingProvider, planIdForConfiguredPrice } from '~/lib/qhub/comm
 import {
   applySubscriptionEvent,
   claimWebhookEvent,
+  consumeCheckoutIntent,
+  getCheckoutIntent,
   getOrgByCustomer,
   setWebhookState,
   upsertBillingCustomer,
@@ -156,80 +158,97 @@ async function reconcileAndApply(
   }
 
   /*
-   * checkout.completed / subscription.updated: NEVER trust event metadata alone —
-   * retrieve and validate the authoritative subscription object from Stripe.
+   * checkout.completed: the tenant comes ONLY from the opaque checkout intent —
+   * never from metadata. Retrieve + validate the authoritative Stripe subscription,
+   * then load and CONSUME the intent (which validates org/price/mode/account) and
+   * bind the customer/subscription to the intent's org.
    */
-  if (event.type === 'checkout.completed' || event.type === 'subscription.updated') {
-    if (!event.providerSubscriptionId) {
-      throw new PermanentError('missing_subscription');
+  if (event.type === 'checkout.completed') {
+    if (!event.checkoutIntentId) {
+      throw new PermanentError('missing_checkout_intent');
     }
 
-    const retrieved = await provider.retrieveSubscription(event.providerSubscriptionId);
+    const sub = await retrieveValidSubscription(event, provider);
+    const intent = await getCheckoutIntent(event.checkoutIntentId, env);
 
-    if (!retrieved.ok) {
-      // Transient (network / Stripe error) — stay retryable.
-      throw new Error(retrieved.error);
+    if (!intent) {
+      throw new PermanentError('unknown_checkout_intent');
     }
 
-    const sub = retrieved.value;
+    const consume = await consumeCheckoutIntent(
+      {
+        intentId: event.checkoutIntentId,
+        orgId: intent.orgId,
+        recurringPriceId: sub.priceId as string,
+        mode: sub.livemode ? 'live' : 'test',
+        account: event.stripeAccount ?? null,
+        sessionId: event.providerSubscriptionId ?? '',
+        customerId: sub.customerId,
+        subscriptionId: sub.id,
+      },
+      env,
+    );
 
-    // Mode binding.
-    if (sub.livemode !== provider.expectedLivemode()) {
-      throw new PermanentError('mode_mismatch');
+    if (consume === 'ALREADY') {
+      return; // exact replay — already bound this subscription
     }
 
-    // Customer must match the event's customer.
-    if (event.providerCustomerId && sub.customerId !== event.providerCustomerId) {
-      throw new PermanentError('customer_mismatch');
+    if (consume !== 'CONSUMED') {
+      throw new PermanentError(`checkout_intent_${consume.toLowerCase()}`);
     }
 
-    // The recurring price must be one of the server-configured prices.
-    if (!sub.priceId || !provider.isConfiguredPrice(sub.priceId)) {
-      throw new PermanentError('unknown_price');
-    }
+    await upsertBillingCustomer(
+      {
+        orgId: intent.orgId,
+        provider: provider.id,
+        providerCustomerId: sub.customerId,
+        email: '',
+        livemode: sub.livemode,
+        stripeAccount: event.stripeAccount,
+      },
+      env,
+    );
+    await applySubscriptionEvent(
+      {
+        orgId: intent.orgId,
+        planId: (planIdForConfiguredPrice(sub.priceId as string, env) ?? intent.planId) as never,
+        status: sub.status,
+        provider: provider.id,
+        providerCustomerId: sub.customerId,
+        providerSubscriptionId: sub.id,
+        providerPriceId: sub.priceId ?? undefined,
+        currentPeriodEnd: sub.currentPeriodEnd ?? undefined,
+        eventCreated: event.eventCreated,
+        livemode: sub.livemode,
+        stripeAccount: event.stripeAccount,
+      },
+      env,
+    );
 
-    const planId = planIdForConfiguredPrice(sub.priceId, env) ?? 'none';
+    return;
+  }
 
-    /*
-     * Authoritative org: prefer the existing customer mapping; else bootstrap from
-     * the subscription metadata (advisory), then require consistency thereafter.
-     */
-    const mappedOrg = await getOrgByCustomer(provider.id, sub.customerId, env);
-    const metaOrg = sub.metadata.org_id ?? event.orgId;
-
-    if (mappedOrg && metaOrg && mappedOrg !== metaOrg) {
-      throw new PermanentError('org_customer_mismatch');
-    }
-
-    const org = mappedOrg ?? metaOrg;
+  /*
+   * subscription.updated: reconcile an EXISTING authoritative customer→org mapping;
+   * metadata never establishes the org here.
+   */
+  if (event.type === 'subscription.updated') {
+    const sub = await retrieveValidSubscription(event, provider);
+    const org = await getOrgByCustomer(provider.id, sub.customerId, env);
 
     if (!org) {
-      throw new PermanentError('unresolved_org');
-    }
-
-    if (!mappedOrg) {
-      await upsertBillingCustomer(
-        {
-          orgId: org,
-          provider: provider.id,
-          providerCustomerId: sub.customerId,
-          email: '',
-          livemode: sub.livemode,
-          stripeAccount: event.stripeAccount,
-        },
-        env,
-      );
+      throw new PermanentError('unknown_customer'); // no mapping → nothing to reconcile
     }
 
     await applySubscriptionEvent(
       {
         orgId: org,
-        planId,
+        planId: (planIdForConfiguredPrice(sub.priceId as string, env) ?? 'none') as never,
         status: sub.status,
         provider: provider.id,
         providerCustomerId: sub.customerId,
         providerSubscriptionId: sub.id,
-        providerPriceId: sub.priceId,
+        providerPriceId: sub.priceId ?? undefined,
         currentPeriodEnd: sub.currentPeriodEnd ?? undefined,
         eventCreated: event.eventCreated,
         livemode: sub.livemode,
@@ -245,4 +264,36 @@ async function reconcileAndApply(
    * invoice.paid / unknown: nothing to apply (paid does not itself reactivate —
    * subscription.updated carries the authoritative active state).
    */
+}
+
+/** Retrieve + validate the authoritative Stripe subscription (mode/customer/price). */
+async function retrieveValidSubscription(
+  event: NormalizedBillingEvent,
+  provider: ReturnType<typeof createBillingProvider>,
+) {
+  if (!event.providerSubscriptionId) {
+    throw new PermanentError('missing_subscription');
+  }
+
+  const retrieved = await provider.retrieveSubscription(event.providerSubscriptionId);
+
+  if (!retrieved.ok) {
+    throw new Error(retrieved.error); // transient — stay retryable
+  }
+
+  const sub = retrieved.value;
+
+  if (sub.livemode !== provider.expectedLivemode()) {
+    throw new PermanentError('mode_mismatch');
+  }
+
+  if (event.providerCustomerId && sub.customerId !== event.providerCustomerId) {
+    throw new PermanentError('customer_mismatch');
+  }
+
+  if (!sub.priceId || !provider.isConfiguredPrice(sub.priceId)) {
+    throw new PermanentError('unknown_price');
+  }
+
+  return sub;
 }

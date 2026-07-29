@@ -554,3 +554,195 @@ export async function recordEntitlementChange(
     created_at: new Date().toISOString(),
   });
 }
+
+// ─── Checkout intents (opaque tenant binding) ───────────────────────────────────
+
+export interface CheckoutIntentInput {
+  orgId: string;
+  requestedBy: string;
+  membershipId: string | null;
+  planId: string;
+  expectedRecurringPriceId: string;
+  expectedSetupPriceId: string | null;
+  expectedMode: 'test' | 'live';
+  expectedAccount: string | null;
+  expectedAppOrigin: string;
+  idempotencyKey: string;
+  expiresAt: string;
+}
+
+/**
+ * Create (or idempotently return) a checkout intent. An exact retry with the same
+ * (org, idempotency_key) returns the existing intent; a materially different request
+ * under the same key is rejected.
+ */
+export async function createCheckoutIntent(
+  input: CheckoutIntentInput,
+  env: Record<string, string | undefined>,
+): Promise<{ ok: true; intentId: string; nonce: string; idempotent: boolean } | { ok: false; reason: string }> {
+  const sb = admin(env);
+  const nonce = crypto.randomUUID().replace(/-/g, '') + crypto.randomUUID().replace(/-/g, '');
+  const row = {
+    org_id: input.orgId,
+    requested_by: input.requestedBy,
+    membership_id: input.membershipId,
+    plan_id: input.planId,
+    expected_recurring_price_id: input.expectedRecurringPriceId,
+    expected_setup_price_id: input.expectedSetupPriceId,
+    expected_mode: input.expectedMode,
+    expected_account: input.expectedAccount,
+    expected_app_origin: input.expectedAppOrigin,
+    idempotency_key: input.idempotencyKey,
+    nonce,
+    expires_at: input.expiresAt,
+  };
+
+  const { data, error } = await sb.from('qhub_checkout_intents').insert(row).select('id,nonce').maybeSingle();
+
+  if (!error && data) {
+    return { ok: true, intentId: data.id as string, nonce: data.nonce as string, idempotent: false };
+  }
+
+  // Unique(org, idempotency_key) → an intent already exists for this key.
+  const { data: existing } = await sb
+    .from('qhub_checkout_intents')
+    .select('id,nonce,plan_id,expected_recurring_price_id,expected_setup_price_id')
+    .eq('org_id', input.orgId)
+    .eq('idempotency_key', input.idempotencyKey)
+    .maybeSingle();
+
+  if (!existing) {
+    return { ok: false, reason: 'intent_create_failed' };
+  }
+
+  const same =
+    existing.plan_id === input.planId &&
+    existing.expected_recurring_price_id === input.expectedRecurringPriceId &&
+    (existing.expected_setup_price_id ?? null) === input.expectedSetupPriceId;
+
+  if (!same) {
+    return { ok: false, reason: 'idempotency_conflict' };
+  }
+
+  return { ok: true, intentId: existing.id as string, nonce: existing.nonce as string, idempotent: true };
+}
+
+export type IntentConsume = 'CONSUMED' | 'EXPIRED' | 'ALREADY' | 'MISMATCH' | 'NOT_FOUND';
+
+/** Atomically consume a checkout intent via the guarded RPC. */
+export async function consumeCheckoutIntent(
+  input: {
+    intentId: string;
+    orgId: string;
+    recurringPriceId: string;
+    mode: string;
+    account: string | null;
+    sessionId: string;
+    customerId: string;
+    subscriptionId: string;
+  },
+  env: Record<string, string | undefined>,
+): Promise<IntentConsume> {
+  const sb = admin(env);
+  const { data, error } = await sb.rpc('qhub_consume_checkout_intent', {
+    p_intent_id: input.intentId,
+    p_org_id: input.orgId,
+    p_recurring_price: input.recurringPriceId,
+    p_mode: input.mode,
+    p_account: input.account,
+    p_session_id: input.sessionId,
+    p_customer_id: input.customerId,
+    p_subscription_id: input.subscriptionId,
+  });
+
+  if (error) {
+    throw new Error(`[Checkout] intent consume failed: ${error.message}`);
+  }
+
+  return (data as IntentConsume) ?? 'NOT_FOUND';
+}
+
+// ─── Invitations + transactional seat acceptance ────────────────────────────────
+
+export async function createInvitation(
+  input: { orgId: string; email: string; role: string; tokenHash: string; invitedBy: string; expiresAt: string },
+  env: Record<string, string | undefined>,
+): Promise<{ ok: true; invitationId: string } | { ok: false; reason: string }> {
+  const sb = admin(env);
+  const { data, error } = await sb
+    .from('qhub_org_invitations')
+    .insert({
+      org_id: input.orgId,
+      email: input.email.toLowerCase(),
+      role: input.role,
+      token_hash: input.tokenHash,
+      invited_by: input.invitedBy,
+      expires_at: input.expiresAt,
+    })
+    .select('id')
+    .maybeSingle();
+
+  if (error || !data) {
+    // Active-invitation uniqueness (org, lower(email)) → already invited.
+    return { ok: false, reason: 'already_invited_or_failed' };
+  }
+
+  return { ok: true, invitationId: data.id as string };
+}
+
+export type AcceptResult = 'ACCEPTED' | 'SEAT_LIMIT' | 'INVALID' | 'ALREADY';
+
+/** Transactionally accept an invitation under the plan seat cap via the guarded RPC. */
+export async function acceptInvitation(
+  input: { invitationId: string; userId: string; maxSeats: number },
+  env: Record<string, string | undefined>,
+): Promise<AcceptResult> {
+  const sb = admin(env);
+  const { data, error } = await sb.rpc('qhub_accept_invitation', {
+    p_invitation_id: input.invitationId,
+    p_user_id: input.userId,
+    p_max_seats: input.maxSeats,
+  });
+
+  if (error) {
+    throw new Error(`[Seat] accept failed: ${error.message}`);
+  }
+
+  return (data as AcceptResult) ?? 'INVALID';
+}
+
+/** Load a checkout intent's authoritative org + bound expectations (or null). */
+export async function getCheckoutIntent(
+  intentId: string,
+  env: Record<string, string | undefined>,
+): Promise<{ orgId: string; planId: string; recurringPriceId: string; mode: string; account: string | null } | null> {
+  const sb = admin(env);
+  const { data } = await sb
+    .from('qhub_checkout_intents')
+    .select('org_id,plan_id,expected_recurring_price_id,expected_mode,expected_account')
+    .eq('id', intentId)
+    .maybeSingle();
+
+  if (!data) {
+    return null;
+  }
+
+  return {
+    orgId: data.org_id as string,
+    planId: data.plan_id as string,
+    recurringPriceId: data.expected_recurring_price_id as string,
+    mode: data.expected_mode as string,
+    account: (data.expected_account as string) ?? null,
+  };
+}
+
+/** The owning org of an invitation (for seat-cap resolution on acceptance). */
+export async function getInvitationOrg(
+  invitationId: string,
+  env: Record<string, string | undefined>,
+): Promise<string | null> {
+  const sb = admin(env);
+  const { data } = await sb.from('qhub_org_invitations').select('org_id').eq('id', invitationId).maybeSingle();
+
+  return (data?.org_id as string) ?? null;
+}

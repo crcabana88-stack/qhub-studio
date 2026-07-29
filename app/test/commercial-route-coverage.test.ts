@@ -17,7 +17,12 @@ import { describe, it, expect } from 'vitest';
 const ROUTES = fileURLToPath(new URL('../routes/', import.meta.url));
 const read = (f: string) => readFileSync(`${ROUTES}${f}`, 'utf8');
 
-const GUARDS = /requireStaff|requireCommercialContext|requireCommercialProject/;
+/*
+ * Authoritative identity resolvers. getVerifiedUser is authoritative (id/email from
+ * the verified token) and is used only where membership cannot pre-exist (invitation
+ * acceptance); getSession authority is forbidden everywhere.
+ */
+const GUARDS = /requireStaff|requireCommercialContext|requireCommercialProject|getVerifiedUser/;
 
 /** Protected routes that MUST resolve an authoritative context before acting. */
 const PROTECTED = [
@@ -38,6 +43,10 @@ const PROTECTED = [
   'api.billing.portal.ts',
   'api.commercial.build.ts',
   'api.commercial.projects.ts',
+  'api.commercial.reviews.ts',
+  'api.commercial.reviews.$requestId.ts',
+  'api.internal.commercial.reviews.$requestId.decision.ts',
+  'api.commercial.invitations.accept.ts',
   'build.tsx',
   'agents.tsx',
 ];

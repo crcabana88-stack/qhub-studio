@@ -83,13 +83,17 @@ export class StripeBillingProvider implements BillingProvider {
     form.set('mode', 'subscription');
     form.set('success_url', input.successUrl);
     form.set('cancel_url', input.cancelUrl);
-    form.set('client_reference_id', input.orgId);
     form.set('line_items[0][price]', recurringPriceId);
     form.set('line_items[0][quantity]', '1');
-    form.set('metadata[org_id]', input.orgId);
-    form.set('metadata[plan_id]', input.planId);
-    form.set('subscription_data[metadata][org_id]', input.orgId);
-    form.set('subscription_data[metadata][plan_id]', input.planId);
+
+    /*
+     * R3: metadata carries ONLY the opaque checkout-intent id — never org/plan.
+     * The webhook loads + consumes the intent to establish the tenant authority.
+     */
+    if (input.checkoutIntentId) {
+      form.set('metadata[checkout_intent_id]', input.checkoutIntentId);
+      form.set('subscription_data[metadata][checkout_intent_id]', input.checkoutIntentId);
+    }
 
     if (input.providerCustomerId) {
       form.set('customer', input.providerCustomerId);
@@ -476,6 +480,7 @@ export function normalizeStripeEvent(event: unknown): NormalizedBillingEvent | n
     livemode: !!e.livemode,
     stripeAccount: typeof e.account === 'string' ? e.account : undefined,
     eventCreated: typeof e.created === 'number' ? e.created : 0,
+    checkoutIntentId: metadata.checkout_intent_id ?? undefined,
   };
 }
 

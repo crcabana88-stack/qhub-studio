@@ -294,4 +294,116 @@ describe('commercial-launch R3 migration', () => {
       await db.close();
     }
   });
+
+  it('seat RPC accepts under the cap and rejects at the cap (transactional)', async () => {
+    const db = await freshDb();
+
+    try {
+      await db.exec(sql);
+
+      const i1 = '10000000-0000-0000-0000-000000000001';
+      const i2 = '10000000-0000-0000-0000-000000000002';
+      await db.exec(`
+        insert into public.qhub_org_invitations (id, org_id, email, role, token_hash, expires_at)
+          values ('${i1}','o1','a@x.com','builder','t', now()+interval '1 day'),
+                 ('${i2}','o1','b@x.com','builder','t', now()+interval '1 day');
+      `);
+
+      const a1 = await db.query<{ s: string }>(`select public.qhub_accept_invitation('${i1}','u1',1) s`);
+      expect(a1.rows[0].s).toBe('ACCEPTED');
+
+      const a2 = await db.query<{ s: string }>(`select public.qhub_accept_invitation('${i2}','u2',1) s`);
+      expect(a2.rows[0].s).toBe('SEAT_LIMIT');
+
+      const n = await db.query<{ c: number }>(
+        `select count(*)::int c from public.qhub_org_members where org_id='o1' and status='active'`,
+      );
+      expect(n.rows[0].c).toBe(1);
+    } finally {
+      await db.close();
+    }
+  });
+
+  it('enforces one active invitation per org+email', async () => {
+    const db = await freshDb();
+
+    try {
+      await db.exec(sql);
+      await db.exec(`insert into public.qhub_org_invitations (org_id,email,role,token_hash,expires_at)
+                     values ('o1','dup@x.com','builder','t', now()+interval '1 day')`);
+      await expect(
+        db.exec(`insert into public.qhub_org_invitations (org_id,email,role,token_hash,expires_at)
+                 values ('o1','DUP@x.com','builder','t', now()+interval '1 day')`),
+      ).rejects.toThrow(/uq_qhub_invitation_active|duplicate key/);
+    } finally {
+      await db.close();
+    }
+  });
+
+  it('checkout-intent consume: matching binds; wrong price / expired / replay handled', async () => {
+    const db = await freshDb();
+
+    try {
+      await db.exec(sql);
+
+      const id = '20000000-0000-0000-0000-000000000001';
+      await db.exec(`
+        insert into public.qhub_checkout_intents
+          (id, org_id, requested_by, plan_id, expected_recurring_price_id, expected_mode, expected_app_origin, idempotency_key, nonce, expires_at)
+        values ('${id}','o1','u1','builder_beta','price_r','test','https://x','k','n', now()+interval '10 min');
+      `);
+
+      const c1 = await db.query<{ s: string }>(
+        `select public.qhub_consume_checkout_intent('${id}','o1','price_r','test',null,'sess','cus','sub1') s`,
+      );
+      expect(c1.rows[0].s).toBe('CONSUMED');
+
+      const c2 = await db.query<{ s: string }>(
+        `select public.qhub_consume_checkout_intent('${id}','o1','price_r','test',null,'sess','cus','sub1') s`,
+      );
+      expect(c2.rows[0].s).toBe('ALREADY');
+
+      const c3 = await db.query<{ s: string }>(
+        `select public.qhub_consume_checkout_intent('${id}','o1','price_r','test',null,'sess','cus','sub_OTHER') s`,
+      );
+      expect(c3.rows[0].s).toBe('MISMATCH');
+
+      const id2 = '20000000-0000-0000-0000-000000000002';
+      await db.exec(`insert into public.qhub_checkout_intents
+        (id, org_id, requested_by, plan_id, expected_recurring_price_id, expected_mode, expected_app_origin, idempotency_key, nonce, expires_at)
+        values ('${id2}','o1','u1','builder_beta','price_r','test','https://x','k2','n2', now()+interval '10 min')`);
+
+      const c4 = await db.query<{ s: string }>(
+        `select public.qhub_consume_checkout_intent('${id2}','o1','price_WRONG','test',null,'sess','cus','subx') s`,
+      );
+      expect(c4.rows[0].s).toBe('MISMATCH');
+
+      const id3 = '20000000-0000-0000-0000-000000000003';
+      await db.exec(`insert into public.qhub_checkout_intents
+        (id, org_id, requested_by, plan_id, expected_recurring_price_id, expected_mode, expected_app_origin, idempotency_key, nonce, expires_at)
+        values ('${id3}','o1','u1','builder_beta','price_r','test','https://x','k3','n3', now()-interval '1 min')`);
+
+      const c5 = await db.query<{ s: string }>(
+        `select public.qhub_consume_checkout_intent('${id3}','o1','price_r','test',null,'sess','cus','suby') s`,
+      );
+      expect(c5.rows[0].s).toBe('EXPIRED');
+    } finally {
+      await db.close();
+    }
+  });
+
+  it('verifier fails when the seat RPC is granted to a browser role', async () => {
+    const db = await freshDb();
+
+    try {
+      await db.exec(sql);
+      await db.exec(`GRANT EXECUTE ON FUNCTION public.qhub_accept_invitation(uuid,text,integer) TO anon`);
+
+      const v = await verify(db);
+      expect(v.ready).toBe(false);
+      expect(v.failed).toContain('seat_rpc_browser_exec');
+    } finally {
+      await db.close();
+    }
+  });
 });

@@ -32,6 +32,13 @@ export interface CreateCheckoutInput {
 
   /** Optional existing provider customer id to reuse. */
   providerCustomerId?: string;
+
+  /**
+   * The opaque checkout-intent id. When set, it is the ONLY authority placed in
+   * Stripe metadata (org/plan are never in metadata). The webhook loads + consumes
+   * the intent to establish the tenant.
+   */
+  checkoutIntentId?: string;
 }
 
 export interface CreatePortalInput {
@@ -88,6 +95,9 @@ export interface NormalizedBillingEvent {
 
   /** event.created (seconds) — used to reject out-of-order updates. */
   eventCreated: number;
+
+  /** The opaque checkout-intent id carried in metadata (checkout.completed). */
+  checkoutIntentId?: string;
 }
 
 export type WebhookVerifyResult =
