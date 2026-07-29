@@ -30,6 +30,9 @@ import {
   verifyStoredResultHashes,
   type StoredRunStep,
   type StoredEvaluationForHash,
+  type StoredPlanRow,
+  type StoredReleaseRow,
+  type StoredReceiptBinding,
   type PersistedEvaluation,
 } from './runtime/run-reconstruction';
 import { buildSafeResult, type SafeResult } from './runtime/safe-result';
@@ -429,6 +432,7 @@ async function driveRun(ctx: DriveContext): Promise<RunResult> {
           summary: action.summary,
         },
         decision.result,
+        decision.receipt,
       );
 
       if (!stepRecorded) {
@@ -489,12 +493,26 @@ async function driveRun(ctx: DriveContext): Promise<RunResult> {
 }
 
 /** Route one proposed action through the central Gate 04 enforcement path. */
+/** The receipt + durable evidence commitment a terminal step binds via the RPC. */
+interface ReceiptBindingInput {
+  receipt_id: string;
+  receipt_type: string;
+  receipt_schema_version: string;
+  receipt_hash: string;
+  evidence_chain_id: string | null;
+  evidence_event_id: string;
+  evidence_event_hash: string;
+  evidence_seq: number | null;
+  committed_at: string;
+  action_type: string;
+}
+
 async function routeThroughGate04(
   ctx: DriveContext,
   action: ProposedAction,
   stepIndex: number,
   parentEvaluationId?: string,
-): Promise<{ result: GovernedActionResult; evaluation_id: string | null }> {
+): Promise<{ result: GovernedActionResult; evaluation_id: string | null; receipt: ReceiptBindingInput | null }> {
   const { session, env, sessionId } = ctx;
 
   const enforceOut = await enforceGovernedAction<{ ok: true }>({
@@ -538,14 +556,31 @@ async function routeThroughGate04(
           : 'ALLOW'
       : decision;
 
+  const r = enforceOut.receipt;
+  const bindable = r && r.ledger_event_id && r.ledger_event_hash;
+
   return {
     evaluation_id: enforceOut.evaluation_id,
     result: {
       decision: mapped,
       reason_codes: enforceOut.reason_codes,
-      receipt_id: enforceOut.receipt?.receipt_id ?? null,
-      safe_result: enforceOut.receipt ? { execution_status: enforceOut.receipt.execution_status } : null,
+      receipt_id: r?.receipt_id ?? null,
+      safe_result: r ? { execution_status: r.execution_status } : null,
     },
+    receipt: bindable
+      ? {
+          receipt_id: r.receipt_id,
+          receipt_type: r.execution_mode,
+          receipt_schema_version: r.receipt_schema_version,
+          receipt_hash: r.result_hash,
+          evidence_chain_id: null,
+          evidence_event_id: r.ledger_event_id as string,
+          evidence_event_hash: r.ledger_event_hash as string,
+          evidence_seq: r.ledger_seq ?? null,
+          committed_at: r.completed_at,
+          action_type: r.action_type,
+        }
+      : null,
   };
 }
 
@@ -621,9 +656,43 @@ async function recordPendingStep(sb: SupabaseClient, step: StepRecord): Promise<
  * plain pending record (also RPC-only). Any failure returns false so the caller
  * fails closed (an unrecorded governed action is never treated as done).
  */
-async function persistStep(sb: SupabaseClient, step: StepRecord, result: GovernedActionResult): Promise<boolean> {
+async function persistStep(
+  sb: SupabaseClient,
+  step: StepRecord,
+  result: GovernedActionResult,
+  receipt: ReceiptBindingInput | null,
+): Promise<boolean> {
   if (step.decision === 'REQUIRE_APPROVAL') {
     return recordPendingStep(sb, step);
+  }
+
+  /*
+   * Receipt-binding step (durable ledger append already succeeded inside Gate 04):
+   * persist the authoritative relational binding of the receipt + evidence
+   * commitment to this exact run/evaluation/action BEFORE terminal finalization.
+   * Idempotent on exact retry. If binding fails, do NOT finalize (fail closed).
+   */
+  if ((step.decision === 'EXECUTED' || step.decision === 'SIMULATED') && receipt) {
+    const bind = await sb.rpc('qhub_bind_governed_action_receipt', {
+      p_run_id: step.run_id,
+      p_org_id: step.org_id,
+      p_evaluation_id: step.evaluation_id,
+      p_decision: step.decision,
+      p_action_type: receipt.action_type,
+      p_receipt_id: receipt.receipt_id,
+      p_receipt_type: receipt.receipt_type,
+      p_receipt_schema_version: receipt.receipt_schema_version,
+      p_receipt_hash: receipt.receipt_hash,
+      p_evidence_chain_id: receipt.evidence_chain_id,
+      p_evidence_event_id: receipt.evidence_event_id,
+      p_evidence_event_hash: receipt.evidence_event_hash,
+      p_evidence_seq: receipt.evidence_seq,
+      p_committed_at: receipt.committed_at,
+    });
+
+    if (bind.error) {
+      return false;
+    }
   }
 
   const { error } = await sb.rpc('qhub_finalize_agent_run_step', {
@@ -804,7 +873,7 @@ export async function resumeAgentRun(input: {
   const stepsRes = await sb
     .from('qhub_agent_run_steps')
     .select(
-      'run_id, org_id, step_index, step_kind, action_type, decision, reason_codes, receipt_id, input_hash, evaluation_id, result_hash, safe_result, previous_step_hash',
+      'run_id, org_id, step_index, step_kind, action_type, decision, reason_codes, receipt_id, input_hash, evaluation_id, result_hash, safe_result, previous_step_hash, result_hash_schema_version, finalized_at',
     )
     .eq('run_id', input.run_id)
     .eq('org_id', session.orgId)
@@ -846,6 +915,71 @@ export async function resumeAgentRun(input: {
     }
   }
 
+  /*
+   * Load the authoritative enforcement-plan, release, and receipt-binding rows the
+   * reconstruction independently re-validates (Blocker F) — no value is trusted
+   * merely because it was joined into a step row.
+   */
+  const planById = new Map<string, StoredPlanRow>();
+  const releaseById = new Map<string, StoredReleaseRow>();
+  const bindingByEval = new Map<string, StoredReceiptBinding>();
+
+  const planIds = Array.from(
+    new Set(
+      Array.from(evaluationById.values())
+        .map((e) => e.enforcement_plan_id)
+        .filter((x): x is string => !!x),
+    ),
+  );
+
+  if (planIds.length > 0) {
+    const planRows = await sb
+      .from('qhub_enforcement_plans')
+      .select('enforcement_plan_id, status, enforcement_plan_hash')
+      .in('enforcement_plan_id', planIds)
+      .eq('org_id', session.orgId);
+
+    if (planRows.error) {
+      return { ok: false, run_id: input.run_id, state: 'BLOCKED', reason_codes: ['RECONSTRUCTION_FAILED'] };
+    }
+
+    for (const row of (planRows.data ?? []) as unknown as StoredPlanRow[]) {
+      planById.set(row.enforcement_plan_id, row);
+    }
+  }
+
+  if (run.release_candidate_id) {
+    const relRows = await sb
+      .from('qhub_release_candidates')
+      .select('release_candidate_id, status, release_candidate_hash')
+      .eq('release_candidate_id', run.release_candidate_id as string)
+      .eq('org_id', session.orgId);
+
+    if (relRows.error) {
+      return { ok: false, run_id: input.run_id, state: 'BLOCKED', reason_codes: ['RECONSTRUCTION_FAILED'] };
+    }
+
+    for (const row of (relRows.data ?? []) as unknown as StoredReleaseRow[]) {
+      releaseById.set(row.release_candidate_id, row);
+    }
+  }
+
+  if (evalIds.length > 0) {
+    const bindRows = await sb
+      .from('qhub_governed_action_receipt_bindings')
+      .select('evaluation_id, receipt_id, run_id, org_id, action_digest')
+      .in('evaluation_id', evalIds)
+      .eq('org_id', session.orgId);
+
+    if (bindRows.error) {
+      return { ok: false, run_id: input.run_id, state: 'BLOCKED', reason_codes: ['RECONSTRUCTION_FAILED'] };
+    }
+
+    for (const row of (bindRows.data ?? []) as unknown as StoredReceiptBinding[]) {
+      bindingByEval.set(row.evaluation_id, row);
+    }
+  }
+
   const hashVerify = verifyStoredResultHashes(
     {
       run_id: input.run_id,
@@ -861,6 +995,7 @@ export async function resumeAgentRun(input: {
     },
     storedSteps,
     evaluationById,
+    { planById, releaseById, bindingByEval },
   );
 
   if (!hashVerify.ok) {
@@ -1002,6 +1137,7 @@ export async function resumeAgentRun(input: {
       summary: action.summary,
     },
     decision.result,
+    decision.receipt,
   );
 
   if (!recorded) {

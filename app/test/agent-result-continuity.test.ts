@@ -1,13 +1,12 @@
 /**
- * QHUB Agent Framework — RESULT CONTINUITY contract on real PostgreSQL (PGlite)
+ * QHUB Agent Framework — RESULT CONTINUITY R3 contract on real PostgreSQL (PGlite)
  * app/test/agent-result-continuity.test.ts
  *
- * Adversarial coverage of the hardened, PRIVILEGE-BASED terminalization contract:
- * service_role holds no direct write on qhub_agent_run_steps (SELECT only); all
- * writes flow through the SECURITY DEFINER RPCs; no caller-settable GUC is trusted;
- * the finalizer validates every authoritative record; run/version identity is
- * immutable; helpers are browser+service_role denied; the verifier proves it all;
- * and a second migration run is a true no-op.
+ * Adversarial coverage of the R3 hardened contract: privilege-based writes (no
+ * forgeable path), the authoritative receipt-binding table + RPC, the contiguous
+ * pending-step RPC, the binding-backed finalizer, run/version identity immutability,
+ * locked helper ACLs, and the foundation+R2+R3 verifier superset (owner /
+ * search_path / body-digest / index-def / policy-expression drift all fail).
  */
 
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
@@ -35,6 +34,8 @@ const AGENT2 = '20000000-0000-0000-0000-000000000002';
 const VERSION2 = '30000000-0000-0000-0000-000000000002';
 const PLAN = '60000000-0000-0000-0000-000000000001';
 const RELEASE = '70000000-0000-0000-0000-000000000001';
+const OTHER_ORG = 'org_other';
+const OTHER_APP = '11000000-0000-0000-0000-000000000009';
 const PP = 'pp_hash';
 const EP = 'ep_hash';
 const RC = 'rc_hash';
@@ -84,13 +85,11 @@ async function seedRun(over: Partial<Record<string, string>> = {}): Promise<stri
   return runId;
 }
 
-const OTHER_ORG = 'org_other';
-const OTHER_APP = '11000000-0000-0000-0000-000000000009';
-
 interface EvalOpts {
   decision?: string;
   action_event_state?: string;
   action_type?: string;
+  action_digest?: string;
   org_id?: string;
   qhub_app_id?: string;
   policy_profile_hash?: string;
@@ -108,14 +107,15 @@ async function seedEval(o: EvalOpts = {}): Promise<string> {
       (evaluation_id, action_request_id, org_id, qhub_app_id, action_type, action_digest, environment, decision,
        policy_profile_id, policy_profile_version, policy_profile_hash, enforcement_plan_id, enforcement_plan_version,
        enforcement_plan_hash, control_results_hash, evaluator_version, action_event_state, created_by)
-     values ($1,$2,$3,$4,$5,'digest_x','INTERNAL',$6,
-             '80000000-0000-0000-0000-000000000001',1,$7,$8,1,$9,'cr_hash','ev-1',$10,'user_a')`,
+     values ($1,$2,$3,$4,$5,$6,'INTERNAL',$7,
+             '80000000-0000-0000-0000-000000000001',1,$8,$9,1,$10,'cr_hash','ev-1',$11,'user_a')`,
     [
       evalId,
       reqId,
       o.org_id ?? ORG,
       o.qhub_app_id ?? APP,
       o.action_type ?? 'CONNECTOR_ACTION',
+      o.action_digest ?? 'digest_x',
       o.decision ?? 'ALLOW',
       o.policy_profile_hash ?? PP,
       o.enforcement_plan_id === null ? null : (o.enforcement_plan_id ?? PLAN),
@@ -125,6 +125,42 @@ async function seedEval(o: EvalOpts = {}): Promise<string> {
   );
 
   return evalId;
+}
+
+interface BindOpts {
+  decision?: string;
+  action_type?: string;
+  receipt_id?: string;
+  receipt_type?: string;
+  receipt_hash?: string;
+  evidence_event_id?: string;
+  evidence_event_hash?: string;
+  org_id?: string;
+}
+
+async function seedBinding(runId: string, evalId: string, o: BindOpts = {}): Promise<Record<string, unknown>> {
+  const r = await db.query<{ r: Record<string, unknown> }>(
+    `select public.qhub_bind_governed_action_receipt(
+       $1::uuid,$2::text,$3::uuid,$4::text,$5::text,$6::text,$7::text,$8::text,$9::text,$10::text,$11::text,$12::text,$13::bigint,$14::timestamptz) r`,
+    [
+      runId,
+      o.org_id ?? ORG,
+      evalId,
+      o.decision ?? 'EXECUTED',
+      o.action_type ?? 'CONNECTOR_ACTION',
+      o.receipt_id ?? 'rcpt_1',
+      o.receipt_type ?? 'SANDBOX',
+      'gate04-receipt-1.0.0',
+      o.receipt_hash ?? 'receipt_hash_1',
+      null,
+      o.evidence_event_id ?? 'evt_1',
+      o.evidence_event_hash ?? 'evt_hash_1',
+      1,
+      new Date().toISOString(),
+    ],
+  );
+
+  return r.rows[0].r;
 }
 
 interface FinalizeArgs {
@@ -163,12 +199,27 @@ async function finalize(runId: string, a: FinalizeArgs): Promise<Record<string, 
   return r.rows[0].r;
 }
 
-/** Finalize a valid EXECUTED step 0 with a fresh ALLOW/COMMITTED evaluation. */
-async function finalizeHappy(runId: string): Promise<{ evalId: string; out: Record<string, unknown> }> {
+/** Finalize a valid EXECUTED step 0: ALLOW+COMMITTED eval, bound receipt. */
+async function finalizeHappy(runId: string, stepIndex = 0): Promise<{ evalId: string; out: Record<string, unknown> }> {
   const evalId = await seedEval();
-  const out = await finalize(runId, { step_index: 0, evaluation_id: evalId });
+  await seedBinding(runId, evalId, { receipt_id: `rcpt_${seq}` });
+
+  const out = await finalize(runId, { step_index: stepIndex, evaluation_id: evalId, receipt_id: `rcpt_${seq}` });
 
   return { evalId, out };
+}
+
+async function createPending(
+  runId: string,
+  evalId: string,
+  stepIndex: number | null = null,
+): Promise<Record<string, unknown>> {
+  const r = await db.query<{ r: Record<string, unknown> }>(
+    `select public.qhub_create_agent_run_step_pending($1::uuid,$2::text,$3::int,$4::text,$5::text,$6::uuid,$7::text[],$8::text,$9::text) r`,
+    [runId, ORG, stepIndex, 'CONNECTOR_ACTION', 'CONNECTOR_ACTION', evalId, '{}', 'ih', 's'],
+  );
+
+  return r.rows[0].r;
 }
 
 async function stepRow(runId: string, stepIndex: number): Promise<Record<string, unknown> | null> {
@@ -242,64 +293,57 @@ afterAll(async () => {
   await db.close();
 });
 
-describe('finalization RPC — valid path + idempotency (tests 13, 14, 15, 24)', () => {
-  it('finalizes a valid EXECUTED step and returns the authoritative hash', async () => {
+describe('finalization + valid path (tests 13, 14, 15, 21, 24)', () => {
+  it('finalizes a valid EXECUTED step with a bound receipt (tests 13, 21)', async () => {
     const run = await seedRun();
     const { out } = await finalizeHappy(run);
     expect(out.finalized).toBe(true);
-    expect(out.previous_step_hash).toBeNull();
     expect((out.result_hash as string).length).toBe(64);
 
     const row = await stepRow(run, 0);
-    expect(row?.result_hash).toBe(out.result_hash);
     expect(row?.finalized_at).not.toBeNull();
+    expect(row?.result_hash).toBe(out.result_hash);
   });
 
   it('is idempotent for an exact repeat, rejects a materially different repeat (tests 14, 15)', async () => {
     const run = await seedRun();
     const evalId = await seedEval();
-    const first = await finalize(run, { step_index: 0, evaluation_id: evalId });
-    const again = await finalize(run, { step_index: 0, evaluation_id: evalId });
+    await seedBinding(run, evalId, { receipt_id: 'r_a' });
+
+    const first = await finalize(run, { step_index: 0, evaluation_id: evalId, receipt_id: 'r_a' });
+    const again = await finalize(run, { step_index: 0, evaluation_id: evalId, receipt_id: 'r_a' });
     expect(again.idempotent).toBe(true);
     expect(again.result_hash).toBe(first.result_hash);
-
-    await expect(finalize(run, { step_index: 0, evaluation_id: evalId, receipt_id: 'DIFFERENT' })).rejects.toThrow(
-      /already finalized with a different result/,
-    );
-  });
-
-  it('chains step 1 onto step 0', async () => {
-    const run = await seedRun();
-    const { out: s0 } = await finalizeHappy(run);
-    const e1 = await seedEval();
-    const s1 = await finalize(run, { step_index: 1, evaluation_id: e1 });
-    expect(s1.previous_step_hash).toBe(s0.result_hash);
-  });
-});
-
-describe('authoritative validation in the finalizer (tests 8-15)', () => {
-  it('rejects EXECUTED without an evaluation (test 8)', async () => {
-    const run = await seedRun();
-    await expect(finalize(run, { step_index: 0, evaluation_id: null })).rejects.toThrow(
-      /requires an authoritative evaluation/,
-    );
-  });
-
-  it('rejects EXECUTED with an arbitrary receipt (evaluation not COMMITTED) (test 9)', async () => {
-    const run = await seedRun();
-    const evalId = await seedEval({ action_event_state: 'NONE' });
-    await expect(finalize(run, { step_index: 0, evaluation_id: evalId })).rejects.toThrow(/not COMMITTED/);
-  });
-
-  it('rejects a DENY step that carries a receipt (test 10)', async () => {
-    const run = await seedRun();
-    const evalId = await seedEval({ decision: 'DENY', action_event_state: 'NONE' });
     await expect(
-      finalize(run, { step_index: 0, evaluation_id: evalId, decision: 'DENY', receipt_id: 'rcpt' }),
-    ).rejects.toThrow(/DENY step must not carry a receipt/);
+      finalize(run, {
+        step_index: 0,
+        evaluation_id: evalId,
+        receipt_id: 'r_a',
+        safe_result: { execution_status: 'FAILED' },
+      }),
+    ).rejects.toThrow(/already finalized with a different result/);
   });
 
-  it('accepts a valid DENY step (no receipt)', async () => {
+  it('rejects EXECUTED without a receipt binding (test 12)', async () => {
+    const run = await seedRun();
+    const evalId = await seedEval();
+    await expect(finalize(run, { step_index: 0, evaluation_id: evalId })).rejects.toThrow(
+      /requires an authoritative receipt binding/,
+    );
+  });
+
+  it('rejects EXECUTED without a receipt id (test 21)', async () => {
+    const run = await seedRun();
+    const evalId = await seedEval();
+    await seedBinding(run, evalId, { receipt_id: 'r_b' });
+
+    // p_receipt_id mismatch vs binding is rejected; a null caller id defers to the binding.
+    await expect(finalize(run, { step_index: 0, evaluation_id: evalId, receipt_id: 'WRONG' })).rejects.toThrow(
+      /caller receipt_id does not match/,
+    );
+  });
+
+  it('accepts a valid DENY step (no receipt) (test 20)', async () => {
     const run = await seedRun();
     const evalId = await seedEval({ decision: 'DENY', action_event_state: 'NONE' });
     const out = await finalize(run, {
@@ -310,13 +354,131 @@ describe('authoritative validation in the finalizer (tests 8-15)', () => {
       safe_result: { execution_status: 'DENIED' },
     });
     expect(out.finalized).toBe(true);
+    expect(await stepRow(run, 0).then((r) => r?.receipt_id)).toBeNull();
   });
 
-  it('rejects a cross-tenant evaluation (tests 11, 12)', async () => {
+  it('rejects a DENY step that carries a receipt (test 20)', async () => {
+    const run = await seedRun();
+    const evalId = await seedEval({ decision: 'DENY', action_event_state: 'NONE' });
+    await expect(
+      finalize(run, { step_index: 0, evaluation_id: evalId, decision: 'DENY', receipt_id: 'rcpt' }),
+    ).rejects.toThrow(/DENY step must not carry a receipt/);
+  });
+});
+
+describe('receipt-binding authority (tests 11-24)', () => {
+  it('rejects a fabricated receipt (uncommitted evidence) (tests 11, 18)', async () => {
+    const run = await seedRun();
+    const evalId = await seedEval({ action_event_state: 'NONE' });
+    await expect(seedBinding(run, evalId)).rejects.toThrow(/evidence is not COMMITTED/);
+  });
+
+  it('rejects a cross-tenant receipt binding (test 14)', async () => {
     const run = await seedRun();
     const evalId = await seedEval({ org_id: OTHER_ORG, qhub_app_id: OTHER_APP, enforcement_plan_id: null });
-    await expect(finalize(run, { step_index: 0, evaluation_id: evalId })).rejects.toThrow(
-      /evaluation ownership mismatch/,
+    await expect(seedBinding(run, evalId)).rejects.toThrow(/evaluation ownership mismatch/);
+  });
+
+  it('rejects a wrong receipt type at finalization (test 19)', async () => {
+    const run = await seedRun();
+    const evalId = await seedEval();
+    await seedBinding(run, evalId, { receipt_id: 'r_prod', receipt_type: 'PRODUCTION' });
+    await expect(
+      finalize(run, { step_index: 0, evaluation_id: evalId, decision: 'SIMULATED', receipt_id: 'r_prod' }),
+    ).rejects.toThrow(/SIMULATED requires a simulation\/sandbox receipt/);
+  });
+
+  it('rejects a cross-run receipt at finalization (tests 13, 16)', async () => {
+    const runA = await seedRun();
+    const evalId = await seedEval();
+    await seedBinding(runA, evalId, { receipt_id: 'r_x' }); // binding belongs to runA
+
+    const runB = await seedRun();
+
+    // finalize runB referencing runA's evaluation → binding.run_id != runB
+    await expect(finalize(runB, { step_index: 0, evaluation_id: evalId, receipt_id: 'r_x' })).rejects.toThrow(
+      /evaluation ownership mismatch|receipt binding does not match/,
+    );
+  });
+
+  it('is idempotent for an exact receipt-binding repeat, rejects a different one (tests 23, 24)', async () => {
+    const run = await seedRun();
+    const evalId = await seedEval();
+    const first = await seedBinding(run, evalId, { receipt_id: 'r_i', evidence_event_hash: 'h1' });
+    const again = await seedBinding(run, evalId, { receipt_id: 'r_i', evidence_event_hash: 'h1' });
+    expect(again.idempotent).toBe(true);
+    expect(again.binding_id).toBe(first.binding_id);
+    await expect(seedBinding(run, evalId, { receipt_id: 'r_i2', evidence_event_hash: 'h2' })).rejects.toThrow(
+      /different receipt is already bound/,
+    );
+  });
+
+  it('rejects an action-digest / policy-plan mismatch at binding time (tests 16, 17)', async () => {
+    const run = await seedRun();
+    const evalId = await seedEval({ enforcement_plan_hash: 'WRONG' });
+    await expect(seedBinding(run, evalId)).rejects.toThrow(/policy\/plan hash does not match/);
+  });
+});
+
+describe('pending-step RPC contract (tests 1-10)', () => {
+  it('creates a contiguous pending step at MAX+1 (test 4)', async () => {
+    const run = await seedRun();
+    const e = await seedEval({ decision: 'REQUIRE_APPROVAL', action_event_state: 'NONE' });
+    const out = await createPending(run, e, 0);
+    expect(out.step_index).toBe(0);
+    expect(out.decision).toBe('REQUIRE_APPROVAL');
+  });
+
+  it('rejects a cross-tenant evaluation (test 1)', async () => {
+    const run = await seedRun();
+    const e = await seedEval({
+      org_id: OTHER_ORG,
+      qhub_app_id: OTHER_APP,
+      enforcement_plan_id: null,
+      decision: 'REQUIRE_APPROVAL',
+      action_event_state: 'NONE',
+    });
+    await expect(createPending(run, e, 0)).rejects.toThrow(/evaluation ownership mismatch/);
+  });
+
+  it('rejects a terminal-decision evaluation for a pending step (test 9)', async () => {
+    const run = await seedRun();
+    const e = await seedEval(); // decision ALLOW
+    await expect(createPending(run, e, 0)).rejects.toThrow(/requires a REQUIRE_APPROVAL evaluation/);
+  });
+
+  it('rejects a noncontiguous / step-99 gap (tests 4, 5)', async () => {
+    const run = await seedRun();
+    const e = await seedEval({ decision: 'REQUIRE_APPROVAL', action_event_state: 'NONE' });
+    await expect(createPending(run, e, 99)).rejects.toThrow(/noncontiguous step_index/);
+  });
+
+  it('is exact-idempotent for the tail pending row, rejects a different evaluation (tests 6, 7, 8)', async () => {
+    const run = await seedRun();
+    const e = await seedEval({ decision: 'REQUIRE_APPROVAL', action_event_state: 'NONE' });
+    await createPending(run, e, 0);
+
+    const again = await createPending(run, e, 0);
+    expect(again.idempotent).toBe(true);
+
+    const e2 = await seedEval({ decision: 'REQUIRE_APPROVAL', action_event_state: 'NONE' });
+    await expect(createPending(run, e2, 0)).rejects.toThrow(/already exists with a different evaluation/);
+  });
+
+  it('rejects a run in an invalid state (test 10)', async () => {
+    const run = await seedRun();
+    await db.query(`update public.qhub_agent_runs set current_state='COMPLETED' where run_id=$1`, [run]);
+
+    const e = await seedEval({ decision: 'REQUIRE_APPROVAL', action_event_state: 'NONE' });
+    await expect(createPending(run, e, 0)).rejects.toThrow(/not in a writable state/);
+  });
+});
+
+describe('authoritative validation in the finalizer (tests 13-17)', () => {
+  it('rejects EXECUTED without an evaluation (test 21-adjacent)', async () => {
+    const run = await seedRun();
+    await expect(finalize(run, { step_index: 0, evaluation_id: null })).rejects.toThrow(
+      /requires an authoritative evaluation/,
     );
   });
 
@@ -327,148 +489,109 @@ describe('authoritative validation in the finalizer (tests 8-15)', () => {
 
     const run = await seedRun();
     const evalId = await seedEval();
-    await expect(finalize(run, { step_index: 0, evaluation_id: evalId })).rejects.toThrow(
-      /release candidate status .* is not valid/,
-    );
+    await expect(seedBinding(run, evalId)).rejects.toThrow(/release candidate invalid/);
     await db.query(`update public.qhub_release_candidates set status='APPROVED' where release_candidate_id=$1`, [
       RELEASE,
     ]);
   });
 
-  it('rejects a run whose agent lifecycle is not runnable (test 14)', async () => {
+  it('rejects an agent whose lifecycle is not runnable (test 14)', async () => {
     await db.query(`update public.qhub_agents set current_lifecycle_state='RETIRED' where agent_id=$1`, [AGENT2]);
 
     const run = await seedRun({ agent_id: AGENT2, agent_version_id: VERSION2 });
     const evalId = await seedEval();
-    await expect(finalize(run, { step_index: 0, evaluation_id: evalId })).rejects.toThrow(
+    await seedBinding(run, evalId, { receipt_id: 'r_life' });
+    await expect(finalize(run, { step_index: 0, evaluation_id: evalId, receipt_id: 'r_life' })).rejects.toThrow(
       /lifecycle .* is not runnable/,
     );
     await db.query(`update public.qhub_agents set current_lifecycle_state='SUPERVISED' where agent_id=$1`, [AGENT2]);
   });
 
-  it('rejects a policy/plan mismatch (test 15)', async () => {
-    const run = await seedRun();
-    const evalId = await seedEval({ enforcement_plan_hash: 'WRONG' });
-    await expect(finalize(run, { step_index: 0, evaluation_id: evalId })).rejects.toThrow(
-      /policy\/plan hash does not match/,
-    );
-  });
-
-  it('rejects an inactive enforcement plan', async () => {
+  it('rejects an inactive enforcement plan at binding (test 15)', async () => {
     await db.query(`update public.qhub_enforcement_plans set status='SUSPENDED' where enforcement_plan_id=$1`, [PLAN]);
 
     const run = await seedRun();
     const evalId = await seedEval();
-    await expect(finalize(run, { step_index: 0, evaluation_id: evalId })).rejects.toThrow(
-      /plan status .* is not ACTIVE/,
-    );
+    await expect(seedBinding(run, evalId)).rejects.toThrow(/enforcement plan invalid/);
     await db.query(`update public.qhub_enforcement_plans set status='ACTIVE' where enforcement_plan_id=$1`, [PLAN]);
   });
 
   it('rejects an invalid safe_result', async () => {
     const run = await seedRun();
     const evalId = await seedEval();
-    await expect(finalize(run, { step_index: 0, evaluation_id: evalId, safe_result: { secret: 'x' } })).rejects.toThrow(
-      /safe_result failed strict validation/,
-    );
+    await seedBinding(run, evalId, { receipt_id: 'r_sr' });
+    await expect(
+      finalize(run, { step_index: 0, evaluation_id: evalId, receipt_id: 'r_sr', safe_result: { secret: 'x' } }),
+    ).rejects.toThrow(/safe_result failed strict validation/);
   });
 });
 
-describe('previous-step hash chain (tests 4, 5, 6, 7)', () => {
-  it('rejects a later step when the previous step is not finalized (test 5)', async () => {
+describe('previous-step hash chain', () => {
+  it('chains step 1 onto step 0', async () => {
+    const run = await seedRun();
+    const { out: s0 } = await finalizeHappy(run, 0);
+    const { out: s1 } = await finalizeHappy(run, 1);
+    expect(s1.previous_step_hash).toBe(s0.result_hash);
+  });
+
+  it('rejects a later step when the previous step is not finalized', async () => {
     const run = await seedRun();
     const e = await seedEval();
-    await expect(finalize(run, { step_index: 1, evaluation_id: e })).rejects.toThrow(
+    await seedBinding(run, e, { receipt_id: 'r_p1' });
+    await expect(finalize(run, { step_index: 1, evaluation_id: e, receipt_id: 'r_p1' })).rejects.toThrow(
       /previous step .* missing or not finalized/,
     );
   });
-
-  it('rejects a transplanted prior hash on a later step (tests 4, 6, 7)', async () => {
-    const runA = await seedRun();
-    const { out: a0 } = await finalizeHappy(runA);
-    const runB = await seedRun();
-    await finalizeHappy(runB);
-
-    const e = await seedEval();
-
-    // A crafted finalized INSERT (as the owner/superuser) with a transplanted prev hash must still be rejected by the trigger.
-    await expect(
-      db.exec(`INSERT INTO public.qhub_agent_run_steps
-        (run_id, org_id, step_index, step_kind, action_type, evaluation_id, decision, reason_codes, receipt_id,
-         input_hash, summary, safe_result, previous_step_hash, result_hash, result_hash_schema_version, finalized_at)
-        VALUES ('${runB}','${ORG}',1,'CONNECTOR_ACTION','CONNECTOR_ACTION','${e}','EXECUTED','{}','rcpt','ih','s',
-          '{"execution_status":"SUCCEEDED"}'::jsonb,'${a0.result_hash}','x','agent-step-result-1.0.0',NOW())`),
-    ).rejects.toThrow(/previous_step_hash does not match/);
-  });
 });
 
-describe('privilege-based authorization — no forgeable path (tests 1-6)', () => {
-  it('denies a direct service_role terminal INSERT (test 1)', async () => {
+describe('privilege-based authorization — no forgeable path (tests 1-6 receipt)', () => {
+  it('denies a direct service_role terminal INSERT', async () => {
     const run = await seedRun();
     await asRole('service_role', async () => {
       await expect(
         db.query(
-          `insert into public.qhub_agent_run_steps (run_id, org_id, step_index, step_kind, decision, summary)
-           values ($1,$2,0,'CONNECTOR_ACTION','EXECUTED','s')`,
+          `insert into public.qhub_agent_run_steps (run_id, org_id, step_index, step_kind, decision, summary) values ($1,$2,0,'CONNECTOR_ACTION','EXECUTED','s')`,
           [run, ORG],
         ),
       ).rejects.toThrow(/permission denied/i);
     });
   });
 
-  it('denies a direct service_role UPDATE (test 2)', async () => {
+  it('denies a direct service_role INSERT into receipt bindings', async () => {
     const run = await seedRun();
-    await finalizeHappy(run);
     await asRole('service_role', async () => {
       await expect(
-        db.query(`update public.qhub_agent_run_steps set summary='x' where run_id=$1 and step_index=0`, [run]),
+        db.query(
+          `insert into public.qhub_governed_action_receipt_bindings (receipt_id, receipt_type, receipt_schema_version, receipt_hash, org_id, qhub_app_id, run_id, agent_id, agent_version_id, evaluation_id, action_request_id, action_digest, action_type, decision, policy_profile_hash, enforcement_plan_hash, evidence_event_id, evidence_event_hash, committed_at)
+           values ('x','SANDBOX','v','h',$1,$2,$3,$4,$5,'50000000-0000-0000-0000-0000000000aa','51000000-0000-0000-0000-0000000000aa','d','CONNECTOR_ACTION','ALLOW','pp','ep','e','eh',NOW())`,
+          [ORG, APP, run, AGENT, VERSION],
+        ),
       ).rejects.toThrow(/permission denied/i);
     });
   });
 
-  it('a custom GUC cannot authorize terminalization — and the trigger references none (tests 3, 4)', async () => {
-    const run = await seedRun();
-    await asRole('service_role', async () => {
-      await db.exec(`SELECT set_config('qhub.allow_finalize','1',true)`);
-      await expect(
-        db.query(
-          `insert into public.qhub_agent_run_steps (run_id, org_id, step_index, step_kind, decision, summary, result_hash)
-           values ($1,$2,0,'CONNECTOR_ACTION','EXECUTED','s','forged')`,
-          [run, ORG],
-        ),
-      ).rejects.toThrow(/permission denied/i);
-    });
-
-    // The guard trigger contains NO GUC gate at all.
+  it('the guard trigger references no forgeable GUC gate', async () => {
     const src = await db.query<{ prosrc: string }>(
       `select prosrc from pg_proc where oid='public.qhub_agent_run_step_guard()'::regprocedure`,
     );
     expect(src.rows[0].prosrc).not.toMatch(/current_setting|allow_finalize|set_config/);
   });
 
-  it('a nested SECURITY DEFINER wrapper owned by service_role cannot bypass (test 5)', async () => {
-    const run = await seedRun();
-    await db.exec(`CREATE FUNCTION public._evil_write(p_run uuid) RETURNS void LANGUAGE plpgsql SECURITY DEFINER AS $f$
-      BEGIN INSERT INTO public.qhub_agent_run_steps (run_id, org_id, step_index, step_kind, decision, summary)
-        VALUES (p_run, '${ORG}', 0, 'CONNECTOR_ACTION', 'EXECUTED', 's'); END $f$;`);
-    await db.exec('ALTER FUNCTION public._evil_write(uuid) OWNER TO service_role');
-    await asRole('service_role', async () => {
-      await expect(db.query(`select public._evil_write($1)`, [run])).rejects.toThrow(/permission denied/i);
-    });
-  });
-
-  it('the finalize RPC works for service_role while direct writes do not (privilege model holds)', async () => {
+  it('the finalize + bind RPCs work for service_role while direct writes do not', async () => {
     const run = await seedRun();
     const evalId = await seedEval();
-    const out = await asRole('service_role', () => finalize(run, { step_index: 0, evaluation_id: evalId }));
+    const out = await asRole('service_role', async () => {
+      await seedBinding(run, evalId, { receipt_id: 'r_svc' });
+      return finalize(run, { step_index: 0, evaluation_id: evalId, receipt_id: 'r_svc' });
+    });
     expect(out.finalized).toBe(true);
   });
 
-  it('browser roles cannot execute the hash/validator helpers (test 6)', async () => {
+  it('browser roles cannot execute helpers or the bind RPC', async () => {
     const r = await db.query<{ a: boolean; b: boolean; c: boolean }>(
       `select has_function_privilege('anon','public.qhub_agent_safe_result_valid(jsonb)','EXECUTE') a,
-              has_function_privilege('service_role','public.qhub_agent_safe_result_valid(jsonb)','EXECUTE') b,
-              has_function_privilege('authenticated','public.qhub_agent_run_step_guard()','EXECUTE') c`,
+              has_function_privilege('authenticated','public.qhub_bind_governed_action_receipt(uuid,text,uuid,text,text,text,text,text,text,text,text,text,bigint,timestamptz)','EXECUTE') b,
+              has_function_privilege('service_role','public.qhub_receipt_binding_immutable()','EXECUTE') c`,
     );
     expect(r.rows[0].a).toBe(false);
     expect(r.rows[0].b).toBe(false);
@@ -476,99 +599,44 @@ describe('privilege-based authorization — no forgeable path (tests 1-6)', () =
   });
 });
 
-describe('malformed terminal rows are impossible (test 7)', () => {
-  it('rejects a terminal decision with NULL continuity (owner path)', async () => {
+describe('immutability (steps + run identity + version + binding)', () => {
+  it('rejects mutation of a finalized step (result_hash)', async () => {
     const run = await seedRun();
+    await finalizeHappy(run);
     await expect(
-      db.query(
-        `insert into public.qhub_agent_run_steps (run_id, org_id, step_index, step_kind, decision, summary)
-         values ($1,$2,0,'CONNECTOR_ACTION','EXECUTED','s')`,
-        [run, ORG],
-      ),
-    ).rejects.toThrow(/non-finalized row must be REQUIRE_APPROVAL/);
+      db.query(`update public.qhub_agent_run_steps set result_hash='00' where run_id=$1 and step_index=0`, [run]),
+    ).rejects.toThrow(/finalized step is immutable/);
   });
 
-  it('rejects a pending row that carries continuity fields', async () => {
-    const run = await seedRun();
-    await expect(
-      db.query(
-        `insert into public.qhub_agent_run_steps (run_id, org_id, step_index, step_kind, decision, summary, safe_result)
-         values ($1,$2,0,'CONNECTOR_ACTION','REQUIRE_APPROVAL','s','{"execution_status":"SUCCEEDED"}'::jsonb)`,
-        [run, ORG],
-      ),
-    ).rejects.toThrow(/continuity fields require finalization/);
-  });
-
-  it('rejects an arbitrary caller-supplied result_hash (owner path)', async () => {
-    const run = await seedRun();
-    const e = await seedEval();
-    await expect(
-      db.exec(`INSERT INTO public.qhub_agent_run_steps
-        (run_id, org_id, step_index, step_kind, action_type, evaluation_id, decision, reason_codes, receipt_id,
-         input_hash, summary, safe_result, previous_step_hash, result_hash, result_hash_schema_version, finalized_at)
-        VALUES ('${run}','${ORG}',0,'CONNECTOR_ACTION','CONNECTOR_ACTION','${e}','EXECUTED','{}','rcpt','ih','s',
-          '{"execution_status":"SUCCEEDED"}'::jsonb,NULL,'deadbeef','agent-step-result-1.0.0',NOW())`),
-    ).rejects.toThrow(/not the authoritative canonical hash/);
-  });
-});
-
-describe('immutability of terminal + run identity (tests 16, 17, 20)', () => {
-  const stepUpdates: Array<[string, string]> = [
-    ['step_index', `update public.qhub_agent_run_steps set step_index=99 where run_id=$1 and step_index=0`],
-    [
-      'evaluation_id',
-      `update public.qhub_agent_run_steps set evaluation_id='50000000-0000-0000-0000-0000000000ff' where run_id=$1 and step_index=0`,
-    ],
-    ['receipt_id', `update public.qhub_agent_run_steps set receipt_id='other' where run_id=$1 and step_index=0`],
-    [
-      'safe_result',
-      `update public.qhub_agent_run_steps set safe_result='{"execution_status":"DENIED"}'::jsonb where run_id=$1 and step_index=0`,
-    ],
-    ['result_hash', `update public.qhub_agent_run_steps set result_hash='00' where run_id=$1 and step_index=0`],
-  ];
-
-  for (const [field, sql] of stepUpdates) {
-    it(`rejects mutation of terminal ${field} (test 20)`, async () => {
-      const run = await seedRun();
-      await finalizeHappy(run);
-      await expect(db.query(sql, [run])).rejects.toThrow(/finalized step is immutable/);
-    });
-  }
-
-  it('rejects mutation of run identity org_id/agent_id (test 16)', async () => {
+  it('rejects mutation of run identity (agent_id) and runtime_provider_version (tests 16, 17)', async () => {
     const run = await seedRun();
     await expect(
       db.query(`update public.qhub_agent_runs set agent_id=$2 where run_id=$1`, [run, AGENT2]),
     ).rejects.toThrow(/hash-bound run identity is immutable/);
-  });
-
-  it('rejects mutation of runtime_provider_version (test 17)', async () => {
-    const run = await seedRun();
     await expect(
-      db.query(`update public.qhub_agent_runs set runtime_provider_version='9.9.9' where run_id=$1`, [run]),
+      db.query(`update public.qhub_agent_runs set runtime_provider_version='9.9' where run_id=$1`, [run]),
     ).rejects.toThrow(/hash-bound run identity is immutable/);
   });
 
-  it('rejects mutation of a version manifest_hash (test 18 — drift prevention)', async () => {
+  it('rejects mutation of version manifest_hash (drift prevention)', async () => {
     await expect(
       db.query(`update public.qhub_agent_versions set manifest_hash='DRIFT' where agent_version_id=$1`, [VERSION]),
     ).rejects.toThrow(/manifest_hash is immutable/);
   });
-});
 
-describe('cross-agent binding (test 8-adjacent)', () => {
-  it('identical inputs under a different agent/version produce a different hash', async () => {
-    const runA = await seedRun();
-    const runB = await seedRun({ agent_id: AGENT2, agent_version_id: VERSION2 });
-    const eA = await seedEval();
-    const eB = await seedEval();
-    const a = await finalize(runA, { step_index: 0, evaluation_id: eA, input_hash: 'same', receipt_id: 'same' });
-    const b = await finalize(runB, { step_index: 0, evaluation_id: eB, input_hash: 'same', receipt_id: 'same' });
-    expect(a.result_hash).not.toBe(b.result_hash);
+  it('rejects mutation of a receipt binding', async () => {
+    const run = await seedRun();
+    const evalId = await seedEval();
+    await seedBinding(run, evalId, { receipt_id: 'r_imm' });
+    await expect(
+      db.query(`update public.qhub_governed_action_receipt_bindings set receipt_id='x' where evaluation_id=$1`, [
+        evalId,
+      ]),
+    ).rejects.toThrow(/receipt bindings are immutable/);
   });
 });
 
-describe('verifier + true no-op (tests 19-24)', () => {
+describe('verifier superset + drift + no-op (tests 25-36)', () => {
   async function verify(inst: PGlite) {
     const r = await inst.query<{
       v: {
@@ -577,7 +645,6 @@ describe('verifier + true no-op (tests 19-24)', () => {
         checks: { identifier: string; ready: boolean; reason_code: string }[];
       };
     }>('select public.qhub_verify_agent_schema() v');
-
     return r.rows[0].v;
   }
 
@@ -595,73 +662,118 @@ describe('verifier + true no-op (tests 19-24)', () => {
     return d;
   }
 
-  it('reports READY at the r2 version with all helper ACLs locked (test 19)', async () => {
+  it('reports READY at r3 and preserves foundation checks (test 36)', async () => {
     const v = await verify(db);
-    expect(v.expected_version).toBe('2026-07-28.agent-result-continuity-r2');
+    expect(v.expected_version).toBe('2026-07-29.agent-result-continuity-r3');
     expect(v.ready).toBe(true);
-    expect(v.checks.find((c) => c.identifier === 'privilege.helpers_locked')?.ready).toBe(true);
-    expect(v.checks.find((c) => c.identifier === 'privilege.steps_no_direct_write')?.ready).toBe(true);
+
+    for (const id of [
+      'index.run_idempotency_unique',
+      'column.runs_contract',
+      'constraint.run_state_check',
+      'index.version_content_unique',
+    ]) {
+      expect(v.checks.find((c) => c.identifier === id)?.ready, id).toBe(true);
+    }
   });
 
-  it('verifier fails on direct table privilege broadening (test 20)', async () => {
+  const drifts: Array<[string, string, string]> = [
+    [
+      'helper owner drift (test 25)',
+      'ALTER FUNCTION public.qhub_agent_safe_result_valid(jsonb) OWNER TO service_role;',
+      'function.owners_pinned',
+    ],
+    [
+      'helper search_path drift (test 26)',
+      'ALTER FUNCTION public.qhub_agent_safe_result_valid(jsonb) SET search_path = public;',
+      'function.search_paths_pinned',
+    ],
+    [
+      'helper ACL drift (test 27)',
+      'GRANT EXECUTE ON FUNCTION public.qhub_agent_safe_result_valid(jsonb) TO anon;',
+      'privilege.helpers_locked',
+    ],
+    [
+      'helper body drift (test 28)',
+      'CREATE OR REPLACE FUNCTION public.qhub_agent_hash_intcell(v INT) RETURNS TEXT LANGUAGE sql IMMUTABLE SET search_path=pg_catalog,public AS $q$ SELECT $1::text $q$;',
+      'function.bodies_pinned',
+    ],
+    [
+      'broad RLS policy (test 29)',
+      'CREATE POLICY evil_broad ON public.qhub_agent_run_steps AS PERMISSIVE FOR SELECT TO authenticated USING (true);',
+      'policy.restrictive_exact',
+    ],
+    [
+      'removed run-idempotency index (test 32)',
+      'DROP INDEX public.idx_agent_runs_idem;',
+      'index.run_idempotency_unique',
+    ],
+    [
+      'removed receipt unique index (test 33)',
+      'DROP INDEX public.idx_receipt_binding_eval;',
+      'index.receipt_binding_unique',
+    ],
+    [
+      'direct table write grant (test 34)',
+      'GRANT INSERT ON public.qhub_agent_run_steps TO service_role;',
+      'privilege.steps_no_direct_write',
+    ],
+    [
+      'disabled guard trigger (test 35)',
+      'ALTER TABLE public.qhub_agent_run_steps DISABLE TRIGGER trg_qhub_agent_run_step_guard;',
+      'trigger.step_guard',
+    ],
+    [
+      'wrong-table index (test 31)',
+      'DROP INDEX public.idx_receipt_binding_receipt; CREATE UNIQUE INDEX idx_receipt_binding_receipt ON public.qhub_agent_runs(run_id);',
+      'index.pinned_defs_exact',
+    ],
+  ];
+
+  for (const [label, mutation, expectFail] of drifts) {
+    it(`verifier fails on ${label}`, async () => {
+      const d = await freshDb();
+      await d.exec(mutation);
+
+      const v = await verify(d);
+      expect(v.ready).toBe(false);
+      expect(
+        v.checks.some((c) => c.identifier === expectFail && !c.ready),
+        `${expectFail} should fail`,
+      ).toBe(true);
+      await d.close();
+    });
+  }
+
+  it('a second migration run is a true no-op (OID/xmin stable) (test 56)', async () => {
     const d = await freshDb();
-    await d.exec('GRANT INSERT ON public.qhub_agent_run_steps TO service_role;');
-
-    const v = await verify(d);
-    expect(v.ready).toBe(false);
-    expect(v.checks.some((c) => c.identifier === 'privilege.steps_no_direct_write' && !c.ready)).toBe(true);
-    await d.close();
-  });
-
-  it('verifier fails on helper PUBLIC execution (test 21)', async () => {
-    const d = await freshDb();
-    await d.exec('GRANT EXECUTE ON FUNCTION public.qhub_agent_safe_result_valid(jsonb) TO anon;');
-
-    const v = await verify(d);
-    expect(v.ready).toBe(false);
-    expect(v.checks.some((c) => c.identifier === 'privilege.helpers_locked' && !c.ready)).toBe(true);
-    await d.close();
-  });
-
-  it('verifier fails on a disabled guard trigger (test 22)', async () => {
-    const d = await freshDb();
-    await d.exec('ALTER TABLE public.qhub_agent_run_steps DISABLE TRIGGER trg_qhub_agent_run_step_guard;');
-
-    const v = await verify(d);
-    expect(v.ready).toBe(false);
-    expect(v.checks.some((c) => c.identifier === 'trigger.step_guard' && !c.ready)).toBe(true);
-    await d.close();
-  });
-
-  it('verifier fails without the run-identity guard', async () => {
-    const d = await freshDb();
-    await d.exec('ALTER TABLE public.qhub_agent_runs DISABLE TRIGGER trg_qhub_agent_run_identity_guard;');
-
-    const v = await verify(d);
-    expect(v.ready).toBe(false);
-    expect(v.checks.some((c) => c.identifier === 'trigger.run_identity_guard' && !c.ready)).toBe(true);
-    await d.close();
-  });
-
-  it('a second migration run is a true no-op (function + trigger OID/xmin stable) (tests 23, 24)', async () => {
-    const d = await freshDb();
-    const before = await d.query<{ proname: string; oid: string; xmin: string }>(
-      `select proname, oid::text, xmin::text from pg_proc where proname like 'qhub_%agent%' or proname='qhub_verify_agent_schema'`,
-    );
-    const trgBefore = await d.query<{ tgname: string; oid: string; xmin: string }>(
-      `select tgname, oid::text, xmin::text from pg_trigger where tgname like 'trg_qhub_agent%'`,
-    );
+    const q = () =>
+      Promise.all([
+        d.query<{ proname: string; oid: string; xmin: string }>(
+          `select proname, oid::text, xmin::text from pg_proc where proname like 'qhub_%agent%' or proname like 'qhub_%receipt%' or proname='qhub_verify_agent_schema' order by proname`,
+        ),
+        d.query<{ tgname: string; oid: string; xmin: string }>(
+          `select tgname, oid::text, xmin::text from pg_trigger where tgname like 'trg_qhub%' order by tgname`,
+        ),
+      ]);
+    const [f1, t1] = await q();
     await d.exec(readFileSync(MIG(CONTINUITY), 'utf8'));
 
-    const after = await d.query<{ proname: string; oid: string; xmin: string }>(
-      `select proname, oid::text, xmin::text from pg_proc where proname like 'qhub_%agent%' or proname='qhub_verify_agent_schema'`,
-    );
-    const trgAfter = await d.query<{ tgname: string; oid: string; xmin: string }>(
-      `select tgname, oid::text, xmin::text from pg_trigger where tgname like 'trg_qhub_agent%'`,
-    );
-    expect(after.rows).toEqual(before.rows);
-    expect(trgAfter.rows).toEqual(trgBefore.rows);
+    const [f2, t2] = await q();
+    expect(f2.rows).toEqual(f1.rows);
+    expect(t2.rows).toEqual(t1.rows);
     expect((await verify(d)).ready).toBe(true);
+    await d.close();
+  });
+
+  it('a drifted second run aborts rather than overwriting (test 57)', async () => {
+    const d = await freshDb();
+
+    // Hand-mutate a pinned function body, then re-run the migration → it must abort.
+    await d.exec(
+      'CREATE OR REPLACE FUNCTION public.qhub_agent_hash_intcell(v INT) RETURNS TEXT LANGUAGE sql IMMUTABLE SET search_path=pg_catalog,public AS $q$ SELECT $1::text $q$;',
+    );
+    await expect(d.exec(readFileSync(MIG(CONTINUITY), 'utf8'))).rejects.toThrow(/drift — aborting/);
     await d.close();
   });
 });

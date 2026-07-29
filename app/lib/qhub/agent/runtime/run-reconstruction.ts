@@ -21,8 +21,8 @@ import type { AgentRuntimeProvider, GovernedActionResult, ProposedAction } from 
 import type { RunActionDecision } from '~/lib/qhub/agent/agent-run';
 import { canonicalActionRequestString } from '~/lib/qhub/enforcement-plan';
 import type { CanonicalActionRequest } from '~/lib/qhub/enforcement';
-import { computeStepResultHash, type StepResultHashInput } from './step-result-hash';
-import type { SafeResult } from './safe-result';
+import { computeStepResultHash, RESULT_HASH_SCHEMA_VERSION, type StepResultHashInput } from './step-result-hash';
+import { validateSafeResult, type SafeResult } from './safe-result';
 
 const sha256 = (s: string) => createHash('sha256').update(s).digest('hex');
 
@@ -69,6 +69,10 @@ export interface StoredRunStep {
 
   /** result_hash of the immediately preceding finalized step (NULL at step 0). */
   previous_step_hash: string | null;
+
+  /** Continuity schema version + finalization marker (NULL for legacy/pending). */
+  result_hash_schema_version: string | null;
+  finalized_at: string | null;
 }
 
 const EXECUTED: ReadonlySet<RunActionDecision> = new Set<RunActionDecision>(['ALLOW', 'SIMULATED', 'EXECUTED']);
@@ -143,9 +147,48 @@ export interface StoredEvaluationForHash {
   enforcement_plan_hash: string | null;
 }
 
+/** Authoritative enforcement-plan row loaded for reconstruction validation. */
+export interface StoredPlanRow {
+  enforcement_plan_id: string;
+  status: string;
+  enforcement_plan_hash: string;
+}
+
+/** Authoritative release-candidate row loaded for reconstruction validation. */
+export interface StoredReleaseRow {
+  release_candidate_id: string;
+  status: string;
+  release_candidate_hash: string;
+}
+
+/** Authoritative receipt-binding row loaded for reconstruction validation. */
+export interface StoredReceiptBinding {
+  evaluation_id: string;
+  receipt_id: string;
+  run_id: string;
+  org_id: string;
+  action_digest: string | null;
+}
+
+/** Authoritative rows the runtime independently re-validates during resume. */
+export interface ReconstructionAuthoritative {
+  planById: Map<string, StoredPlanRow>;
+  releaseById: Map<string, StoredReleaseRow>;
+  bindingByEval: Map<string, StoredReceiptBinding>;
+}
+
 export type ResultHashVerifyReason =
   | 'NON_RESUMABLE_LEGACY_CONTINUITY'
   | 'MISSING_EVALUATION_FOR_HASH'
+  | 'INVALID_SCHEMA_VERSION'
+  | 'MISSING_FINALIZED_AT'
+  | 'INVALID_SAFE_RESULT'
+  | 'MISSING_PLAN_ROW'
+  | 'PLAN_INVALID'
+  | 'MISSING_RELEASE_ROW'
+  | 'RELEASE_INVALID'
+  | 'MISSING_RECEIPT_BINDING'
+  | 'RECEIPT_BINDING_MISMATCH'
   | 'RESULT_HASH_MISMATCH';
 
 export interface ResultHashVerifyResult {
@@ -154,17 +197,22 @@ export interface ResultHashVerifyResult {
   step_index?: number;
 }
 
+const EXECUTED_TERMINAL: ReadonlySet<string> = new Set(['EXECUTED', 'SIMULATED']);
+
 /**
- * Recompute every FINALIZED step's result_hash from CURRENT authoritative run/
- * version/evaluation data and compare it to the stored value. Detects drift in
- * any hash-bound authoritative record and any stored-hash tampering. Fails closed
- * on a legacy row, a missing evaluation, or a mismatch. The database independently
- * recomputes on write; this is the runtime's pre-Gate-04 defense in depth.
+ * Independently re-validate every FINALIZED step from CURRENT authoritative data
+ * BEFORE Gate 04, and recompute its result_hash. Beyond the hash, when
+ * `authoritative` is supplied (production resume) it verifies the schema version,
+ * finalized_at, the strict safe_result, the policy/enforcement-plan row + hash, the
+ * release row + status/hash, and the receipt binding + evidence ownership — never
+ * trusting a value merely because it came from a joined row. Fails closed on any
+ * gap. Legacy NULL-continuity rows are non-resumable.
  */
 export function verifyStoredResultHashes(
   run: ResultHashRecomputeRun,
   steps: StoredRunStep[],
   evaluationById: Map<string, StoredEvaluationForHash>,
+  authoritative?: ReconstructionAuthoritative,
 ): ResultHashVerifyResult {
   const ordered = [...steps].sort((a, b) => a.step_index - b.step_index);
 
@@ -173,14 +221,75 @@ export function verifyStoredResultHashes(
       continue; // pending (REQUIRE_APPROVAL) rows carry no continuity yet
     }
 
-    if (step.safe_result === null) {
+    if (step.safe_result === null || step.result_hash_schema_version === null || step.finalized_at === null) {
       return { ok: false, reason: 'NON_RESUMABLE_LEGACY_CONTINUITY', step_index: step.step_index };
+    }
+
+    if (step.result_hash_schema_version !== RESULT_HASH_SCHEMA_VERSION) {
+      return { ok: false, reason: 'INVALID_SCHEMA_VERSION', step_index: step.step_index };
+    }
+
+    if (!Number.isFinite(Date.parse(step.finalized_at))) {
+      return { ok: false, reason: 'MISSING_FINALIZED_AT', step_index: step.step_index };
+    }
+
+    if (!validateSafeResult(step.safe_result).ok) {
+      return { ok: false, reason: 'INVALID_SAFE_RESULT', step_index: step.step_index };
     }
 
     const ev = step.evaluation_id ? evaluationById.get(step.evaluation_id) : undefined;
 
     if (step.evaluation_id && !ev) {
       return { ok: false, reason: 'MISSING_EVALUATION_FOR_HASH', step_index: step.step_index };
+    }
+
+    if (authoritative) {
+      // Enforcement-plan row (active) anchoring the policy hash.
+      if (ev?.enforcement_plan_id) {
+        const plan = authoritative.planById.get(ev.enforcement_plan_id);
+
+        if (!plan) {
+          return { ok: false, reason: 'MISSING_PLAN_ROW', step_index: step.step_index };
+        }
+
+        if (plan.status !== 'ACTIVE' || plan.enforcement_plan_hash !== ev.enforcement_plan_hash) {
+          return { ok: false, reason: 'PLAN_INVALID', step_index: step.step_index };
+        }
+      }
+
+      // Release row when the run is release-bound.
+      if (run.release_candidate_id) {
+        const rel = authoritative.releaseById.get(run.release_candidate_id);
+
+        if (!rel) {
+          return { ok: false, reason: 'MISSING_RELEASE_ROW', step_index: step.step_index };
+        }
+
+        if (
+          !['APPROVED', 'DEPLOYED'].includes(rel.status) ||
+          rel.release_candidate_hash !== run.release_candidate_hash
+        ) {
+          return { ok: false, reason: 'RELEASE_INVALID', step_index: step.step_index };
+        }
+      }
+
+      // Receipt binding + evidence ownership for executed/simulated steps.
+      if (step.receipt_id !== null && EXECUTED_TERMINAL.has(step.decision as string)) {
+        const bnd = step.evaluation_id ? authoritative.bindingByEval.get(step.evaluation_id) : undefined;
+
+        if (!bnd) {
+          return { ok: false, reason: 'MISSING_RECEIPT_BINDING', step_index: step.step_index };
+        }
+
+        if (
+          bnd.receipt_id !== step.receipt_id ||
+          bnd.run_id !== run.run_id ||
+          bnd.org_id !== run.org_id ||
+          (ev?.action_digest ?? null) !== (bnd.action_digest ?? null)
+        ) {
+          return { ok: false, reason: 'RECEIPT_BINDING_MISMATCH', step_index: step.step_index };
+        }
+      }
     }
 
     const input: StepResultHashInput = {

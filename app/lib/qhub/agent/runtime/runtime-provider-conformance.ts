@@ -294,6 +294,8 @@ export class GovernedRunHarness {
       result_hash: terminal ? synthResultHash(state.run_id, stepIndex, inputHash, d) : null,
       safe_result: resultOf(d).safe_result,
       previous_step_hash: terminal ? prev : null,
+      result_hash_schema_version: terminal ? 'agent-step-result-1.0.0' : null,
+      finalized_at: terminal ? new Date().toISOString() : null,
     };
   }
 

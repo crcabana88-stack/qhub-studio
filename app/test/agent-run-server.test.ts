@@ -83,15 +83,45 @@ async function pausedEvalForConnector(inputs: any) {
 }
 
 // ── In-memory fake Supabase (backs run/step writes) ──
-const STORE: { runs: any[]; steps: any[]; evals: any[]; failStepInsert: boolean } = {
-  runs: [],
-  steps: [],
-  evals: [],
-  failStepInsert: false,
-};
+const STORE: {
+  runs: any[];
+  steps: any[];
+  evals: any[];
+  bindings: any[];
+  plans: any[];
+  releases: any[];
+  failStepInsert: boolean;
+} = { runs: [], steps: [], evals: [], bindings: [], plans: [], releases: [], failStepInsert: false };
 const MANIFEST_HASH = 'MH'; // matches makeVersion().manifest_hash
-const tableKey = (t: string): 'runs' | 'steps' | 'evals' =>
-  t === 'qhub_agent_runs' ? 'runs' : t === 'qhub_control_evaluations' ? 'evals' : 'steps';
+
+/** A full Gate 04 receipt carrying the ledger evidence commitment (bindable). */
+function fullReceipt(receiptId: string) {
+  return {
+    receipt_id: receiptId,
+    execution_status: 'SIMULATED_SUCCESS',
+    execution_mode: 'SIMULATION',
+    result_hash: `rh_${receiptId}`,
+    receipt_schema_version: 'gate04-receipt-1.0.0',
+    action_type: 'EXTERNAL_DATA_TRANSMISSION',
+    completed_at: '2026-07-29T00:00:00.000Z',
+    ledger_event_id: `evt_${receiptId}`,
+    ledger_event_hash: `evth_${receiptId}`,
+    ledger_seq: 1,
+  };
+}
+
+const tableKey = (t: string): 'runs' | 'steps' | 'evals' | 'bindings' | 'plans' | 'releases' =>
+  t === 'qhub_agent_runs'
+    ? 'runs'
+    : t === 'qhub_control_evaluations'
+      ? 'evals'
+      : t === 'qhub_governed_action_receipt_bindings'
+        ? 'bindings'
+        : t === 'qhub_enforcement_plans'
+          ? 'plans'
+          : t === 'qhub_release_candidates'
+            ? 'releases'
+            : 'steps';
 
 function fakeClient() {
   const from = (table: string) => {
@@ -220,6 +250,23 @@ function fakeClient() {
   };
 
   const rpc = (fn: string, args: any) => {
+    if (fn === 'qhub_bind_governed_action_receipt') {
+      const ev = evalFor(args.p_evaluation_id ?? null, args.p_org_id);
+      const existing = STORE.bindings.find((b) => b.evaluation_id === args.p_evaluation_id);
+
+      if (!existing) {
+        STORE.bindings.push({
+          evaluation_id: args.p_evaluation_id,
+          receipt_id: args.p_receipt_id,
+          run_id: args.p_run_id,
+          org_id: args.p_org_id,
+          action_digest: ev?.action_digest ?? null,
+        });
+      }
+
+      return Promise.resolve({ data: { bound: true, receipt_id: args.p_receipt_id }, error: null });
+    }
+
     if (fn === 'qhub_create_agent_run_step_pending') {
       if (STORE.failStepInsert) {
         return Promise.resolve({ data: null, error: { message: 'forced create failure' } });
@@ -459,7 +506,7 @@ function defaultEnforce() {
         execution_mode: 'SIMULATION',
         side_effect_performed: false,
         execution_status: 'SIMULATED_SUCCESS',
-        receipt: { receipt_id: 'rM', execution_status: 'SIMULATED_SUCCESS' },
+        receipt: fullReceipt('rM'),
       };
     }
 
@@ -471,7 +518,7 @@ function defaultEnforce() {
         execution_mode: 'SIMULATION',
         side_effect_performed: false,
         execution_status: 'SIMULATED_SUCCESS',
-        receipt: { receipt_id: 'rT', execution_status: 'SIMULATED_SUCCESS' },
+        receipt: fullReceipt('rT'),
       };
     }
 
@@ -506,6 +553,11 @@ beforeEach(() => {
   STORE.runs = [];
   STORE.steps = [];
   STORE.evals = [];
+  STORE.bindings = [];
+  STORE.plans = [];
+  STORE.releases = [
+    { release_candidate_id: 'rc-1', status: 'APPROVED', release_candidate_hash: 'RCHASH', org_id: 'client-smoke' },
+  ];
   STORE.failStepInsert = false;
   H.assertSchema.mockResolvedValue(undefined);
   H.getAgent.mockResolvedValue(makeAgent());

@@ -20,7 +20,7 @@ import {
 } from '~/lib/qhub/schema-check.server';
 import { projectRefFromUrl, type RequiredSchemaObject } from '~/lib/qhub/schema-contract';
 
-export const EXPECTED_AGENT_SCHEMA_VERSION = '2026-07-28.agent-result-continuity-r2';
+export const EXPECTED_AGENT_SCHEMA_VERSION = '2026-07-29.agent-result-continuity-r3';
 export const AGENT_SCHEMA_VERIFIER_RPC = 'qhub_verify_agent_schema';
 
 /** One representative column per Agent Framework table (first-line existence probe). */

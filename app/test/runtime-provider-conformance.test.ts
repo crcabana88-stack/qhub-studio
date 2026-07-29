@@ -331,6 +331,8 @@ describe('reconstructForResume — direct fail-closed unit checks', () => {
         result_hash: 'rh-step-0',
         safe_result: { execution_status: 'SIMULATED' },
         previous_step_hash: null,
+        result_hash_schema_version: 'agent-step-result-1.0.0',
+        finalized_at: '2026-07-29T00:00:00.000Z',
       },
       {
         run_id: 'r1',
@@ -346,6 +348,8 @@ describe('reconstructForResume — direct fail-closed unit checks', () => {
         result_hash: null,
         safe_result: null,
         previous_step_hash: null,
+        result_hash_schema_version: null,
+        finalized_at: null,
       },
     ];
     return base.map((s, i) => ({ ...s, ...(over[i] ?? {}) }));
@@ -512,6 +516,8 @@ describe('verifyStoredResultHashes — recompute from authoritative data', () =>
       result_hash: hash,
       safe_result: { execution_status: 'SUCCEEDED' },
       previous_step_hash: null,
+      result_hash_schema_version: 'agent-step-result-1.0.0',
+      finalized_at: '2026-07-29T00:00:00.000Z',
       ...overrides,
     };
   }
@@ -542,6 +548,76 @@ describe('verifyStoredResultHashes — recompute from authoritative data', () =>
     const r = verifyStoredResultHashes(run, [finalizedStep({ safe_result: null })], evalById);
     expect(r.ok).toBe(false);
     expect(r.reason).toBe('NON_RESUMABLE_LEGACY_CONTINUITY');
+  });
+
+  // ── Authoritative-mode reconstruction validation (Blocker F, tests 37-47) ──
+  const auth = () => ({
+    planById: new Map([['ep0', { enforcement_plan_id: 'ep0', status: 'ACTIVE', enforcement_plan_hash: 'EPH' }]]),
+    releaseById: new Map([['rc1', { release_candidate_id: 'rc1', status: 'APPROVED', release_candidate_hash: 'RCH' }]]),
+    bindingByEval: new Map([
+      ['E0', { evaluation_id: 'E0', receipt_id: 'rcpt0', run_id: 'r1', org_id: 'o1', action_digest: 'dig0' }],
+    ]),
+  });
+
+  it('accepts a fully valid finalized step in authoritative mode (test 49)', () => {
+    expect(verifyStoredResultHashes(run, [finalizedStep()], evalById, auth()).ok).toBe(true);
+  });
+
+  const cases: Array<[string, Partial<StoredRunStep>, ReturnType<typeof auth> | null, string]> = [
+    ['invalid schema version (test 37)', { result_hash_schema_version: 'bogus' }, null, 'INVALID_SCHEMA_VERSION'],
+    ['null finalized_at (test 38)', { finalized_at: null }, null, 'NON_RESUMABLE_LEGACY_CONTINUITY'],
+    [
+      'invalid safe_result (test 39)',
+      { safe_result: { execution_status: 'not-an-enum' } },
+      null,
+      'INVALID_SAFE_RESULT',
+    ],
+  ];
+
+  for (const [label, over, a, reason] of cases) {
+    it(`fails closed on ${label}`, () => {
+      const r = verifyStoredResultHashes(run, [finalizedStep(over)], evalById, a ?? auth());
+      expect(r.ok).toBe(false);
+      expect(r.reason).toBe(reason);
+    });
+  }
+
+  it('fails closed on a missing plan row (test 40)', () => {
+    const a = auth();
+    a.planById = new Map();
+    expect(verifyStoredResultHashes(run, [finalizedStep()], evalById, a).reason).toBe('MISSING_PLAN_ROW');
+  });
+
+  it('fails closed on plan hash drift (test 41/43)', () => {
+    const a = auth();
+    a.planById = new Map([['ep0', { enforcement_plan_id: 'ep0', status: 'ACTIVE', enforcement_plan_hash: 'DRIFT' }]]);
+    expect(verifyStoredResultHashes(run, [finalizedStep()], evalById, a).reason).toBe('PLAN_INVALID');
+  });
+
+  it('fails closed on a missing release row (test 42)', () => {
+    const a = auth();
+    a.releaseById = new Map();
+    expect(verifyStoredResultHashes(run, [finalizedStep()], evalById, a).reason).toBe('MISSING_RELEASE_ROW');
+  });
+
+  it('fails closed on a fabricated/missing receipt binding (test 44)', () => {
+    const a = auth();
+    a.bindingByEval = new Map();
+    expect(verifyStoredResultHashes(run, [finalizedStep()], evalById, a).reason).toBe('MISSING_RECEIPT_BINDING');
+  });
+
+  it('fails closed on receipt-binding evidence drift (test 45)', () => {
+    const a = auth();
+    a.bindingByEval = new Map([
+      ['E0', { evaluation_id: 'E0', receipt_id: 'DIFFERENT', run_id: 'r1', org_id: 'o1', action_digest: 'dig0' }],
+    ]);
+    expect(verifyStoredResultHashes(run, [finalizedStep()], evalById, a).reason).toBe('RECEIPT_BINDING_MISMATCH');
+  });
+
+  it('stored-hash tamper still fails in authoritative mode (test 46)', () => {
+    expect(verifyStoredResultHashes(run, [finalizedStep({ result_hash: 'tampered' })], evalById, auth()).reason).toBe(
+      'RESULT_HASH_MISMATCH',
+    );
   });
 });
 
