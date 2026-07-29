@@ -1,20 +1,20 @@
 /**
- * QHUB Commercial Launch R2 — real-route enforcement wiring
+ * QHUB Commercial Launch R3 — internal routes are Quantex-STAFF-ONLY
  * app/test/commercial-route-enforcement.test.ts
  *
- * Proves the protected production routes actually call requireCommercialContext
- * with the correct capability and return its fail-closed response — the browser UI
- * is never the boundary. The guard itself is unit-tested in commercial-context.
+ * The unrestricted internal Studio / agent / Gate 04 / governance / classify
+ * surfaces now enforce requireStaff and return its fail-closed response. Commercial
+ * customers cannot reach them (they build via /api/commercial/*).
  */
 
 import { json } from '@remix-run/cloudflare';
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 
-const { mockRequire } = vi.hoisted(() => ({ mockRequire: vi.fn() }));
+const { mockStaff } = vi.hoisted(() => ({ mockStaff: vi.fn() }));
 
 vi.mock('~/lib/qhub/commercial/commercial-context.server', async (importActual) => {
   const actual = await importActual<typeof import('~/lib/qhub/commercial/commercial-context.server')>();
-  return { ...actual, requireCommercialContext: mockRequire };
+  return { ...actual, requireStaff: mockStaff };
 });
 
 import { action as enforceAction } from '~/routes/api.enforce';
@@ -34,47 +34,46 @@ function ctx(body: unknown = {}) {
   } as never;
 }
 
-/** Simulate a denied guard (e.g. commercial user lacking the capability). */
-function deny() {
-  mockRequire.mockResolvedValue({ ok: false, response: json({ ok: false, error: 'forbidden' }, { status: 403 }) });
+function denyStaff() {
+  mockStaff.mockResolvedValue({ ok: false, response: json({ ok: false, error: 'staff_only' }, { status: 403 }) });
 }
 
 beforeEach(() => {
   vi.clearAllMocks();
 });
 
-describe('protected routes enforce the commercial capability', () => {
-  it('POST /api/enforce requires CONSEQUENTIAL_ACTION and returns the denial', async () => {
-    deny();
+describe('internal routes are staff-only', () => {
+  it('POST /api/enforce denies a non-staff caller', async () => {
+    denyStaff();
 
     const res = (await enforceAction(
       ctx({ conversationId: 'c', action: { action_type: 'CONNECTOR_ACTION' } }),
     )) as Response;
     expect(res.status).toBe(403);
-    expect(mockRequire).toHaveBeenCalledWith(expect.anything(), expect.anything(), 'CONSEQUENTIAL_ACTION');
+    expect(mockStaff).toHaveBeenCalled();
   });
 
-  it('POST /api/agent requires AGENT_BUILD and returns the denial', async () => {
-    deny();
+  it('POST /api/agent denies a non-staff caller', async () => {
+    denyStaff();
 
     const res = (await agentAction(ctx({ op: 'create' }))) as Response;
     expect(res.status).toBe(403);
-    expect(mockRequire).toHaveBeenCalledWith(expect.anything(), expect.anything(), 'AGENT_BUILD');
+    expect(mockStaff).toHaveBeenCalled();
   });
 
-  it('POST /api/governance requires APP_BUILD and returns the denial', async () => {
-    deny();
+  it('POST /api/governance denies a non-staff caller', async () => {
+    denyStaff();
 
     const res = (await governanceAction(ctx({ action: 'PROJECT_CREATED', conversationId: 'c' }))) as Response;
     expect(res.status).toBe(403);
-    expect(mockRequire).toHaveBeenCalledWith(expect.anything(), expect.anything(), 'APP_BUILD');
+    expect(mockStaff).toHaveBeenCalled();
   });
 
-  it('POST /api/classify requires APP_BUILD and returns the denial', async () => {
-    deny();
+  it('POST /api/classify denies a non-staff caller', async () => {
+    denyStaff();
 
     const res = (await classifyAction(ctx({ description: 'hello' }))) as Response;
     expect(res.status).toBe(403);
-    expect(mockRequire).toHaveBeenCalledWith(expect.anything(), expect.anything(), 'APP_BUILD');
+    expect(mockStaff).toHaveBeenCalled();
   });
 });

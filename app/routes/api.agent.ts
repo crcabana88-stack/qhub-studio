@@ -20,7 +20,7 @@
  */
 
 import { json, type ActionFunctionArgs } from '@remix-run/cloudflare';
-import { requireCommercialContext } from '~/lib/qhub/commercial/commercial-context.server';
+import { requireStaff } from '~/lib/qhub/commercial/commercial-context.server';
 import { generateStableSessionId } from '~/lib/qhub/session-id.server';
 import { buildAgentManifest } from '~/lib/qhub/agent/agent-manifest.server';
 import {
@@ -46,7 +46,7 @@ export async function action({ request, context }: ActionFunctionArgs) {
    * Agent building/running is denied to commercial customers — only authoritative
    * internal staff hold AGENT_BUILD. Institutional agents are not in the launch tier.
    */
-  const guard = await requireCommercialContext(request, env, 'AGENT_BUILD');
+  const guard = await requireStaff(request, env);
 
   if (!guard.ok) {
     return guard.response;

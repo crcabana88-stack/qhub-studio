@@ -9,19 +9,21 @@
 
 import { json, type LoaderFunctionArgs } from '@remix-run/cloudflare';
 import { useLoaderData, useFetcher, Link } from '@remix-run/react';
-import { getSession } from '~/lib/auth/session';
+import { requireStaff } from '~/lib/qhub/commercial/commercial-context.server';
 import { listAgents, type AgentRow } from '~/lib/qhub/agent/agent-registry.server';
 import { AgentRegistryView } from '~/components/agent/AgentRegistryView';
 
 export async function loader({ request, context }: LoaderFunctionArgs) {
   const env = (context.cloudflare?.env as unknown as Record<string, string | undefined>) ?? {};
-  const session = await getSession(request, env);
 
-  if (!session) {
+  // R3: the agent registry is an internal surface — Quantex-STAFF-ONLY.
+  const guard = await requireStaff(request, env);
+
+  if (!guard.ok || !guard.ctx.orgId) {
     return json({ authenticated: false, agents: [] as AgentRow[] }, { status: 200 });
   }
 
-  const agents = await listAgents(session.orgId, env);
+  const agents = await listAgents(guard.ctx.orgId, env);
 
   return json({ authenticated: true, agents });
 }

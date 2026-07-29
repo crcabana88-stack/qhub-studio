@@ -8,24 +8,25 @@
  */
 
 import { json, type LoaderFunctionArgs } from '@remix-run/cloudflare';
-import { getSession } from '~/lib/auth/session';
-import { loadOrgEntitlements } from '~/lib/qhub/commercial/entitlements.server';
+import { requireCommercialContext } from '~/lib/qhub/commercial/commercial-context.server';
 
 export async function loader({ request, context }: LoaderFunctionArgs) {
   const env = (context?.cloudflare?.env as unknown as Record<string, string | undefined>) ?? {};
-  const session = await getSession(request, env);
 
-  if (!session) {
-    return json({ error: 'unauthorized' }, { status: 401 });
+  // Commercial-safe: returns the caller's OWN authoritative entitlements only.
+  const guard = await requireCommercialContext(request, env);
+
+  if (!guard.ok) {
+    return guard.response;
   }
 
-  const resolved = await loadOrgEntitlements(session.orgId, env);
+  const ctx = guard.ctx;
 
   return json({
-    orgId: session.orgId,
-    planId: resolved.planId,
-    status: resolved.status,
-    serviceState: resolved.serviceState,
-    entitlements: resolved.entitlements,
+    orgId: ctx.orgId,
+    planId: ctx.resolved.planId,
+    status: ctx.resolved.status,
+    serviceState: ctx.resolved.serviceState,
+    entitlements: ctx.resolved.entitlements,
   });
 }

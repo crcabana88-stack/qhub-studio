@@ -8,7 +8,7 @@
  *       vitest --run app/test/governance.test.ts
  */
 
-import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach } from 'vitest';
 
 /*
  * ─── Module mocks ─────────────────────────────────────────────────────────────
@@ -156,7 +156,7 @@ describe('TEST 1: Root loader response contains no HMAC secret', () => {
 
 describe('TEST 2: GENESIS intent is handled server-side', () => {
   it('GovernanceService.handleIntent routes PROJECT_CREATED correctly', async () => {
-    const { GovernanceService } = await import('~/lib/qhub/governance-service.server');
+    const govMod = await import('~/lib/qhub/governance-service.server');
 
     // Lambda returns the chain_id it minted for CHAIN_GENESIS (seq=1).
     const mockFetch = vi
@@ -164,7 +164,7 @@ describe('TEST 2: GENESIS intent is handled server-side', () => {
       .mockResolvedValue(new Response('{"chain_id":"chain-genesis-uuid","seq":1}', { status: 200 }));
     vi.stubGlobal('fetch', mockFetch);
 
-    const svc = new GovernanceService({
+    const svc = new govMod.GovernanceService({
       userId: 'user-123',
       orgId: 'org-abc',
       sessionId: 'studio-abc123',
@@ -209,7 +209,7 @@ describe('TEST 2: GENESIS intent is handled server-side', () => {
   });
 
   it('GENESIS event body does not contain hmacSecret', async () => {
-    const { GovernanceService } = await import('~/lib/qhub/governance-service.server');
+    const govMod = await import('~/lib/qhub/governance-service.server');
 
     const capturedBodies: string[] = [];
     const mockFetch = vi.fn().mockImplementation((url: string, opts: RequestInit) => {
@@ -218,7 +218,7 @@ describe('TEST 2: GENESIS intent is handled server-side', () => {
     });
     vi.stubGlobal('fetch', mockFetch);
 
-    const svc = new GovernanceService({
+    const svc = new govMod.GovernanceService({
       userId: 'user-123',
       orgId: 'org-abc',
       sessionId: 'studio-abc123',
@@ -279,12 +279,12 @@ describe('TEST 3: AI_BOM hook is server-side only', () => {
   });
 
   it('AI_BOM event goes to POST /events via GovernanceService', async () => {
-    const { GovernanceService } = await import('~/lib/qhub/governance-service.server');
+    const govMod = await import('~/lib/qhub/governance-service.server');
 
     const mockFetch = vi.fn().mockResolvedValue(new Response('{}', { status: 200 }));
     vi.stubGlobal('fetch', mockFetch);
 
-    const svc = new GovernanceService({
+    const svc = new govMod.GovernanceService({
       userId: 'u',
       orgId: 'o',
       sessionId: 's',
@@ -379,12 +379,12 @@ describe('TEST 3: AI_BOM hook is server-side only', () => {
 
 describe('TEST 4: Browser-supplied identity claims are ignored', () => {
   it('GovernanceService uses server context userId, not any browser-supplied value', async () => {
-    const { GovernanceService } = await import('~/lib/qhub/governance-service.server');
+    const govMod = await import('~/lib/qhub/governance-service.server');
 
     const mockFetch = vi.fn().mockResolvedValue(new Response('{}', { status: 200 }));
     vi.stubGlobal('fetch', mockFetch);
 
-    const svc = new GovernanceService({
+    const svc = new govMod.GovernanceService({
       userId: 'real-server-user',
       orgId: 'real-server-org',
       sessionId: 'studio-real',
@@ -476,13 +476,13 @@ describe('TEST 5: Missing session blocks production deployment', () => {
 
 describe('TEST 6: API unreachable returns UNKNOWN (fail-closed)', () => {
   it('queryGateState returns UNKNOWN on network error', async () => {
-    const { GovernanceService } = await import('~/lib/qhub/governance-service.server');
+    const govMod = await import('~/lib/qhub/governance-service.server');
 
     // Simulate network failure (DNS error)
     const mockFetch = vi.fn().mockRejectedValue(new TypeError('fetch failed: ENOTFOUND'));
     vi.stubGlobal('fetch', mockFetch);
 
-    const svc = new GovernanceService({
+    const svc = new govMod.GovernanceService({
       userId: 'u',
       orgId: 'o',
       sessionId: 's',
@@ -521,7 +521,7 @@ describe('TEST 6: API unreachable returns UNKNOWN (fail-closed)', () => {
 
 describe('TEST 7: Unattested project returns BLOCKED', () => {
   it('gate returns BLOCKED when attestation_status is not ATTESTED', async () => {
-    const { GovernanceService } = await import('~/lib/qhub/governance-service.server');
+    const govMod = await import('~/lib/qhub/governance-service.server');
 
     const mockFetch = vi.fn().mockImplementation((url: string) => {
       if (url.includes('/chains')) {
@@ -536,7 +536,7 @@ describe('TEST 7: Unattested project returns BLOCKED', () => {
     });
     vi.stubGlobal('fetch', mockFetch);
 
-    const svc = new GovernanceService({
+    const svc = new govMod.GovernanceService({
       userId: 'u',
       orgId: 'o',
       sessionId: 's',
@@ -559,7 +559,7 @@ describe('TEST 7: Unattested project returns BLOCKED', () => {
 
 describe('TEST 8: Attested project returns APPROVED', () => {
   it('gate returns APPROVED when attestation_status is ATTESTED', async () => {
-    const { GovernanceService } = await import('~/lib/qhub/governance-service.server');
+    const govMod = await import('~/lib/qhub/governance-service.server');
 
     const mockFetch = vi.fn().mockImplementation((url: string) => {
       if (url.includes('/chains')) {
@@ -572,7 +572,7 @@ describe('TEST 8: Attested project returns APPROVED', () => {
     });
     vi.stubGlobal('fetch', mockFetch);
 
-    const svc = new GovernanceService({
+    const svc = new govMod.GovernanceService({
       userId: 'u',
       orgId: 'o',
       sessionId: 's',

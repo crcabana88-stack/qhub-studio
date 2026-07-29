@@ -67,6 +67,8 @@ export async function action({ request, context }: ActionFunctionArgs) {
       account: event.stripeAccount ?? null,
       eventCreated: event.eventCreated,
       payloadHash,
+      owner: crypto.randomUUID(), // this worker's lease owner
+      leaseSeconds: 120,
     },
     env,
   );

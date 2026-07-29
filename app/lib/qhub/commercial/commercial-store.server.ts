@@ -165,6 +165,8 @@ export async function claimWebhookEvent(
     account: string | null;
     eventCreated: number;
     payloadHash: string;
+    owner: string;
+    leaseSeconds?: number;
   },
   env: Record<string, string | undefined>,
 ): Promise<WebhookClaim> {
@@ -177,9 +179,12 @@ export async function claimWebhookEvent(
     p_account: input.account,
     p_event_created: input.eventCreated,
     p_payload_hash: input.payloadHash,
+    p_owner: input.owner,
+    p_lease_seconds: input.leaseSeconds ?? 120,
   });
 
   if (error) {
+    // DB errors are never silently ignored — surface for a retry.
     throw new Error(`[Webhook] claim failed: ${error.message}`);
   }
 
@@ -258,11 +263,63 @@ export async function applySubscriptionEvent(
 export async function countProjects(orgId: string, env: Record<string, string | undefined>): Promise<number> {
   const sb = admin(env);
   const { count } = await sb
-    .from('qhub_applications')
-    .select('qhub_app_id', { count: 'exact', head: true })
-    .eq('org_id', orgId);
+    .from('qhub_project_entitlements')
+    .select('project_id', { count: 'exact', head: true })
+    .eq('org_id', orgId)
+    .eq('active', true);
 
   return count ?? 0;
+}
+
+/** The authoritative owning org of a project, or null when the project is unknown. */
+export async function getProjectOwnership(
+  projectId: string,
+  env: Record<string, string | undefined>,
+): Promise<string | null> {
+  const sb = admin(env);
+  const { data } = await sb
+    .from('qhub_project_entitlements')
+    .select('org_id')
+    .eq('project_id', projectId)
+    .maybeSingle();
+
+  return (data?.org_id as string) ?? null;
+}
+
+/**
+ * Create a project transactionally under the plan's project cap (enforced by the
+ * one-active-guided partial-unique index + an app-level active-count check for
+ * Builder Beta). Returns the new project id or a reason.
+ */
+export async function createProjectEntitlement(
+  input: { orgId: string; createdBy: string; planId: string; maxProjects: number },
+  env: Record<string, string | undefined>,
+): Promise<{ ok: true; projectId: string } | { ok: false; reason: string }> {
+  const sb = admin(env);
+  const active = await countProjects(input.orgId, env);
+
+  if (active >= input.maxProjects) {
+    return { ok: false, reason: 'project_limit_reached' };
+  }
+
+  const { data, error } = await sb
+    .from('qhub_project_entitlements')
+    .insert({
+      project_id: crypto.randomUUID(),
+      org_id: input.orgId,
+      created_by: input.createdBy,
+      plan_id: input.planId,
+      active: true,
+    })
+    .select('project_id')
+    .maybeSingle();
+
+  if (error) {
+    // Unique-violation (e.g. the one-active-guided index) → limit reached.
+    return { ok: false, reason: 'project_limit_reached' };
+  }
+
+  return { ok: true, projectId: data?.project_id as string };
 }
 
 // ─── Usage credits ──────────────────────────────────────────────────────────────
@@ -318,34 +375,38 @@ export async function getOrInitUsage(
   return { periodKey: data.period_key as string, allotted, used, remaining: Math.max(0, allotted - used) };
 }
 
+export interface CreditResult {
+  ok: boolean;
+  idempotent?: boolean;
+  remaining?: number;
+  ledger_id?: string;
+  reason?: string;
+}
+
 /**
- * Consume one build credit atomically + idempotently via the guarded RPC (single
- * transaction: lock → validate → decrement → append immutable ledger row). The
- * idempotency key makes an exact retry return the prior balance without a second
- * decrement; a materially different request under the same key is rejected by the
- * RPC. Returns the remaining credits, or null when exhausted / not consumable.
+ * Consume build credits atomically via the project-derived R3 RPC (single
+ * transaction: derive org/ownership/eligibility → lock period → validate → idempotency
+ * → decrement → append immutable ledger row). The RPC returns a structured result;
+ * an exact retry (same key + canonical hash + units) returns the prior balance, a
+ * changed request under the same key is rejected, and overdraw is impossible.
  */
 export async function consumeBuildCredit(
-  input: { orgId: string; monthlyAllotment: number; idempotencyKey: string; requestHash: string },
+  input: { projectId: string; idempotencyKey: string; canonicalHash: string; units: number },
   env: Record<string, string | undefined>,
-  now: Date = new Date(),
-): Promise<number | null> {
-  await getOrInitUsage(input.orgId, input.monthlyAllotment, env, now);
-
+): Promise<CreditResult> {
   const sb = admin(env);
-  const period = currentUsagePeriod(now);
   const { data, error } = await sb.rpc('qhub_consume_build_credit', {
-    p_org_id: input.orgId,
-    p_period_key: period.periodKey,
+    p_project_id: input.projectId,
     p_idempotency_key: input.idempotencyKey,
-    p_request_hash: input.requestHash,
+    p_canonical_hash: input.canonicalHash,
+    p_units: input.units,
   });
 
   if (error || data === null || data === undefined) {
-    return null;
+    return { ok: false, reason: error?.message ?? 'rpc_error' };
   }
 
-  return data as number;
+  return data as CreditResult;
 }
 
 export async function appendUsageLedger(

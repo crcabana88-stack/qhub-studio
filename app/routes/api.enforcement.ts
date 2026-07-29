@@ -13,7 +13,7 @@
  */
 
 import { json, type ActionFunctionArgs } from '@remix-run/cloudflare';
-import { getSession } from '~/lib/auth/session';
+import { requireStaff } from '~/lib/qhub/commercial/commercial-context.server';
 import { getOrCreateQhubApp, getPolicyProfile } from '~/lib/qhub/qhub-app.server';
 import {
   getActivePlan,
@@ -32,11 +32,13 @@ const KILL_SWITCH_ROLES = ['owner', 'admin', 'governance', 'security'];
 
 export async function action({ request, context }: ActionFunctionArgs) {
   const env = (context.cloudflare?.env as unknown as Record<string, string | undefined>) ?? {};
-  const session = await getSession(request, env);
+  const guard = await requireStaff(request, env);
 
-  if (!session) {
-    return json({ ok: false, error: 'Unauthenticated' }, { status: 401 });
+  if (!guard.ok) {
+    return guard.response;
   }
+
+  const session = { userId: guard.ctx.userId, orgId: guard.ctx.orgId ?? '', role: guard.ctx.role ?? 'staff' };
 
   let body: any;
 

@@ -1,6 +1,5 @@
 import { type ActionFunctionArgs } from '@remix-run/cloudflare';
-import { requireCommercialContext } from '~/lib/qhub/commercial/commercial-context.server';
-import { consumeBuildCredit } from '~/lib/qhub/commercial/commercial-store.server';
+import { requireStaff } from '~/lib/qhub/commercial/commercial-context.server';
 import { generateStableSessionId } from '~/lib/qhub/session-id.server';
 import { createDataStream, generateId } from 'ai';
 import { MAX_RESPONSE_SEGMENTS, MAX_TOKENS, type FileMap } from '~/lib/.server/llm/constants';
@@ -86,10 +85,10 @@ async function chatAction({ context, request }: ActionFunctionArgs) {
   const serverEnv = (context.cloudflare?.env as unknown as Record<string, string | undefined>) ?? {};
 
   /*
-   * Authoritative context + capability. Model invocation requires MODEL_INVOKE
-   * (active plan + completed onboarding for commercial customers; staff exempt).
+   * R3: the unrestricted internal Studio chat is Quantex-STAFF-ONLY. Commercial
+   * customers build through the dedicated /api/commercial surface, never here.
    */
-  const guard = await requireCommercialContext(request, serverEnv, 'MODEL_INVOKE');
+  const guard = await requireStaff(request, serverEnv);
 
   if (!guard.ok) {
     return guard.response;
@@ -99,29 +98,6 @@ async function chatAction({ context, request }: ActionFunctionArgs) {
 
   // Use first user message ID as the stable conversation anchor.
   const firstMessageId = messages.find((m) => m.role === 'user')?.id ?? `init-${Date.now()}`;
-
-  /*
-   * Consume a build credit BEFORE expensive model execution (staff exempt). An
-   * exact retry of the same anchor is idempotent (no double-charge).
-   */
-  if (!qhubCtx.isStaff && qhubCtx.orgId) {
-    const remaining = await consumeBuildCredit(
-      {
-        orgId: qhubCtx.orgId,
-        monthlyAllotment: qhubCtx.resolved.entitlements.buildCreditsPerMonth,
-        idempotencyKey: `chat:${qhubCtx.orgId}:${firstMessageId}`,
-        requestHash: `msgs:${messages.length}`,
-      },
-      serverEnv,
-    );
-
-    if (remaining === null) {
-      return new Response(JSON.stringify({ ok: false, error: 'build_credits_exhausted' }), {
-        status: 402,
-        headers: { 'Content-Type': 'application/json' },
-      });
-    }
-  }
 
   const qhubContext = qhubCtx.orgId
     ? {

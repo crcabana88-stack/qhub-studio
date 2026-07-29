@@ -1,5 +1,6 @@
 import { type ActionFunctionArgs, json } from '@remix-run/cloudflare';
 import crypto from 'crypto';
+import { requireStaff } from '~/lib/qhub/commercial/commercial-context.server';
 import type { NetlifySiteInfo } from '~/types/netlify';
 
 interface DeployRequestBody {
@@ -25,7 +26,15 @@ async function readNetlifyError(response: Response) {
   }
 }
 
-export async function action({ request }: ActionFunctionArgs) {
+export async function action({ request, context }: ActionFunctionArgs) {
+  // R3: direct deployment is Quantex-STAFF-ONLY (commercial publishes via review).
+  const env = (context?.cloudflare?.env as unknown as Record<string, string | undefined>) ?? {};
+  const guard = await requireStaff(request, env);
+
+  if (!guard.ok) {
+    return guard.response;
+  }
+
   try {
     const { siteId, files, token, chatId } = (await request.json()) as DeployRequestBody & { token: string };
 

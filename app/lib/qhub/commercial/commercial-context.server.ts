@@ -57,6 +57,66 @@ export function ctxToSession(ctx: CommercialContext): { userId: string; orgId: s
   return { userId: ctx.userId, orgId: ctx.orgId ?? '', role: ctx.role ?? (ctx.isStaff ? 'staff' : 'viewer') };
 }
 
+/**
+ * Authoritative Quantex-staff gate for internal / legacy routes. Non-staff callers
+ * (including any commercial customer) are denied. Internal Studio, agent, Gate 04,
+ * governance, raw-query, and deploy surfaces use THIS — they are never commercially
+ * reachable.
+ */
+export async function requireStaff(request: Request, env: Record<string, string | undefined>): Promise<GuardResult> {
+  const guard = await requireCommercialContext(request, env);
+
+  if (!guard.ok) {
+    return guard;
+  }
+
+  if (!guard.ctx.isStaff) {
+    return { ok: false, response: json({ ok: false, error: 'staff_only' }, { status: 403 }) };
+  }
+
+  return guard;
+}
+
+/**
+ * Bind a verified project to the context: the project must be owned by the
+ * caller's authoritative org (browser-supplied ownership is never trusted).
+ * Returns the CommercialExecutionContext or a fail-closed response.
+ */
+export async function requireCommercialProject(
+  request: Request,
+  env: Record<string, string | undefined>,
+  projectId: string,
+  requiredCapability?: Capability,
+): Promise<{ ok: true; ctx: CommercialExecutionContext } | { ok: false; response: Response }> {
+  const guard = await requireCommercialContext(request, env, requiredCapability);
+
+  if (!guard.ok) {
+    return guard;
+  }
+
+  const ctx = guard.ctx;
+
+  if (!ctx.orgId) {
+    return { ok: false, response: json({ ok: false, error: 'no_org_context' }, { status: 403 }) };
+  }
+
+  const { getProjectOwnership } = await import('~/lib/qhub/commercial/commercial-store.server');
+  const ownerOrg = await getProjectOwnership(projectId, env).catch(() => null);
+
+  if (!ownerOrg || ownerOrg !== ctx.orgId) {
+    // Not found OR owned by another tenant → deny (no cross-tenant project access).
+    return { ok: false, response: json({ ok: false, error: 'project_forbidden' }, { status: 403 }) };
+  }
+
+  return { ok: true, ctx: { ...ctx, projectId, projectOrgId: ownerOrg } };
+}
+
+/** The execution context carried into protected commercial service functions. */
+export interface CommercialExecutionContext extends CommercialContext {
+  projectId: string;
+  projectOrgId: string;
+}
+
 /** Read a browser-requested org selection (validated against membership later). */
 function requestedOrg(request: Request): string | null {
   const header = request.headers.get('x-qhub-org');

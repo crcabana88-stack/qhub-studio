@@ -29,14 +29,14 @@
  */
 
 import { json, type ActionFunctionArgs } from '@remix-run/cloudflare';
-import { requireCommercialContext } from '~/lib/qhub/commercial/commercial-context.server';
+import { requireStaff } from '~/lib/qhub/commercial/commercial-context.server';
 import { createGovernanceService, type GovernanceIntent } from '~/lib/qhub/governance-service.server';
 import { generateStableSessionId } from '~/lib/qhub/session-id.server';
 
 export async function action({ request, context }: ActionFunctionArgs) {
   // ── 1. Authoritative context + capability (APP_BUILD) ─────────────────────────
   const env = (context.cloudflare?.env as unknown as Record<string, string | undefined>) ?? {};
-  const guard = await requireCommercialContext(request, env, 'APP_BUILD');
+  const guard = await requireStaff(request, env);
 
   if (!guard.ok) {
     return guard.response;
@@ -86,7 +86,7 @@ export async function action({ request, context }: ActionFunctionArgs) {
 
   const svc = createGovernanceService({
     userId: session.userId, // Server-authoritative: from Supabase JWT
-    orgId: session.orgId, // Server-authoritative: from Supabase user_metadata
+    orgId: session.orgId, // Server-authoritative: from the DB-backed staff context
     sessionId,
     env,
   });

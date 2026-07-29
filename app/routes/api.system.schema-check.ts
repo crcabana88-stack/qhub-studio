@@ -20,18 +20,18 @@
  */
 
 import { json, type LoaderFunctionArgs } from '@remix-run/cloudflare';
-import { getSession } from '~/lib/auth/session';
+import { requireStaff } from '~/lib/qhub/commercial/commercial-context.server';
 import { getSchemaReadiness } from '~/lib/qhub/schema-check.server';
 import { getAgentSchemaReadiness } from '~/lib/qhub/agent/agent-schema-check.server';
 
 export const loader = async ({ request, context }: LoaderFunctionArgs) => {
   const env = (context?.cloudflare?.env as unknown as Record<string, string | undefined>) ?? {};
 
-  // Authentication gate: the detailed diagnostic is operator-only.
-  const session = await getSession(request, env);
+  // R3: the detailed schema diagnostic is an internal surface — Quantex-STAFF-ONLY.
+  const guard = await requireStaff(request, env);
 
-  if (!session) {
-    return json({ ok: false, error: 'Unauthenticated' }, { status: 401 });
+  if (!guard.ok) {
+    return guard.response;
   }
 
   const force = new URL(request.url).searchParams.get('force') === '1';

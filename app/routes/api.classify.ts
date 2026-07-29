@@ -14,7 +14,7 @@
  */
 
 import { json, type ActionFunctionArgs } from '@remix-run/cloudflare';
-import { requireCommercialContext } from '~/lib/qhub/commercial/commercial-context.server';
+import { requireStaff } from '~/lib/qhub/commercial/commercial-context.server';
 import { classifyApplication } from '~/lib/qhub/classifier.server';
 import { tierRank } from '~/lib/qhub/classification';
 import { LAUNCH_MAX_RISK_TIER } from '~/lib/qhub/commercial/plans';
@@ -22,7 +22,7 @@ import { persistProposal } from '~/lib/qhub/qhub-app.server';
 
 export async function action({ request, context }: ActionFunctionArgs) {
   const env = (context.cloudflare?.env as unknown as Record<string, string | undefined>) ?? {};
-  const guard = await requireCommercialContext(request, env, 'APP_BUILD');
+  const guard = await requireStaff(request, env);
 
   if (!guard.ok) {
     return guard.response;

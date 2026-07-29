@@ -1,19 +1,19 @@
 -- ============================================================================
--- QHUB Commercial Launch Foundation — R2 HARDENING
+-- QHUB Commercial Launch Foundation — R3 HARDENING
 -- Migration: 20260729_commercial_launch_foundation  (replaces the rejected
---            2ff6ab3a… contents IN PLACE — one authoritative commercial migration)
--- Schema version: 2026-07-29.commercial-launch-r2
+--            4b42555a… contents IN PLACE — one authoritative commercial migration)
+-- Schema version: 2026-07-30.commercial-launch-r3
 --
--- Adds authoritative identity/membership, a recoverable Stripe webhook inbox,
--- mode/account/price-bound subscriptions, an atomic idempotent build-credit RPC,
--- persisted Governance Essentials, staff-authorized manual review, hardened
--- constraints, and a qhub_verify_commercial_schema() readiness contract.
+-- Central commercial security boundary: authoritative membership/staff, real
+-- project ownership, checkout-intent binding (metadata is never tenant authority),
+-- a recoverable webhook inbox with LEASES, an atomic project-derived credit RPC,
+-- persisted Governance Essentials as the build gate, staff-authorized review, and
+-- a qhub_verify_commercial_schema() contract that checks exact semantics.
 --
--- SAFETY: wrapped in a single transaction (BEGIN/COMMIT — full rollback on any
--- failure). Additive only: no DROP / DELETE / TRUNCATE / destructive type change /
--- fabricated backfill. Idempotent: a healthy rerun is a no-op. Tenant-scoped +
--- server-authoritative: RESTRICTIVE RLS denies anon/authenticated; only the
--- service role holds table grants; the credit RPC is service-role only.
+-- SAFETY: single transaction (BEGIN/COMMIT — full rollback on any failure).
+-- Additive only: no DROP / DELETE / TRUNCATE / destructive type change / fabricated
+-- backfill. Idempotent: a healthy rerun is a no-op. RESTRICTIVE service-only RLS;
+-- only the service role holds grants; RPCs are service-role only.
 --
 -- Run in the Supabase SQL editor at the human checkpoint. Do NOT apply here.
 -- ============================================================================
@@ -29,9 +29,6 @@ CREATE TABLE IF NOT EXISTS public.qhub_commercial_plans (
 );
 
 -- ─── Authoritative identity / tenancy ───────────────────────────────────────
-
--- Organization membership. THE authority for org_id + org role — never
--- user_metadata. A protected request resolves membership from here.
 CREATE TABLE IF NOT EXISTS public.qhub_org_members (
   user_id     TEXT NOT NULL,
   org_id      TEXT NOT NULL,
@@ -46,7 +43,6 @@ CREATE TABLE IF NOT EXISTS public.qhub_org_members (
   PRIMARY KEY (user_id, org_id)
 );
 
--- Internal Quantex staff. THE authority for internal override/review/dev access.
 CREATE TABLE IF NOT EXISTS public.qhub_quantex_staff (
   user_id     TEXT PRIMARY KEY,
   staff_role  TEXT NOT NULL DEFAULT 'reviewer'
@@ -55,7 +51,6 @@ CREATE TABLE IF NOT EXISTS public.qhub_quantex_staff (
   created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
--- Invitations (acceptance flow).
 CREATE TABLE IF NOT EXISTS public.qhub_org_invitations (
   id           UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   org_id       TEXT NOT NULL,
@@ -100,6 +95,7 @@ CREATE TABLE IF NOT EXISTS public.qhub_subscriptions (
   stripe_account                 TEXT,
   current_period_end             BIGINT,
   last_event_created             BIGINT NOT NULL DEFAULT 0,
+  last_provider_event_id         TEXT,
   override_sensitive_data_review BOOLEAN NOT NULL DEFAULT FALSE,
   override_bonus_credits         INTEGER NOT NULL DEFAULT 0,
   override_actor                 TEXT,
@@ -112,7 +108,24 @@ CREATE TABLE IF NOT EXISTS public.qhub_subscriptions (
   UNIQUE (provider, provider_subscription_id)
 );
 
--- ─── Webhook inbox (recoverable state machine) ──────────────────────────────
+-- ─── Checkout intents (opaque tenant binding — metadata is never authority) ──
+CREATE TABLE IF NOT EXISTS public.qhub_checkout_intents (
+  id                UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  org_id            TEXT NOT NULL,
+  requested_by      TEXT NOT NULL,
+  plan_id           TEXT NOT NULL REFERENCES public.qhub_commercial_plans (plan_id),
+  expected_price_ids TEXT[] NOT NULL DEFAULT ARRAY[]::TEXT[],
+  expected_mode     TEXT NOT NULL DEFAULT 'test' CHECK (expected_mode IN ('test','live')),
+  nonce             TEXT NOT NULL,
+  status            TEXT NOT NULL DEFAULT 'pending'
+                    CHECK (status IN ('pending','consumed','expired')),
+  expires_at        TIMESTAMPTZ NOT NULL,
+  consumed_at       TIMESTAMPTZ,
+  created_at        TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  UNIQUE (nonce)
+);
+
+-- ─── Webhook inbox (recoverable state machine with LEASES) ───────────────────
 CREATE TABLE IF NOT EXISTS public.qhub_billing_webhook_events (
   id                 UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   provider           TEXT NOT NULL,
@@ -124,8 +137,12 @@ CREATE TABLE IF NOT EXISTS public.qhub_billing_webhook_events (
   stripe_account     TEXT,
   event_created      BIGINT,
   payload_hash       TEXT,
-  attempts           INTEGER NOT NULL DEFAULT 0,
+  attempt_count      INTEGER NOT NULL DEFAULT 0,
+  processing_owner   TEXT,
+  claimed_at         TIMESTAMPTZ,
+  lease_expires_at   TIMESTAMPTZ,
   last_error_code    TEXT,
+  last_error_at      TIMESTAMPTZ,
   received_at        TIMESTAMPTZ NOT NULL DEFAULT NOW(),
   processed_at       TIMESTAMPTZ,
   UNIQUE (provider, provider_event_id)
@@ -154,16 +171,18 @@ CREATE TABLE IF NOT EXISTS public.qhub_usage_ledger (
   credits_delta    INTEGER NOT NULL,
   idempotency_key  TEXT,
   request_hash     TEXT,
+  units            INTEGER NOT NULL DEFAULT 1,
   metadata         JSONB NOT NULL DEFAULT '{}'::jsonb,
   created_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
   UNIQUE (org_id, idempotency_key)
 );
 
--- ─── Project entitlements (ownership + one-active-guided rule) ───────────────
+-- ─── Project entitlements (authoritative project ownership) ──────────────────
 CREATE TABLE IF NOT EXISTS public.qhub_project_entitlements (
   id            UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   project_id    UUID NOT NULL,
   org_id        TEXT NOT NULL,
+  created_by    TEXT,
   plan_id       TEXT NOT NULL DEFAULT 'none',
   risk_tier     TEXT NOT NULL DEFAULT 'UNCLASSIFIED'
                 CHECK (risk_tier IN ('UNCLASSIFIED','T0','T1','T2','T3')),
@@ -174,10 +193,11 @@ CREATE TABLE IF NOT EXISTS public.qhub_project_entitlements (
   updated_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
   UNIQUE (project_id)
 );
--- One ACTIVE guided-plan launch project per org (product = exactly one).
 CREATE UNIQUE INDEX IF NOT EXISTS uq_qhub_guided_one_active_project
   ON public.qhub_project_entitlements (org_id)
   WHERE (active AND plan_id = 'guided_builder');
+CREATE INDEX IF NOT EXISTS idx_qhub_project_active
+  ON public.qhub_project_entitlements (org_id) WHERE active;
 
 -- ─── Onboarding + acknowledgments ───────────────────────────────────────────
 CREATE TABLE IF NOT EXISTS public.qhub_onboarding_state (
@@ -202,10 +222,10 @@ CREATE TABLE IF NOT EXISTS public.qhub_acknowledgments (
   acknowledged_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
--- ─── Governance Essentials (persisted server workflow) ──────────────────────
+-- ─── Governance Essentials (persisted server workflow + review) ──────────────
 CREATE TABLE IF NOT EXISTS public.qhub_governance_essentials (
   id                     UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-  project_id             UUID NOT NULL,
+  project_id             UUID NOT NULL REFERENCES public.qhub_project_entitlements (project_id),
   org_id                 TEXT NOT NULL,
   purpose                TEXT,
   use_case               TEXT,
@@ -222,6 +242,9 @@ CREATE TABLE IF NOT EXISTS public.qhub_governance_essentials (
   acknowledged           BOOLEAN NOT NULL DEFAULT FALSE,
   review_state           TEXT NOT NULL DEFAULT 'none'
                          CHECK (review_state IN ('none','requested','approved','rejected')),
+  reviewed_by            TEXT,
+  reviewed_at            TIMESTAMPTZ,
+  review_policy_version  TEXT,
   created_at             TIMESTAMPTZ NOT NULL DEFAULT NOW(),
   updated_at             TIMESTAMPTZ NOT NULL DEFAULT NOW(),
   UNIQUE (project_id)
@@ -268,7 +291,8 @@ CREATE INDEX IF NOT EXISTS idx_qhub_project_entitlements_org  ON public.qhub_pro
 CREATE INDEX IF NOT EXISTS idx_qhub_ack_org                   ON public.qhub_acknowledgments (org_id);
 CREATE INDEX IF NOT EXISTS idx_qhub_manual_review_status      ON public.qhub_manual_review_requests (status, created_at);
 CREATE INDEX IF NOT EXISTS idx_qhub_gov_essentials_org        ON public.qhub_governance_essentials (org_id);
-CREATE INDEX IF NOT EXISTS idx_qhub_webhook_state             ON public.qhub_billing_webhook_events (state, received_at);
+CREATE INDEX IF NOT EXISTS idx_qhub_webhook_state             ON public.qhub_billing_webhook_events (state, lease_expires_at);
+CREATE INDEX IF NOT EXISTS idx_qhub_checkout_intents_org      ON public.qhub_checkout_intents (org_id, status);
 CREATE INDEX IF NOT EXISTS idx_qhub_entitlement_audit_org     ON public.qhub_entitlement_audit (org_id, created_at);
 
 -- ─── Shared updated_at trigger ──────────────────────────────────────────────
@@ -301,127 +325,177 @@ BEGIN
 END;
 $$;
 
--- Acknowledgment immutability: no UPDATE/DELETE of a recorded acknowledgment.
-CREATE OR REPLACE FUNCTION public.qhub_acknowledgment_immutable()
+-- Acknowledgment + usage-ledger immutability (append-only).
+CREATE OR REPLACE FUNCTION public.qhub_row_immutable()
 RETURNS TRIGGER LANGUAGE plpgsql AS $$
 BEGIN
-  RAISE EXCEPTION 'qhub_acknowledgments rows are immutable';
+  RAISE EXCEPTION '% rows are immutable', TG_TABLE_NAME;
 END;
 $$;
 
 DO $$
+DECLARE
+  t TEXT;
+  tables TEXT[] := ARRAY['qhub_acknowledgments','qhub_usage_ledger'];
 BEGIN
-  IF NOT EXISTS (
-    SELECT 1 FROM pg_trigger WHERE tgname = 'trg_qhub_ack_immutable'
-      AND tgrelid = 'public.qhub_acknowledgments'::regclass
-  ) THEN
-    EXECUTE 'CREATE TRIGGER trg_qhub_ack_immutable BEFORE UPDATE OR DELETE ON public.qhub_acknowledgments '
-         || 'FOR EACH ROW EXECUTE FUNCTION public.qhub_acknowledgment_immutable()';
-  END IF;
+  FOREACH t IN ARRAY tables LOOP
+    IF NOT EXISTS (
+      SELECT 1 FROM pg_trigger WHERE tgname = 'trg_' || t || '_immutable'
+        AND tgrelid = ('public.' || t)::regclass
+    ) THEN
+      EXECUTE format(
+        'CREATE TRIGGER trg_%1$s_immutable BEFORE UPDATE OR DELETE ON public.%1$s '
+        || 'FOR EACH ROW EXECUTE FUNCTION public.qhub_row_immutable()', t);
+    END IF;
+  END LOOP;
 END;
 $$;
 
--- Usage-ledger immutability: append-only.
-CREATE OR REPLACE FUNCTION public.qhub_usage_ledger_immutable()
-RETURNS TRIGGER LANGUAGE plpgsql AS $$
-BEGIN
-  RAISE EXCEPTION 'qhub_usage_ledger rows are immutable';
-END;
-$$;
-
-DO $$
-BEGIN
-  IF NOT EXISTS (
-    SELECT 1 FROM pg_trigger WHERE tgname = 'trg_qhub_usage_ledger_immutable'
-      AND tgrelid = 'public.qhub_usage_ledger'::regclass
-  ) THEN
-    EXECUTE 'CREATE TRIGGER trg_qhub_usage_ledger_immutable BEFORE UPDATE OR DELETE ON public.qhub_usage_ledger '
-         || 'FOR EACH ROW EXECUTE FUNCTION public.qhub_usage_ledger_immutable()';
-  END IF;
-END;
-$$;
-
--- ─── Atomic, idempotent build-credit consume RPC ────────────────────────────
--- One transaction: idempotency check → lock credit row → validate remaining →
--- decrement → append immutable ledger row → return remaining. Materially
--- different reuse of an idempotency key (different request_hash) fails.
+-- ─── Atomic project-derived build-credit RPC (R3) ───────────────────────────
+-- Inputs are minimal + non-authoritative: project, idempotency key, canonical
+-- request hash, units. The RPC derives org/ownership/eligibility and, in one
+-- transaction: locks the credit period, validates active eligibility, initializes
+-- the period if absent, enforces idempotency (exact retry returns the prior
+-- result; a changed hash/units under the same key is rejected), prevents overdraw,
+-- decrements, appends the immutable ledger row, and returns the balance + ledger id.
 CREATE OR REPLACE FUNCTION public.qhub_consume_build_credit(
-  p_org_id TEXT, p_period_key TEXT, p_idempotency_key TEXT, p_request_hash TEXT
-) RETURNS INTEGER
+  p_project_id UUID, p_idempotency_key TEXT, p_canonical_hash TEXT, p_units INTEGER
+) RETURNS JSONB
 LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, public AS $$
 DECLARE
-  v_existing_hash TEXT;
-  v_remaining     INTEGER;
+  v_org        TEXT;
+  v_active     BOOLEAN;
+  v_plan       TEXT;
+  v_sub_status TEXT;
+  v_period_key TEXT;
+  v_period_start TIMESTAMPTZ;
+  v_period_end   TIMESTAMPTZ;
+  v_allot      INTEGER;
+  v_existing   RECORD;
+  v_remaining  INTEGER;
+  v_ledger_id  UUID;
 BEGIN
-  -- Idempotency: a prior ledger row for this key returns the prior result.
-  SELECT request_hash INTO v_existing_hash
+  IF p_units IS NULL OR p_units <= 0 THEN
+    RETURN jsonb_build_object('ok', false, 'reason', 'invalid_units');
+  END IF;
+
+  -- Derive org + ownership from the authoritative project row (locked).
+  SELECT org_id, active, plan_id INTO v_org, v_active, v_plan
+    FROM public.qhub_project_entitlements
+   WHERE project_id = p_project_id
+   FOR UPDATE;
+
+  IF NOT FOUND THEN
+    RETURN jsonb_build_object('ok', false, 'reason', 'unknown_project');
+  END IF;
+
+  IF NOT v_active THEN
+    RETURN jsonb_build_object('ok', false, 'reason', 'project_inactive');
+  END IF;
+
+  -- Subscription eligibility (active / trialing only).
+  SELECT status INTO v_sub_status FROM public.qhub_subscriptions WHERE org_id = v_org FOR UPDATE;
+
+  IF v_sub_status IS NULL OR v_sub_status NOT IN ('active','trialing') THEN
+    RETURN jsonb_build_object('ok', false, 'reason', 'ineligible_subscription');
+  END IF;
+
+  -- Idempotency: exact retry returns prior result; changed request is rejected.
+  SELECT request_hash, units INTO v_existing
     FROM public.qhub_usage_ledger
-   WHERE org_id = p_org_id AND idempotency_key = p_idempotency_key
+   WHERE org_id = v_org AND idempotency_key = p_idempotency_key
    LIMIT 1;
 
   IF FOUND THEN
-    IF v_existing_hash IS DISTINCT FROM p_request_hash THEN
-      RAISE EXCEPTION 'qhub_consume_build_credit: idempotency key reused with a different request';
+    IF v_existing.request_hash IS DISTINCT FROM p_canonical_hash OR v_existing.units IS DISTINCT FROM p_units THEN
+      RETURN jsonb_build_object('ok', false, 'reason', 'idempotency_conflict');
     END IF;
 
     SELECT (allotted - used) INTO v_remaining
       FROM public.qhub_usage_credits
-     WHERE org_id = p_org_id AND period_key = p_period_key;
+     WHERE org_id = v_org AND period_key = to_char(NOW() AT TIME ZONE 'UTC', 'YYYY-MM');
 
-    RETURN v_remaining; -- no second decrement
+    RETURN jsonb_build_object('ok', true, 'idempotent', true, 'remaining', v_remaining);
   END IF;
 
-  -- Lock the current-period credit row and decrement only while credits remain.
-  UPDATE public.qhub_usage_credits
-     SET used = used + 1, updated_at = NOW()
-   WHERE org_id = p_org_id AND period_key = p_period_key AND used < allotted
-  RETURNING (allotted - used) INTO v_remaining;
+  -- Current UTC period; initialize under lock if absent (using the plan allotment).
+  v_period_key := to_char(NOW() AT TIME ZONE 'UTC', 'YYYY-MM');
+  v_period_start := date_trunc('month', NOW() AT TIME ZONE 'UTC');
+  v_period_end := v_period_start + INTERVAL '1 month';
+
+  SELECT (allotted - used) INTO v_remaining
+    FROM public.qhub_usage_credits
+   WHERE org_id = v_org AND period_key = v_period_key
+   FOR UPDATE;
 
   IF NOT FOUND THEN
-    RETURN NULL; -- exhausted / no period row
+    v_allot := CASE v_plan WHEN 'builder_beta' THEN 200 WHEN 'guided_builder' THEN 1000 ELSE 0 END;
+    INSERT INTO public.qhub_usage_credits (org_id, period_key, period_start, period_end, allotted, used)
+    VALUES (v_org, v_period_key, v_period_start, v_period_end, v_allot, 0)
+    ON CONFLICT (org_id, period_key) DO NOTHING;
+
+    SELECT (allotted - used) INTO v_remaining
+      FROM public.qhub_usage_credits
+     WHERE org_id = v_org AND period_key = v_period_key
+     FOR UPDATE;
   END IF;
 
-  INSERT INTO public.qhub_usage_ledger (org_id, event_type, credits_delta, idempotency_key, request_hash)
-  VALUES (p_org_id, 'BUILD_CREDIT_CONSUMED', -1, p_idempotency_key, p_request_hash);
+  IF v_remaining < p_units THEN
+    RETURN jsonb_build_object('ok', false, 'reason', 'insufficient_credits', 'remaining', v_remaining);
+  END IF;
 
-  RETURN v_remaining;
+  UPDATE public.qhub_usage_credits
+     SET used = used + p_units, updated_at = NOW()
+   WHERE org_id = v_org AND period_key = v_period_key;
+
+  INSERT INTO public.qhub_usage_ledger (org_id, project_id, event_type, credits_delta, idempotency_key, request_hash, units)
+  VALUES (v_org, p_project_id, 'BUILD_CREDIT_CONSUMED', -p_units, p_idempotency_key, p_canonical_hash, p_units)
+  RETURNING id INTO v_ledger_id;
+
+  RETURN jsonb_build_object('ok', true, 'idempotent', false, 'remaining', v_remaining - p_units, 'ledger_id', v_ledger_id);
 END;
 $$;
 
--- ─── Atomic webhook-event claim RPC ─────────────────────────────────────────
--- Inserts a RECEIVED row (or claims a retryable one) and transitions to
--- PROCESSING atomically. Returns: CLAIMED | DUPLICATE | IN_PROGRESS.
+-- ─── Webhook claim with LEASE (R3) ──────────────────────────────────────────
+-- Claims a RECEIVED/FAILED_RETRYABLE event, or a PROCESSING event whose lease has
+-- expired (crash recovery). An active non-expired lease cannot be stolen. Returns
+-- CLAIMED | DUPLICATE | IN_PROGRESS.
 CREATE OR REPLACE FUNCTION public.qhub_claim_webhook_event(
-  p_provider TEXT, p_event_id TEXT, p_event_type TEXT,
-  p_livemode BOOLEAN, p_account TEXT, p_event_created BIGINT, p_payload_hash TEXT
+  p_provider TEXT, p_event_id TEXT, p_event_type TEXT, p_livemode BOOLEAN,
+  p_account TEXT, p_event_created BIGINT, p_payload_hash TEXT, p_owner TEXT, p_lease_seconds INTEGER
 ) RETURNS TEXT
 LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, public AS $$
 DECLARE
   v_state TEXT;
+  v_lease TIMESTAMPTZ;
 BEGIN
   INSERT INTO public.qhub_billing_webhook_events
-    (provider, provider_event_id, event_type, state, livemode, stripe_account, event_created, payload_hash, attempts)
+    (provider, provider_event_id, event_type, state, livemode, stripe_account, event_created,
+     payload_hash, attempt_count, processing_owner, claimed_at, lease_expires_at)
   VALUES
-    (p_provider, p_event_id, p_event_type, 'PROCESSING', p_livemode, p_account, p_event_created, p_payload_hash, 1)
+    (p_provider, p_event_id, p_event_type, 'PROCESSING', p_livemode, p_account, p_event_created,
+     p_payload_hash, 1, p_owner, NOW(), NOW() + make_interval(secs => p_lease_seconds))
   ON CONFLICT (provider, provider_event_id) DO NOTHING;
 
   IF FOUND THEN
     RETURN 'CLAIMED';
   END IF;
 
-  -- Existing row: claim it only if it is retryable.
-  SELECT state INTO v_state
+  SELECT state, lease_expires_at INTO v_state, v_lease
     FROM public.qhub_billing_webhook_events
    WHERE provider = p_provider AND provider_event_id = p_event_id
    FOR UPDATE;
 
   IF v_state IN ('PROCESSED','FAILED_PERMANENT') THEN
     RETURN 'DUPLICATE';
-  ELSIF v_state = 'PROCESSING' THEN
-    RETURN 'IN_PROGRESS';
+  ELSIF v_state = 'PROCESSING' AND v_lease IS NOT NULL AND v_lease > NOW() THEN
+    RETURN 'IN_PROGRESS'; -- active non-expired lease cannot be stolen
   ELSE
+    -- RECEIVED, FAILED_RETRYABLE, or PROCESSING with an EXPIRED lease → reclaim.
     UPDATE public.qhub_billing_webhook_events
-       SET state = 'PROCESSING', attempts = attempts + 1
+       SET state = 'PROCESSING', attempt_count = attempt_count + 1,
+           processing_owner = p_owner, claimed_at = NOW(),
+           lease_expires_at = NOW() + make_interval(secs => p_lease_seconds)
      WHERE provider = p_provider AND provider_event_id = p_event_id;
     RETURN 'CLAIMED';
   END IF;
@@ -434,9 +508,9 @@ DECLARE
   t TEXT;
   tables TEXT[] := ARRAY[
     'qhub_commercial_plans','qhub_org_members','qhub_quantex_staff','qhub_org_invitations',
-    'qhub_billing_customers','qhub_subscriptions','qhub_billing_webhook_events','qhub_usage_credits',
-    'qhub_usage_ledger','qhub_project_entitlements','qhub_onboarding_state','qhub_acknowledgments',
-    'qhub_governance_essentials','qhub_manual_review_requests','qhub_entitlement_audit'
+    'qhub_billing_customers','qhub_subscriptions','qhub_checkout_intents','qhub_billing_webhook_events',
+    'qhub_usage_credits','qhub_usage_ledger','qhub_project_entitlements','qhub_onboarding_state',
+    'qhub_acknowledgments','qhub_governance_essentials','qhub_manual_review_requests','qhub_entitlement_audit'
   ];
 BEGIN
   FOREACH t IN ARRAY tables LOOP
@@ -456,17 +530,17 @@ BEGIN
 END;
 $$;
 
-REVOKE ALL ON FUNCTION public.qhub_consume_build_credit(TEXT, TEXT, TEXT, TEXT) FROM PUBLIC, anon, authenticated;
-GRANT EXECUTE ON FUNCTION public.qhub_consume_build_credit(TEXT, TEXT, TEXT, TEXT) TO service_role;
-REVOKE ALL ON FUNCTION public.qhub_claim_webhook_event(TEXT, TEXT, TEXT, BOOLEAN, TEXT, BIGINT, TEXT) FROM PUBLIC, anon, authenticated;
-GRANT EXECUTE ON FUNCTION public.qhub_claim_webhook_event(TEXT, TEXT, TEXT, BOOLEAN, TEXT, BIGINT, TEXT) TO service_role;
+REVOKE ALL ON FUNCTION public.qhub_consume_build_credit(UUID, TEXT, TEXT, INTEGER) FROM PUBLIC, anon, authenticated;
+GRANT EXECUTE ON FUNCTION public.qhub_consume_build_credit(UUID, TEXT, TEXT, INTEGER) TO service_role;
+REVOKE ALL ON FUNCTION public.qhub_claim_webhook_event(TEXT, TEXT, TEXT, BOOLEAN, TEXT, BIGINT, TEXT, TEXT, INTEGER) FROM PUBLIC, anon, authenticated;
+GRANT EXECUTE ON FUNCTION public.qhub_claim_webhook_event(TEXT, TEXT, TEXT, BOOLEAN, TEXT, BIGINT, TEXT, TEXT, INTEGER) TO service_role;
 
 -- ─── Seed plan identity (idempotent) ────────────────────────────────────────
 INSERT INTO public.qhub_commercial_plans (plan_id, display_name, active)
 VALUES ('builder_beta','QHub Builder Beta',TRUE), ('guided_builder','QHub Guided Builder',TRUE)
 ON CONFLICT (plan_id) DO NOTHING;
 
--- ─── Readiness verifier ─────────────────────────────────────────────────────
+-- ─── Readiness verifier (exact semantics) ───────────────────────────────────
 CREATE OR REPLACE FUNCTION public.qhub_verify_commercial_schema()
 RETURNS JSONB
 LANGUAGE plpgsql STABLE SECURITY DEFINER SET search_path = pg_catalog, public AS $$
@@ -475,13 +549,11 @@ DECLARE
   t TEXT;
   tables TEXT[] := ARRAY[
     'qhub_commercial_plans','qhub_org_members','qhub_quantex_staff','qhub_org_invitations',
-    'qhub_billing_customers','qhub_subscriptions','qhub_billing_webhook_events','qhub_usage_credits',
-    'qhub_usage_ledger','qhub_project_entitlements','qhub_onboarding_state','qhub_acknowledgments',
-    'qhub_governance_essentials','qhub_manual_review_requests','qhub_entitlement_audit'
+    'qhub_billing_customers','qhub_subscriptions','qhub_checkout_intents','qhub_billing_webhook_events',
+    'qhub_usage_credits','qhub_usage_ledger','qhub_project_entitlements','qhub_onboarding_state',
+    'qhub_acknowledgments','qhub_governance_essentials','qhub_manual_review_requests','qhub_entitlement_audit'
   ];
 BEGIN
-  -- Every table must exist, have RLS enabled, a RESTRICTIVE service-only policy,
-  -- and no anon/authenticated privileges.
   FOREACH t IN ARRAY tables LOOP
     IF NOT EXISTS (SELECT 1 FROM pg_class WHERE oid = ('public.'||t)::regclass) THEN
       v_failed := v_failed || ('missing_table:'||t); CONTINUE;
@@ -504,10 +576,16 @@ BEGIN
     END IF;
   END LOOP;
 
-  -- Critical unique constraints / indexes.
-  IF NOT EXISTS (SELECT 1 FROM pg_indexes WHERE schemaname='public' AND indexname='uq_qhub_guided_one_active_project') THEN
-    v_failed := v_failed || 'missing_index:guided_one_active'::text;
+  -- Critical unique/index semantics (checked by exact index definition — a
+  -- same-named index over the wrong columns/predicate still fails).
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_indexes WHERE schemaname='public' AND indexname='uq_qhub_guided_one_active_project'
+      AND indexdef LIKE '%UNIQUE%' AND indexdef LIKE '%(org_id)%'
+      AND indexdef LIKE '%guided_builder%'
+  ) THEN
+    v_failed := v_failed || 'index_semantics:guided_one_active'::text;
   END IF;
+
   IF NOT EXISTS (
     SELECT 1 FROM pg_constraint WHERE conrelid='public.qhub_billing_customers'::regclass AND contype='u'
       AND conkey @> (SELECT ARRAY[attnum] FROM pg_attribute WHERE attrelid='public.qhub_billing_customers'::regclass AND attname='provider_customer_id')
@@ -520,37 +598,54 @@ BEGIN
   ) THEN
     v_failed := v_failed || 'missing_unique:subscription_mapping'::text;
   END IF;
-  IF NOT EXISTS (
-    SELECT 1 FROM pg_constraint WHERE conrelid='public.qhub_usage_ledger'::regclass AND contype='u'
-  ) THEN
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conrelid='public.qhub_usage_ledger'::regclass AND contype='u') THEN
     v_failed := v_failed || 'missing_unique:ledger_idempotency'::text;
   END IF;
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conrelid='public.qhub_checkout_intents'::regclass AND contype='u') THEN
+    v_failed := v_failed || 'missing_unique:checkout_intent_nonce'::text;
+  END IF;
 
-  -- FK: subscription.plan_id → plans, manual review decided_by → staff.
-  IF NOT EXISTS (
-    SELECT 1 FROM pg_constraint WHERE conrelid='public.qhub_subscriptions'::regclass AND contype='f'
-  ) THEN
+  -- FKs: subscription.plan → plans, review.decided_by → staff, gov.project →
+  -- project_entitlements (authoritative project ownership), checkout.plan → plans.
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conrelid='public.qhub_subscriptions'::regclass AND contype='f') THEN
     v_failed := v_failed || 'missing_fk:subscription_plan'::text;
   END IF;
-  IF NOT EXISTS (
-    SELECT 1 FROM pg_constraint WHERE conrelid='public.qhub_manual_review_requests'::regclass AND contype='f'
-  ) THEN
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conrelid='public.qhub_manual_review_requests'::regclass AND contype='f') THEN
     v_failed := v_failed || 'missing_fk:review_staff'::text;
   END IF;
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conrelid='public.qhub_governance_essentials'::regclass AND contype='f') THEN
+    v_failed := v_failed || 'missing_fk:gov_project_ownership'::text;
+  END IF;
 
-  -- Credit + webhook RPCs: exist, SECURITY DEFINER, fixed search_path, service-only.
+  -- Webhook lease columns present (crash recovery contract).
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_attribute WHERE attrelid='public.qhub_billing_webhook_events'::regclass
+      AND attname='lease_expires_at' AND NOT attisdropped
+  ) THEN
+    v_failed := v_failed || 'webhook_lease_contract'::text;
+  END IF;
+
+  -- Credit RPC R3: exact signature (uuid,text,text,int), SECURITY DEFINER, fixed
+  -- search_path, returns jsonb, and no unexpected overloads.
   PERFORM 1 FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace
     WHERE n.nspname='public' AND p.proname='qhub_consume_build_credit'
-      AND p.prosecdef AND p.proconfig @> ARRAY['search_path=pg_catalog, public'];
+      AND p.prosecdef AND p.proconfig @> ARRAY['search_path=pg_catalog, public']
+      AND pg_get_function_identity_arguments(p.oid) = 'p_project_id uuid, p_idempotency_key text, p_canonical_hash text, p_units integer'
+      AND p.prorettype = 'jsonb'::regtype;
   IF NOT FOUND THEN v_failed := v_failed || 'credit_rpc_contract'::text; END IF;
+
+  IF (SELECT count(*) FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace
+       WHERE n.nspname='public' AND p.proname='qhub_consume_build_credit') <> 1 THEN
+    v_failed := v_failed || 'credit_rpc_overload'::text;
+  END IF;
 
   PERFORM 1 FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace
     WHERE n.nspname='public' AND p.proname='qhub_claim_webhook_event'
       AND p.prosecdef AND p.proconfig @> ARRAY['search_path=pg_catalog, public'];
   IF NOT FOUND THEN v_failed := v_failed || 'webhook_rpc_contract'::text; END IF;
 
-  IF has_function_privilege('anon','public.qhub_consume_build_credit(text,text,text,text)','EXECUTE')
-     OR has_function_privilege('authenticated','public.qhub_consume_build_credit(text,text,text,text)','EXECUTE') THEN
+  IF has_function_privilege('anon','public.qhub_consume_build_credit(uuid,text,text,integer)','EXECUTE')
+     OR has_function_privilege('authenticated','public.qhub_consume_build_credit(uuid,text,text,integer)','EXECUTE') THEN
     v_failed := v_failed || 'credit_rpc_browser_exec'::text;
   END IF;
 
@@ -562,8 +657,14 @@ BEGIN
     v_failed := v_failed || 'webhook_state_contract'::text;
   END IF;
 
+  -- Append-only immutability triggers.
+  IF NOT EXISTS (SELECT 1 FROM pg_trigger WHERE tgname='trg_qhub_usage_ledger_immutable'
+                   AND tgrelid='public.qhub_usage_ledger'::regclass) THEN
+    v_failed := v_failed || 'ledger_immutable_contract'::text;
+  END IF;
+
   RETURN jsonb_build_object(
-    'expected_version', '2026-07-29.commercial-launch-r2',
+    'expected_version', '2026-07-30.commercial-launch-r3',
     'ready', (cardinality(v_failed) = 0),
     'failed', to_jsonb(v_failed)
   );

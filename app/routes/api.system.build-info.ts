@@ -8,15 +8,17 @@
  */
 
 import { json, type LoaderFunctionArgs } from '@remix-run/cloudflare';
-import { getSession } from '~/lib/auth/session';
+import { requireStaff } from '~/lib/qhub/commercial/commercial-context.server';
 import { REQUIRED_BUILD_MARKERS } from '~/lib/qhub/build-identity';
 
 export const loader = async ({ request, context }: LoaderFunctionArgs) => {
   const env = (context.cloudflare?.env as unknown as Record<string, string | undefined>) ?? {};
-  const session = await getSession(request, env);
 
-  if (!session) {
-    return json({ ok: false, error: 'Unauthenticated' }, { status: 401 });
+  // R3: build/deploy diagnostics are an internal surface — Quantex-STAFF-ONLY.
+  const guard = await requireStaff(request, env);
+
+  if (!guard.ok) {
+    return guard.response;
   }
 
   const sourceCommit = env.QHUB_BUILD_SOURCE_COMMIT ?? process.env.QHUB_BUILD_SOURCE_COMMIT ?? null;

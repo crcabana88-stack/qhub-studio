@@ -1,11 +1,23 @@
 import { type ActionFunctionArgs } from '@remix-run/cloudflare';
+import { requireStaff } from '~/lib/qhub/commercial/commercial-context.server';
 import { createScopedLogger } from '~/utils/logger';
 
 const logger = createScopedLogger('api.supabase.query');
 
-export async function action({ request }: ActionFunctionArgs) {
+export async function action({ request, context }: ActionFunctionArgs) {
   if (request.method !== 'POST') {
     return new Response('Method not allowed', { status: 405 });
+  }
+
+  /*
+   * R3: the raw Supabase query surface is Quantex-STAFF-ONLY (never commercially
+   * reachable); raw SQL is never logged.
+   */
+  const env = (context?.cloudflare?.env as unknown as Record<string, string | undefined>) ?? {};
+  const guard = await requireStaff(request, env);
+
+  if (!guard.ok) {
+    return guard.response;
   }
 
   const authHeader = request.headers.get('Authorization');
@@ -16,7 +28,7 @@ export async function action({ request }: ActionFunctionArgs) {
 
   try {
     const { projectId, query } = (await request.json()) as any;
-    logger.debug('Executing query:', { projectId, query });
+    logger.debug('Executing query for project', { projectId }); // never log raw SQL
 
     const response = await fetch(`https://api.supabase.com/v1/projects/${projectId}/database/query`, {
       method: 'POST',

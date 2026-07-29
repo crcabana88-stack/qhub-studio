@@ -7,17 +7,31 @@
 
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
-const { getSession, getOrCreateQhubApp, getPolicyProfile, getActivePlan, getEvaluationById, grantApproval } =
-  vi.hoisted(() => ({
-    getSession: vi.fn(),
-    getOrCreateQhubApp: vi.fn(),
-    getPolicyProfile: vi.fn(),
-    getActivePlan: vi.fn(),
-    getEvaluationById: vi.fn(),
-    grantApproval: vi.fn(),
-  }));
+const {
+  getSession,
+  requireStaff,
+  getOrCreateQhubApp,
+  getPolicyProfile,
+  getActivePlan,
+  getEvaluationById,
+  grantApproval,
+} = vi.hoisted(() => ({
+  getSession: vi.fn(),
+  requireStaff: vi.fn(),
+  getOrCreateQhubApp: vi.fn(),
+  getPolicyProfile: vi.fn(),
+  getActivePlan: vi.fn(),
+  getEvaluationById: vi.fn(),
+  grantApproval: vi.fn(),
+}));
 
 vi.mock('~/lib/auth/session', () => ({ getSession }));
+
+/*
+ * R3: /api/enforcement is Quantex-STAFF-ONLY. Mock the staff guard to an allowed
+ * staff context for the same tenant these tests exercise.
+ */
+vi.mock('~/lib/qhub/commercial/commercial-context.server', () => ({ requireStaff }));
 vi.mock('~/lib/qhub/qhub-app.server', () => ({ getOrCreateQhubApp, getPolicyProfile }));
 vi.mock('~/lib/qhub/enforcement-store.server', () => ({
   getActivePlan,
@@ -69,6 +83,10 @@ function evaluation(overrides: Record<string, unknown> = {}) {
 beforeEach(() => {
   vi.clearAllMocks();
   getSession.mockResolvedValue({ userId: 'owner-a', orgId: 'tenant-a', role: 'owner' });
+  requireStaff.mockResolvedValue({
+    ok: true,
+    ctx: { userId: 'owner-a', orgId: 'tenant-a', role: 'owner', isStaff: true },
+  });
   getOrCreateQhubApp.mockResolvedValue({ org_id: 'tenant-a', qhub_app_id: APP_ID });
   getEvaluationById.mockResolvedValue(evaluation());
   getPolicyProfile.mockResolvedValue({

@@ -13,7 +13,7 @@
  */
 
 import { json, type ActionFunctionArgs } from '@remix-run/cloudflare';
-import { requireCommercialContext } from '~/lib/qhub/commercial/commercial-context.server';
+import { requireStaff } from '~/lib/qhub/commercial/commercial-context.server';
 import { generateStableSessionId } from '~/lib/qhub/session-id.server';
 import { enforceGovernedAction, type EnforceActionInput } from '~/lib/qhub/enforcement.server';
 import type { GovernedActionType } from '~/lib/qhub/enforcement';
@@ -39,7 +39,7 @@ export async function action({ request, context }: ActionFunctionArgs) {
    * Direct Gate 04 consequential execution is denied to commercial customers;
    * only authoritative internal staff hold CONSEQUENTIAL_ACTION.
    */
-  const guard = await requireCommercialContext(request, env, 'CONSEQUENTIAL_ACTION');
+  const guard = await requireStaff(request, env);
 
   if (!guard.ok) {
     return guard.response;

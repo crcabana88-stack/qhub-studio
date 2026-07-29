@@ -15,13 +15,25 @@ import type { SchemaReadinessReport } from '~/lib/qhub/schema-check.server';
 
 // ─── Hoisted mocks ────────────────────────────────────────────────────────────
 
-const { mockGetSchemaReadiness, mockAssertGovernanceSchemaReady, mockGetSession, mockGetAgentSchemaReadiness } =
-  vi.hoisted(() => ({
-    mockGetSchemaReadiness: vi.fn(),
-    mockAssertGovernanceSchemaReady: vi.fn(),
-    mockGetSession: vi.fn(),
-    mockGetAgentSchemaReadiness: vi.fn(),
-  }));
+const {
+  mockGetSchemaReadiness,
+  mockAssertGovernanceSchemaReady,
+  mockGetSession,
+  mockRequireStaff,
+  mockGetAgentSchemaReadiness,
+} = vi.hoisted(() => ({
+  mockGetSchemaReadiness: vi.fn(),
+  mockAssertGovernanceSchemaReady: vi.fn(),
+  mockGetSession: vi.fn(),
+  mockRequireStaff: vi.fn(),
+  mockGetAgentSchemaReadiness: vi.fn(),
+}));
+
+/*
+ * R3: /api/system/schema-check is Quantex-STAFF-ONLY. Bridge the staff guard to the
+ * legacy getSession mock so existing auth cases keep working.
+ */
+vi.mock('~/lib/qhub/commercial/commercial-context.server', () => ({ requireStaff: mockRequireStaff }));
 
 vi.mock('~/lib/qhub/schema-check.server', () => {
   class SchemaNotReadyError extends Error {
@@ -49,6 +61,20 @@ vi.mock('~/lib/auth/session', () => ({
   getSession: mockGetSession,
   getHmacSecret: vi.fn().mockReturnValue('test-secret-32-chars-minimum-ok!'),
 }));
+
+// Bridge the R3 staff guard to the legacy getSession mock: null → 401, else allow.
+mockRequireStaff.mockImplementation(async () => {
+  const s = await mockGetSession();
+
+  if (!s) {
+    return {
+      ok: false,
+      response: new Response(JSON.stringify({ ok: false, error: 'unauthenticated' }), { status: 401 }),
+    };
+  }
+
+  return { ok: true, ctx: { userId: s.userId, orgId: s.orgId, role: s.role, isStaff: true } };
+});
 
 function readyReport(overrides: Partial<SchemaReadinessReport> = {}): SchemaReadinessReport {
   return {

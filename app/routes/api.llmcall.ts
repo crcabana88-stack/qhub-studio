@@ -1,4 +1,5 @@
 import { type ActionFunctionArgs } from '@remix-run/cloudflare';
+import { requireStaff } from '~/lib/qhub/commercial/commercial-context.server';
 import { streamText } from '~/lib/.server/llm/stream-text';
 import type { IProviderSetting, ProviderInfo } from '~/types/model';
 import { generateText } from 'ai';
@@ -10,6 +11,17 @@ import { getApiKeysFromCookie, getProviderSettingsFromCookie } from '~/lib/api/c
 import { createScopedLogger } from '~/utils/logger';
 
 export async function action(args: ActionFunctionArgs) {
+  /*
+   * R3: raw model-call surface is Quantex-STAFF-ONLY (no commercial reach; no
+   * browser-supplied provider keys forwarded on a commercial path).
+   */
+  const env = (args.context?.cloudflare?.env as unknown as Record<string, string | undefined>) ?? {};
+  const guard = await requireStaff(args.request, env);
+
+  if (!guard.ok) {
+    return guard.response;
+  }
+
   return llmCallAction(args);
 }
 
@@ -151,7 +163,11 @@ async function llmCallAction({ context, request }: ActionFunctionArgs) {
     }
   } else {
     try {
-      const models = await getModelList({ apiKeys, providerSettings, serverEnv: (context.cloudflare?.env ?? process.env) as any });
+      const models = await getModelList({
+        apiKeys,
+        providerSettings,
+        serverEnv: (context.cloudflare?.env ?? process.env) as any,
+      });
       const modelDetails = models.find((m: ModelInfo) => m.name === model);
 
       if (!modelDetails) {
