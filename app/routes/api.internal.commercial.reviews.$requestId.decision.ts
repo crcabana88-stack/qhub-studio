@@ -11,6 +11,7 @@
 
 import { json, type ActionFunctionArgs } from '@remix-run/cloudflare';
 import { requireStaff } from '~/lib/qhub/commercial/commercial-context.server';
+import { requireCommercialReady } from '~/lib/qhub/commercial/commercial-schema-check.server';
 import { decideReviewAtomic } from '~/lib/qhub/commercial/commercial-store.server';
 import { checkRateLimit, isSameOrigin, readBoundedJson } from '~/lib/qhub/commercial/request-guards.server';
 
@@ -32,6 +33,14 @@ export async function action({ request, context, params }: ActionFunctionArgs) {
   }
 
   const ctx = guard.ctx;
+
+  // Fail closed on schema readiness BEFORE any decision/governance/audit write.
+  const ready = await requireCommercialReady(env);
+
+  if (!ready.ok) {
+    return ready.response;
+  }
+
   const rate = checkRateLimit(`review_decide:${ctx.userId}`, 60, 60_000);
 
   if (!rate.allowed) {

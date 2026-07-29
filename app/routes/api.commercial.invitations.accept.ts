@@ -11,6 +11,7 @@
 
 import { json, type ActionFunctionArgs } from '@remix-run/cloudflare';
 import { getVerifiedUser } from '~/lib/auth/session';
+import { requireCommercialReady } from '~/lib/qhub/commercial/commercial-schema-check.server';
 import { acceptInvitation } from '~/lib/qhub/commercial/commercial-store.server';
 import { checkRateLimit, isSameOrigin, readBoundedJson } from '~/lib/qhub/commercial/request-guards.server';
 
@@ -33,6 +34,13 @@ export async function action({ request, context }: ActionFunctionArgs) {
 
   if (!user) {
     return json({ ok: false, error: 'unauthenticated' }, { status: 401 });
+  }
+
+  // Fail closed on schema readiness BEFORE any seat/membership mutation.
+  const ready = await requireCommercialReady(env);
+
+  if (!ready.ok) {
+    return ready.response;
   }
 
   const rate = checkRateLimit(`invite_accept:${user.userId}`, 10, 60_000);

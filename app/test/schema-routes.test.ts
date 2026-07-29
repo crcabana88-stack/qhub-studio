@@ -57,6 +57,21 @@ vi.mock('~/lib/qhub/agent/agent-schema-check.server', () => ({
   assertAgentSchemaReady: vi.fn(),
 }));
 
+/*
+ * The commercial readiness contract is exercised in commercial-readiness*.test.ts;
+ * here it is READY so the diagnostic's overall status reflects the Gate/Agent checks.
+ */
+vi.mock('~/lib/qhub/commercial/commercial-schema-check.server', () => ({
+  getCommercialSchemaReadiness: vi.fn().mockResolvedValue({
+    state: 'READY',
+    expected: '2026-07-30.commercial-launch-r4',
+    version: '2026-07-30.commercial-launch-r4',
+    failed: [],
+    checkedAt: 0,
+  }),
+  resetCommercialReadinessCache: vi.fn(),
+}));
+
 vi.mock('~/lib/auth/session', () => ({
   getSession: mockGetSession,
   getHmacSecret: vi.fn().mockReturnValue('test-secret-32-chars-minimum-ok!'),

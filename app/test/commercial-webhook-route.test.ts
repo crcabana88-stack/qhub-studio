@@ -18,6 +18,7 @@ const H = vi.hoisted(() => ({
   retrieve: vi.fn(),
   reconcile: vi.fn(),
   lines: vi.fn(),
+  requireReady: vi.fn(),
 }));
 
 vi.mock('~/lib/qhub/commercial/billing/stripe-provider.server', () => ({
@@ -32,6 +33,17 @@ vi.mock('~/lib/qhub/commercial/commercial-store.server', () => ({
   upsertBillingCustomer: H.upsertCustomer,
   reconcileCheckout: H.reconcile,
 }));
+
+// Deterministic readiness injection — mock the route-level gate the webhook calls.
+vi.mock('~/lib/qhub/commercial/commercial-schema-check.server', () => ({
+  requireCommercialReady: H.requireReady,
+}));
+
+const READY_GATE = { ok: true } as const;
+const NOT_READY_GATE = {
+  ok: false,
+  response: new Response(JSON.stringify({ ok: false, error: 'commercial_unavailable' }), { status: 500 }),
+};
 
 import { action } from '~/routes/api.billing.webhook';
 
@@ -81,6 +93,7 @@ function verifyOk(e: NormalizedBillingEvent) {
 
 beforeEach(() => {
   vi.clearAllMocks();
+  H.requireReady.mockResolvedValue(READY_GATE);
   H.createProvider.mockReturnValue(provider());
   H.planForPrice.mockReturnValue('builder_beta');
   H.apply.mockResolvedValue('applied');
@@ -123,6 +136,44 @@ describe('webhook verification failures', () => {
 
     const res = (await action(req())) as Response;
     expect(res.status).toBe(400);
+  });
+});
+
+describe('webhook fails closed on schema NOT READY (R4)', () => {
+  it('returns a retryable 500 and does NOT claim or mutate when NOT READY', async () => {
+    verifyOk(evt());
+    H.requireReady.mockResolvedValue(NOT_READY_GATE);
+
+    const res = (await action(req())) as Response;
+
+    // Retryable so Stripe redelivers once the schema is ready.
+    expect(res.status).toBe(500);
+
+    // Signature verified, but nothing beyond it happened.
+    expect(H.verify).toHaveBeenCalledTimes(1);
+    expect(H.claim).not.toHaveBeenCalled();
+    expect(H.apply).not.toHaveBeenCalled();
+    expect(H.reconcile).not.toHaveBeenCalled();
+
+    // The event is neither PROCESSED nor marked permanent — no state written at all.
+    expect(H.setState).not.toHaveBeenCalled();
+  });
+
+  it('does not reach reconciliation for a checkout event when NOT READY', async () => {
+    verifyOk(
+      evt({
+        type: 'checkout.completed',
+        rawType: 'checkout.session.completed',
+        checkoutIntentId: 'intent_1',
+        checkoutSessionId: 'cs_1',
+      }),
+    );
+    H.requireReady.mockResolvedValue(NOT_READY_GATE);
+
+    const res = (await action(req())) as Response;
+    expect(res.status).toBe(500);
+    expect(H.reconcile).not.toHaveBeenCalled();
+    expect(H.setState).not.toHaveBeenCalled();
   });
 });
 

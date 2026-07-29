@@ -20,6 +20,7 @@
 
 import { json, type ActionFunctionArgs } from '@remix-run/cloudflare';
 import { createBillingProvider, planIdForConfiguredPrice } from '~/lib/qhub/commercial/billing/stripe-provider.server';
+import { requireCommercialReady } from '~/lib/qhub/commercial/commercial-schema-check.server';
 import {
   applySubscriptionEvent,
   claimWebhookEvent,
@@ -56,6 +57,17 @@ export async function action({ request, context }: ActionFunctionArgs) {
   }
 
   const event = verified.event;
+
+  /*
+   * Fail closed on schema readiness AFTER the signature is verified but BEFORE any
+   * claim or mutation. NOT READY → retryable (500), no claim, no state written, event
+   * never marked PROCESSED or permanent, so Stripe redelivers once the schema is ready.
+   */
+  const ready = await requireCommercialReady(env, { webhook: true });
+
+  if (!ready.ok) {
+    return ready.response;
+  }
 
   // 2. Atomically claim/reclaim the lease (idempotency + crash recovery).
   const owner = crypto.randomUUID(); // this worker's lease owner

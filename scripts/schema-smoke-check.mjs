@@ -37,6 +37,15 @@ const SCHEMA_VERIFIER_RPC = 'qhub_verify_governance_schema';
 const EXPECTED_AGENT_SCHEMA_VERSION = '2026-07-27.agent-foundation';
 const AGENT_SCHEMA_VERIFIER_RPC = 'qhub_verify_agent_schema';
 
+/*
+ * Commercial Launch schema — separate contract with a DIFFERENT verifier shape:
+ * qhub_verify_commercial_schema() returns { expected_version, ready, failed:[] }
+ * (a compact failed-check-name array, not per-check {identifier,category,...}).
+ * KEEP IN SYNC with app/lib/qhub/commercial/commercial-schema-check.server.ts.
+ */
+const EXPECTED_COMMERCIAL_SCHEMA_VERSION = '2026-07-30.commercial-launch-r4';
+const COMMERCIAL_SCHEMA_VERIFIER_RPC = 'qhub_verify_commercial_schema';
+
 /** @type {{table:string,column:string,migration:string}[]} */
 const AGENT_REQUIRED_OBJECTS = [
   { table: 'qhub_agents', column: 'current_lifecycle_state', migration: '20260727_agent_framework_foundation' },
@@ -218,6 +227,59 @@ async function verifyMetadata(url, serviceKey, rpc = SCHEMA_VERIFIER_RPC, expect
   }
 }
 
+/**
+ * Verify the Commercial Launch schema via qhub_verify_commercial_schema(). Fails
+ * closed for a missing verifier, wrong version, ready=false, any failed check, a
+ * malformed response, or an unavailable DB. Never prints SQL, keys, or payloads.
+ * @returns {Promise<{ready:boolean, error?:string, failed:string[]}>}
+ */
+async function verifyCommercial(url, serviceKey) {
+  const endpoint = `${url.replace(/\/$/, '')}/rest/v1/rpc/${COMMERCIAL_SCHEMA_VERIFIER_RPC}`;
+
+  try {
+    const res = await fetch(endpoint, {
+      method: 'POST',
+      headers: {
+        apikey: serviceKey,
+        Authorization: `Bearer ${serviceKey}`,
+        Accept: 'application/json',
+        'Content-Type': 'application/json',
+      },
+      body: '{}',
+      signal: AbortSignal.timeout(8000),
+    });
+
+    if (!res.ok) {
+      const body = await res.json().catch(() => null);
+
+      // Missing verifier / permission / connectivity — fail closed.
+      return { ready: false, error: body?.code ?? `HTTP ${res.status}`, failed: [] };
+    }
+
+    const body = await res.json();
+
+    if (
+      typeof body?.ready !== 'boolean' ||
+      !Array.isArray(body?.failed) ||
+      typeof body?.expected_version !== 'string'
+    ) {
+      return { ready: false, error: 'MALFORMED_COMMERCIAL_METADATA', failed: [] };
+    }
+
+    if (body.expected_version !== EXPECTED_COMMERCIAL_SCHEMA_VERSION) {
+      return { ready: false, error: 'VERSION_MISMATCH', failed: [String(body.expected_version)] };
+    }
+
+    if (body.ready !== true || body.failed.length > 0) {
+      return { ready: false, error: 'NOT_READY', failed: body.failed.map(String).slice(0, 25) };
+    }
+
+    return { ready: true, failed: [] };
+  } catch (err) {
+    return { ready: false, error: err instanceof Error ? err.name : 'COMMERCIAL_PROBE_FAILED', failed: [] };
+  }
+}
+
 async function main() {
   loadDotenv();
 
@@ -331,8 +393,22 @@ async function main() {
     `  [OK  ] ${agentMeta.checks.length} Agent Framework metadata invariants (${EXPECTED_AGENT_SCHEMA_VERSION})`,
   );
 
+  // ── Commercial Launch schema (separate contract, compact failed[] shape) ──
+  const commercialMeta = await verifyCommercial(url, serviceKey);
+
+  if (!commercialMeta.ready) {
+    console.error(
+      `[schema-smoke-check] FAIL: Commercial Launch metadata contract is not ready — ` +
+        `${commercialMeta.error ?? 'NOT_READY'}${commercialMeta.failed.length ? `: ${commercialMeta.failed.join(', ')}` : ''}. ` +
+        `Expected ${EXPECTED_COMMERCIAL_SCHEMA_VERSION}. Apply the unapplied commercial migration to this project before deploying.`,
+    );
+    process.exit(1);
+  }
+
+  console.log(`  [OK  ] Commercial Launch metadata contract (${EXPECTED_COMMERCIAL_SCHEMA_VERSION})`);
+
   console.log(
-    `[schema-smoke-check] PASS: project ${projectRef ?? '(unknown)'} matches ${EXPECTED_SCHEMA_VERSION} + ${EXPECTED_AGENT_SCHEMA_VERSION}.`,
+    `[schema-smoke-check] PASS: project ${projectRef ?? '(unknown)'} matches ${EXPECTED_SCHEMA_VERSION} + ${EXPECTED_AGENT_SCHEMA_VERSION} + ${EXPECTED_COMMERCIAL_SCHEMA_VERSION}.`,
   );
   process.exit(0);
 }

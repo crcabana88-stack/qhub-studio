@@ -9,6 +9,7 @@
 
 import { json, type ActionFunctionArgs } from '@remix-run/cloudflare';
 import { requireCommercialContext } from '~/lib/qhub/commercial/commercial-context.server';
+import { requireCommercialReady } from '~/lib/qhub/commercial/commercial-schema-check.server';
 import { createCommercialProject } from '~/lib/qhub/commercial/commercial-service.server';
 import { checkRateLimit, isSameOrigin, readBoundedJson } from '~/lib/qhub/commercial/request-guards.server';
 
@@ -30,6 +31,13 @@ export async function action({ request, context }: ActionFunctionArgs) {
   }
 
   const ctx = guard.ctx;
+
+  // Fail closed on schema readiness BEFORE any project write.
+  const ready = await requireCommercialReady(env);
+
+  if (!ready.ok) {
+    return ready.response;
+  }
 
   const rate = checkRateLimit(`project_create:${ctx.orgId}:${ctx.userId}`, 10, 60_000);
 

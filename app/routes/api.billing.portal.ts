@@ -11,6 +11,7 @@
 import { json, type ActionFunctionArgs } from '@remix-run/cloudflare';
 import { requireCommercialContext } from '~/lib/qhub/commercial/commercial-context.server';
 import { createBillingProvider } from '~/lib/qhub/commercial/billing/stripe-provider.server';
+import { requireCommercialReady } from '~/lib/qhub/commercial/commercial-schema-check.server';
 import { getSubscriptionSnapshot } from '~/lib/qhub/commercial/commercial-store.server';
 import { appUrl, checkRateLimit, isSameOrigin } from '~/lib/qhub/commercial/request-guards.server';
 
@@ -35,6 +36,13 @@ export async function action({ request, context }: ActionFunctionArgs) {
 
   if (!ctx.orgId) {
     return json({ ok: false, error: 'no_org_context' }, { status: 403 });
+  }
+
+  // Fail closed on schema readiness BEFORE any Stripe call.
+  const ready = await requireCommercialReady(env);
+
+  if (!ready.ok) {
+    return ready.response;
   }
 
   const rate = checkRateLimit(`portal:${ctx.orgId}`, 5, 60_000);

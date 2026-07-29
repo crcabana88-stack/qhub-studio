@@ -23,6 +23,10 @@ import { json, type LoaderFunctionArgs } from '@remix-run/cloudflare';
 import { requireStaff } from '~/lib/qhub/commercial/commercial-context.server';
 import { getSchemaReadiness } from '~/lib/qhub/schema-check.server';
 import { getAgentSchemaReadiness } from '~/lib/qhub/agent/agent-schema-check.server';
+import {
+  getCommercialSchemaReadiness,
+  resetCommercialReadinessCache,
+} from '~/lib/qhub/commercial/commercial-schema-check.server';
 
 export const loader = async ({ request, context }: LoaderFunctionArgs) => {
   const env = (context?.cloudflare?.env as unknown as Record<string, string | undefined>) ?? {};
@@ -36,8 +40,13 @@ export const loader = async ({ request, context }: LoaderFunctionArgs) => {
 
   const force = new URL(request.url).searchParams.get('force') === '1';
 
+  if (force) {
+    resetCommercialReadinessCache();
+  }
+
   const report = await getSchemaReadiness(env, { force });
   const agent = await getAgentSchemaReadiness(env, { force });
+  const commercial = await getCommercialSchemaReadiness(env);
 
   return json(
     {
@@ -75,8 +84,19 @@ export const loader = async ({ request, context }: LoaderFunctionArgs) => {
         missing: agent.missing.map((m) => m.identifier ?? `${m.table}.${m.column}`),
         ...(agent.error ? { error: agent.error } : {}),
       },
+
+      // Commercial Launch readiness (separate contract; compact, non-secret).
+      commercial: {
+        state: commercial.state,
+        ready: commercial.state === 'READY',
+        expectedSchemaVersion: commercial.expected,
+        actualSchemaVersion: commercial.version ?? null,
+        failed: commercial.failed,
+        checkedAt: commercial.checkedAt,
+        ...(commercial.cacheAgeMs !== undefined ? { cacheAgeMs: commercial.cacheAgeMs } : {}),
+      },
     },
-    { status: report.ready && agent.ready ? 200 : 503 },
+    { status: report.ready && agent.ready && commercial.state === 'READY' ? 200 : 503 },
   );
 };
 

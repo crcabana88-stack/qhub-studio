@@ -11,6 +11,7 @@
 
 import type { CommercialExecutionContext } from '~/lib/qhub/commercial/commercial-context.server';
 import { hasCapability, type Capability } from '~/lib/qhub/commercial/capabilities';
+import { getCommercialSchemaReadiness } from '~/lib/qhub/commercial/commercial-schema-check.server';
 import {
   getGovernanceRecord,
   isModelInvocationAllowed,
@@ -33,6 +34,16 @@ function isExecutionContext(ctx: unknown): ctx is CommercialExecutionContext {
 
 function requireCap(ctx: CommercialExecutionContext, cap: Capability): boolean {
   return hasCapability(ctx.capabilities, cap);
+}
+
+/**
+ * Server-authoritative schema readiness — the lowest-boundary fail-closed check.
+ * Returns true only when the commercial schema is fully READY; every non-READY state
+ * (NOT_READY / UNAVAILABLE / CONFIGURATION_ERROR) fails closed.
+ */
+async function schemaReady(env: Record<string, string | undefined>): Promise<boolean> {
+  const r = await getCommercialSchemaReadiness(env);
+  return r.state === 'READY';
 }
 
 // ─── Canonical request hash (binds the MATERIAL build request) ──────────────────
@@ -110,6 +121,11 @@ export async function invokeCommercialModel<T>(
     return { ok: false, reason: 'capability_denied' };
   }
 
+  // Fail closed on schema readiness BEFORE credit consumption or the model runner.
+  if (!(await schemaReady(env))) {
+    return { ok: false, reason: 'schema_not_ready' };
+  }
+
   const gov = await getGovernanceRecord(ctx.projectOrgId, ctx.projectId, env);
 
   if (!isModelInvocationAllowed(gov)) {
@@ -146,6 +162,11 @@ export async function createCommercialProject(
     return { ok: false, reason: 'no_org_context' };
   }
 
+  // Fail closed on schema readiness BEFORE any project write.
+  if (!(await schemaReady(env))) {
+    return { ok: false, reason: 'schema_not_ready' };
+  }
+
   /*
    * ONE atomic RPC: derives + locks org/subscription/active-count, enforces the plan
    * cap and idempotency, inserts project + entitlement, appends audit — all-or-nothing.
@@ -163,13 +184,21 @@ export async function createCommercialProject(
   return { ok: true, value: { projectId: created.project_id, idempotent: created.idempotent } };
 }
 
-export function exportCommercialProject(ctx: CommercialExecutionContext): ServiceOutcome<{ projectId: string }> {
+export async function exportCommercialProject(
+  ctx: CommercialExecutionContext,
+  env: Record<string, string | undefined>,
+): Promise<ServiceOutcome<{ projectId: string }>> {
   if (!isExecutionContext(ctx)) {
     return { ok: false, reason: 'missing_execution_context' };
   }
 
   if (!requireCap(ctx, 'CODE_EXPORT')) {
     return { ok: false, reason: 'capability_denied' };
+  }
+
+  // Fail closed on schema readiness BEFORE producing any evidence export.
+  if (!(await schemaReady(env))) {
+    return { ok: false, reason: 'schema_not_ready' };
   }
 
   return { ok: true, value: { projectId: ctx.projectId } };
@@ -185,6 +214,11 @@ export async function requestCommercialPublication(
 
   if (!requireCap(ctx, 'PUBLISH_REQUEST')) {
     return { ok: false, reason: 'capability_denied' };
+  }
+
+  // Fail closed on schema readiness BEFORE any publication request.
+  if (!(await schemaReady(env))) {
+    return { ok: false, reason: 'schema_not_ready' };
   }
 
   const gov = await getGovernanceRecord(ctx.projectOrgId, ctx.projectId, env);

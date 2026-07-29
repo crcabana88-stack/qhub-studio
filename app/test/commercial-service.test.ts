@@ -11,13 +11,32 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 import type { CommercialExecutionContext } from '~/lib/qhub/commercial/commercial-context.server';
 import type { GovernanceRecord } from '~/lib/qhub/commercial/governance-essentials.server';
 
-const H = vi.hoisted(() => ({ getGov: vi.fn(), consume: vi.fn() }));
+const H = vi.hoisted(() => ({ getGov: vi.fn(), consume: vi.fn(), ready: vi.fn() }));
 
 vi.mock('~/lib/qhub/commercial/governance-essentials.server', async (importActual) => {
   const actual = await importActual<typeof import('~/lib/qhub/commercial/governance-essentials.server')>();
   return { ...actual, getGovernanceRecord: H.getGov };
 });
 vi.mock('~/lib/qhub/commercial/commercial-store.server', () => ({ consumeBuildCredit: H.consume }));
+
+// Deterministic readiness injection (no production bypass — the module is mocked).
+vi.mock('~/lib/qhub/commercial/commercial-schema-check.server', () => ({
+  getCommercialSchemaReadiness: H.ready,
+}));
+
+const READY = {
+  state: 'READY',
+  expected: '2026-07-30.commercial-launch-r4',
+  version: '2026-07-30.commercial-launch-r4',
+  failed: [],
+  checkedAt: 0,
+};
+const NOT_READY = {
+  state: 'NOT_READY',
+  expected: '2026-07-30.commercial-launch-r4',
+  failed: ['version_mismatch'],
+  checkedAt: 0,
+};
 
 import {
   invokeCommercialModel,
@@ -72,6 +91,7 @@ beforeEach(() => {
   vi.clearAllMocks();
   H.getGov.mockResolvedValue(goodGov);
   H.consume.mockResolvedValue({ ok: true, remaining: 9, ledger_id: 'L1' });
+  H.ready.mockResolvedValue(READY);
 });
 
 describe('invokeCommercialModel', () => {
@@ -138,11 +158,31 @@ describe('invokeCommercialModel', () => {
     const c = await canonicalRequestHash(execCtx(), req);
     expect(a).toBe(c);
   });
+
+  it('fails closed BEFORE credit consumption when the schema is NOT READY', async () => {
+    H.ready.mockResolvedValue(NOT_READY);
+
+    let ran = false;
+    const r = await invokeCommercialModel(execCtx(), req, 'k1', {}, async () => {
+      ran = true;
+      return 'ran';
+    });
+    expect(r.ok === false && r.reason).toBe('schema_not_ready');
+    expect(H.consume).not.toHaveBeenCalled(); // no credit decrement
+    expect(ran).toBe(false); // no model call
+  });
 });
 
 describe('exportCommercialProject', () => {
-  it('requires CODE_EXPORT capability', () => {
-    expect(exportCommercialProject(execCtx(['CODE_EXPORT'])).ok).toBe(true);
-    expect(exportCommercialProject(execCtx([])).ok).toBe(false);
+  it('requires CODE_EXPORT capability', async () => {
+    expect((await exportCommercialProject(execCtx(['CODE_EXPORT']), {})).ok).toBe(true);
+    expect((await exportCommercialProject(execCtx([]), {})).ok).toBe(false);
+  });
+
+  it('fails closed when the schema is NOT READY', async () => {
+    H.ready.mockResolvedValue(NOT_READY);
+
+    const r = await exportCommercialProject(execCtx(['CODE_EXPORT']), {});
+    expect(r.ok === false && r.reason).toBe('schema_not_ready');
   });
 });

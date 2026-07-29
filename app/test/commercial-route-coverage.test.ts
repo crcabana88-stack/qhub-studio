@@ -102,6 +102,56 @@ describe('specific R4-hardened routes are guarded', () => {
   });
 });
 
+describe('commercial routes fail closed on schema readiness (R4)', () => {
+  /*
+   * Every route that mutates commercial state or calls a model/Stripe MUST gate on
+   * the central readiness service BEFORE any protected work.
+   */
+  const READINESS_REQUIRED = [
+    'api.billing.checkout.ts',
+    'api.billing.portal.ts',
+    'api.billing.webhook.ts',
+    'api.commercial.build.ts',
+    'api.commercial.projects.ts',
+    'api.commercial.reviews.ts',
+    'api.internal.commercial.reviews.$requestId.decision.ts',
+    'api.commercial.invitations.accept.ts',
+  ];
+
+  const READINESS_GATE = /requireCommercialReady\s*\(/;
+
+  for (const f of READINESS_REQUIRED) {
+    const src = read(f);
+
+    it(`${f} calls the central readiness gate`, () => {
+      expect(READINESS_GATE.test(src), `${f} does not call requireCommercialReady`).toBe(true);
+    });
+
+    it(`${f} returns the fail-closed response (does not swallow NOT_READY)`, () => {
+      // The gate result must actually be returned — not caught and ignored.
+      expect(/ready\.response/.test(src), `${f} does not return the readiness fail-closed response`).toBe(true);
+    });
+  }
+
+  it('no route calls the commercial verifier RPC directly (only the readiness service may)', () => {
+    for (const f of routeFiles) {
+      expect(
+        /qhub_verify_commercial_schema/.test(read(f)),
+        `${f} calls qhub_verify_commercial_schema directly — route must go through the readiness service`,
+      ).toBe(false);
+    }
+  });
+
+  it('no route hard-codes commercial readiness', () => {
+    for (const f of READINESS_REQUIRED) {
+      const src = read(f);
+
+      // A route must never fabricate a READY state or bypass the gate with a literal.
+      expect(/state:\s*['"]READY['"]/.test(src), `${f} hard-codes a READY state`).toBe(false);
+    }
+  });
+});
+
 describe('no route reads user_metadata for authorization', () => {
   for (const f of routeFiles) {
     it(`${f} does not read user_metadata.org_id / .role`, () => {
