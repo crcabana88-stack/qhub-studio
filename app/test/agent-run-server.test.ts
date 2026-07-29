@@ -15,6 +15,7 @@ import {
   LocalSimulationProvider,
 } from '~/lib/qhub/agent/runtime/local-simulation-provider';
 import { stableStringify } from '~/lib/qhub/agent/runtime/run-reconstruction';
+import { computeStepResultHash } from '~/lib/qhub/agent/runtime/step-result-hash';
 import { canonicalActionRequestString } from '~/lib/qhub/enforcement-plan';
 
 /**
@@ -82,16 +83,25 @@ async function pausedEvalForConnector(inputs: any) {
 }
 
 // ── In-memory fake Supabase (backs run/step writes) ──
-const STORE: { runs: any[]; steps: any[]; failStepInsert: boolean } = { runs: [], steps: [], failStepInsert: false };
-const tableKey = (t: string) => (t === 'qhub_agent_runs' ? 'runs' : 'steps');
+const STORE: { runs: any[]; steps: any[]; evals: any[]; failStepInsert: boolean } = {
+  runs: [],
+  steps: [],
+  evals: [],
+  failStepInsert: false,
+};
+const MANIFEST_HASH = 'MH'; // matches makeVersion().manifest_hash
+const tableKey = (t: string): 'runs' | 'steps' | 'evals' =>
+  t === 'qhub_agent_runs' ? 'runs' : t === 'qhub_control_evaluations' ? 'evals' : 'steps';
 
 function fakeClient() {
   const from = (table: string) => {
-    const key = tableKey(table) as 'runs' | 'steps';
+    const key = tableKey(table);
     const filters: [string, unknown][] = [];
+    const inFilters: [string, unknown[]][] = [];
     let mode: 'select' | 'insert' | 'update' | null = null;
     let payload: any = null;
-    const match = (r: any) => filters.every(([c, v]) => r[c] === v);
+    const match = (r: any) =>
+      filters.every(([c, v]) => r[c] === v) && inFilters.every(([c, arr]) => arr.includes(r[c]));
     const exec = () => {
       const rows = STORE[key];
 
@@ -159,6 +169,10 @@ function fakeClient() {
         filters.push([c, v]);
         return b;
       },
+      in(c: string, arr: unknown[]) {
+        inFilters.push([c, arr]);
+        return b;
+      },
       order() {
         return b;
       },
@@ -174,52 +188,141 @@ function fakeClient() {
   };
 
   /**
-   * Simulates the service-role-only qhub_finalize_agent_run_step RPC: update-or-insert
-   * the terminal step with server-owned continuity (result_hash, previous_step_hash,
-   * safe_result) chained onto the prior finalized step. Honors failStepInsert.
+   * Simulates the two service-role-only write RPCs. Direct table writes are denied
+   * to service_role in the real schema; here the RPC is the only write path.
+   * qhub_finalize computes the REAL canonical result_hash (so the resume-time
+   * recompute matches) chained onto the prior finalized step. Honors failStepInsert.
    */
+  const evalFor = (evaluationId: string | null, orgId: string) => {
+    if (!evaluationId) {
+      return undefined;
+    }
+
+    let ev = STORE.evals.find((e) => e.evaluation_id === evaluationId);
+
+    if (!ev) {
+      ev = {
+        evaluation_id: evaluationId,
+        org_id: orgId,
+        action_request_id: null,
+        action_digest: null,
+        policy_profile_id: null,
+        policy_profile_version: null,
+        policy_profile_hash: null,
+        enforcement_plan_id: null,
+        enforcement_plan_version: null,
+        enforcement_plan_hash: null,
+      };
+      STORE.evals.push(ev);
+    }
+
+    return ev;
+  };
+
   const rpc = (fn: string, args: any) => {
-    if (fn !== 'qhub_finalize_agent_run_step') {
-      return Promise.resolve({ data: null, error: { message: `unknown rpc ${fn}` } });
+    if (fn === 'qhub_create_agent_run_step_pending') {
+      if (STORE.failStepInsert) {
+        return Promise.resolve({ data: null, error: { message: 'forced create failure' } });
+      }
+
+      const row = {
+        run_id: args.p_run_id,
+        org_id: args.p_org_id,
+        step_index: args.p_step_index,
+        step_kind: args.p_step_kind,
+        action_type: args.p_action_type,
+        evaluation_id: args.p_evaluation_id,
+        decision: 'REQUIRE_APPROVAL',
+        reason_codes: args.p_reason_codes ?? [],
+        receipt_id: null,
+        input_hash: args.p_input_hash,
+        summary: args.p_summary,
+        result_hash: null,
+        safe_result: null,
+        previous_step_hash: null,
+      };
+      const idx = STORE.steps.findIndex((x) => x.run_id === row.run_id && x.step_index === row.step_index);
+
+      if (idx >= 0) {
+        STORE.steps[idx] = { ...STORE.steps[idx], ...row };
+      } else {
+        STORE.steps.push(row);
+      }
+
+      return Promise.resolve({ data: { recorded: true }, error: null });
     }
 
-    if (STORE.failStepInsert) {
-      return Promise.resolve({ data: null, error: { message: 'forced finalize failure' } });
+    if (fn === 'qhub_finalize_agent_run_step') {
+      if (STORE.failStepInsert) {
+        return Promise.resolve({ data: null, error: { message: 'forced finalize failure' } });
+      }
+
+      const run = STORE.runs.find((r) => r.run_id === args.p_run_id);
+      const ev = evalFor(args.p_evaluation_id ?? null, args.p_org_id);
+      const prev =
+        args.p_step_index === 0
+          ? null
+          : (STORE.steps.find((s) => s.run_id === args.p_run_id && s.step_index === args.p_step_index - 1)
+              ?.result_hash ?? null);
+      const resultHash = computeStepResultHash({
+        org_id: run.org_id,
+        qhub_app_id: run.qhub_app_id,
+        agent_id: run.agent_id,
+        agent_version_id: run.agent_version_id,
+        release_candidate_id: run.release_candidate_id ?? null,
+        release_candidate_hash: run.release_candidate_hash ?? null,
+        manifest_hash: MANIFEST_HASH,
+        run_id: args.p_run_id,
+        runtime_provider_id: run.runtime_provider,
+        runtime_provider_version: run.runtime_provider_version,
+        step_index: args.p_step_index,
+        step_kind: args.p_step_kind,
+        action_type: args.p_action_type,
+        input_hash: args.p_input_hash,
+        decision: args.p_decision,
+        evaluation_id: args.p_evaluation_id ?? null,
+        action_request_id: ev?.action_request_id ?? null,
+        action_digest: ev?.action_digest ?? null,
+        policy_profile_id: ev?.policy_profile_id ?? null,
+        policy_profile_version: ev?.policy_profile_version ?? null,
+        policy_profile_hash: ev?.policy_profile_hash ?? null,
+        enforcement_plan_id: ev?.enforcement_plan_id ?? null,
+        enforcement_plan_version: ev?.enforcement_plan_version ?? null,
+        enforcement_plan_hash: ev?.enforcement_plan_hash ?? null,
+        receipt_id: args.p_receipt_id ?? null,
+        safe_result: args.p_safe_result,
+        previous_step_hash: prev,
+      });
+      const row = {
+        run_id: args.p_run_id,
+        org_id: args.p_org_id,
+        step_index: args.p_step_index,
+        step_kind: args.p_step_kind,
+        action_type: args.p_action_type,
+        evaluation_id: args.p_evaluation_id,
+        decision: args.p_decision,
+        reason_codes: args.p_reason_codes ?? [],
+        receipt_id: args.p_receipt_id,
+        input_hash: args.p_input_hash,
+        summary: args.p_summary,
+        safe_result: args.p_safe_result,
+        previous_step_hash: prev,
+        result_hash: resultHash,
+        result_hash_schema_version: 'agent-step-result-1.0.0',
+        finalized_at: new Date().toISOString(),
+      };
+      const idx = STORE.steps.findIndex((x) => x.run_id === row.run_id && x.step_index === row.step_index);
+
+      if (idx >= 0) {
+        STORE.steps[idx] = { ...STORE.steps[idx], ...row };
+      } else {
+        STORE.steps.push(row);
+      }
+
+      return Promise.resolve({ data: { finalized: true, result_hash: resultHash }, error: null });
     }
 
-    const prev =
-      args.p_step_index === 0
-        ? null
-        : (STORE.steps.find((s) => s.run_id === args.p_run_id && s.step_index === args.p_step_index - 1)?.result_hash ??
-          null);
-    const resultHash = `rh:${args.p_run_id}:${args.p_step_index}:${args.p_decision}:${args.p_receipt_id ?? ''}`;
-    const row = {
-      run_id: args.p_run_id,
-      org_id: args.p_org_id,
-      step_index: args.p_step_index,
-      step_kind: args.p_step_kind,
-      action_type: args.p_action_type,
-      evaluation_id: args.p_evaluation_id,
-      decision: args.p_decision,
-      reason_codes: args.p_reason_codes ?? [],
-      receipt_id: args.p_receipt_id,
-      input_hash: args.p_input_hash,
-      summary: args.p_summary,
-      safe_result: args.p_safe_result,
-      previous_step_hash: prev,
-      result_hash: resultHash,
-      result_hash_schema_version: 'agent-step-result-1.0.0',
-      finalized_at: new Date().toISOString(),
-    };
-    const idx = STORE.steps.findIndex((x) => x.run_id === row.run_id && x.step_index === row.step_index);
-
-    if (idx >= 0) {
-      STORE.steps[idx] = { ...STORE.steps[idx], ...row };
-    } else {
-      STORE.steps.push(row);
-    }
-
-    return Promise.resolve({ data: { finalized: true, result_hash: resultHash }, error: null });
+    return Promise.resolve({ data: null, error: { message: `unknown rpc ${fn}` } });
   };
 
   return { from, rpc };
@@ -402,6 +505,7 @@ beforeEach(() => {
   vi.clearAllMocks();
   STORE.runs = [];
   STORE.steps = [];
+  STORE.evals = [];
   STORE.failStepInsert = false;
   H.assertSchema.mockResolvedValue(undefined);
   H.getAgent.mockResolvedValue(makeAgent());

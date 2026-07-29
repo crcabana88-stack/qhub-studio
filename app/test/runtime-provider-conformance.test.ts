@@ -29,9 +29,13 @@ import {
 import { selectRuntimeProvider } from '~/lib/qhub/agent/runtime/provider-registry.server';
 import {
   reconstructForResume,
+  verifyStoredResultHashes,
   type RunIdentity,
   type StoredRunStep,
+  type ResultHashRecomputeRun,
+  type StoredEvaluationForHash,
 } from '~/lib/qhub/agent/runtime/run-reconstruction';
+import { computeStepResultHash } from '~/lib/qhub/agent/runtime/step-result-hash';
 
 const localFactory = () => new LocalSimulationProvider();
 
@@ -317,6 +321,7 @@ describe('reconstructForResume — direct fail-closed unit checks', () => {
         run_id: 'r1',
         org_id: 'o1',
         step_index: 0,
+        step_kind: 'MODEL_INVOCATION',
         action_type: 'AI_MODEL_INVOCATION',
         decision: 'SIMULATED',
         reason_codes: [],
@@ -331,6 +336,7 @@ describe('reconstructForResume — direct fail-closed unit checks', () => {
         run_id: 'r1',
         org_id: 'o1',
         step_index: 1,
+        step_kind: 'CONNECTOR_ACTION',
         action_type: 'EXTERNAL_DATA_TRANSMISSION',
         decision: 'REQUIRE_APPROVAL',
         reason_codes: [],
@@ -429,6 +435,113 @@ describe('reconstructForResume — direct fail-closed unit checks', () => {
     });
     expect(r.ok).toBe(false);
     expect(r.reason).toBe('RUN_NOT_RESUMABLE');
+  });
+});
+
+// ── FULL RESULT-HASH RECOMPUTATION on resume (Blocker H) ─────────────────────
+
+describe('verifyStoredResultHashes — recompute from authoritative data', () => {
+  const run: ResultHashRecomputeRun = {
+    run_id: 'r1',
+    org_id: 'o1',
+    qhub_app_id: 'app1',
+    agent_id: 'a1',
+    agent_version_id: 'v1',
+    release_candidate_id: 'rc1',
+    release_candidate_hash: 'RCH',
+    manifest_hash: 'MH',
+    runtime_provider_id: 'local-simulation',
+    runtime_provider_version: '1.0.0',
+  };
+  const ev: StoredEvaluationForHash = {
+    evaluation_id: 'E0',
+    action_request_id: 'ar0',
+    action_digest: 'dig0',
+    policy_profile_id: 'pp0',
+    policy_profile_version: 1,
+    policy_profile_hash: 'PPH',
+    enforcement_plan_id: 'ep0',
+    enforcement_plan_version: 2,
+    enforcement_plan_hash: 'EPH',
+  };
+  const evalById = new Map([[ev.evaluation_id, ev]]);
+
+  function finalizedStep(overrides: Partial<StoredRunStep> = {}): StoredRunStep {
+    const base = {
+      org_id: run.org_id,
+      qhub_app_id: run.qhub_app_id,
+      agent_id: run.agent_id,
+      agent_version_id: run.agent_version_id,
+      release_candidate_id: run.release_candidate_id,
+      release_candidate_hash: run.release_candidate_hash,
+      manifest_hash: run.manifest_hash,
+      run_id: run.run_id,
+      runtime_provider_id: run.runtime_provider_id,
+      runtime_provider_version: run.runtime_provider_version,
+      step_index: 0,
+      step_kind: 'CONNECTOR_ACTION',
+      action_type: 'EXTERNAL_DATA_TRANSMISSION',
+      input_hash: 'ih0',
+      decision: 'EXECUTED',
+      evaluation_id: ev.evaluation_id,
+      action_request_id: ev.action_request_id,
+      action_digest: ev.action_digest,
+      policy_profile_id: ev.policy_profile_id,
+      policy_profile_version: ev.policy_profile_version,
+      policy_profile_hash: ev.policy_profile_hash,
+      enforcement_plan_id: ev.enforcement_plan_id,
+      enforcement_plan_version: ev.enforcement_plan_version,
+      enforcement_plan_hash: ev.enforcement_plan_hash,
+      receipt_id: 'rcpt0',
+      safe_result: { execution_status: 'SUCCEEDED' } as Record<string, unknown>,
+      previous_step_hash: null,
+    };
+    const hash = computeStepResultHash({ ...base, safe_result: { execution_status: 'SUCCEEDED' } });
+
+    return {
+      run_id: run.run_id,
+      org_id: run.org_id,
+      step_index: 0,
+      step_kind: 'CONNECTOR_ACTION',
+      action_type: 'EXTERNAL_DATA_TRANSMISSION',
+      decision: 'EXECUTED',
+      reason_codes: [],
+      receipt_id: 'rcpt0',
+      input_hash: 'ih0',
+      evaluation_id: ev.evaluation_id,
+      result_hash: hash,
+      safe_result: { execution_status: 'SUCCEEDED' },
+      previous_step_hash: null,
+      ...overrides,
+    };
+  }
+
+  it('accepts a step whose stored hash matches the recomputed authoritative hash', () => {
+    expect(verifyStoredResultHashes(run, [finalizedStep()], evalById).ok).toBe(true);
+  });
+
+  it('detects stored-hash tampering', () => {
+    const r = verifyStoredResultHashes(run, [finalizedStep({ result_hash: 'tampered' })], evalById);
+    expect(r.ok).toBe(false);
+    expect(r.reason).toBe('RESULT_HASH_MISMATCH');
+  });
+
+  it('detects authoritative-data drift (mutated manifest_hash)', () => {
+    const r = verifyStoredResultHashes({ ...run, manifest_hash: 'DRIFTED' }, [finalizedStep()], evalById);
+    expect(r.ok).toBe(false);
+    expect(r.reason).toBe('RESULT_HASH_MISMATCH');
+  });
+
+  it('fails closed on a missing evaluation for a finalized step', () => {
+    const r = verifyStoredResultHashes(run, [finalizedStep()], new Map());
+    expect(r.ok).toBe(false);
+    expect(r.reason).toBe('MISSING_EVALUATION_FOR_HASH');
+  });
+
+  it('fails closed on a legacy NULL-safe_result finalized row', () => {
+    const r = verifyStoredResultHashes(run, [finalizedStep({ safe_result: null })], evalById);
+    expect(r.ok).toBe(false);
+    expect(r.reason).toBe('NON_RESUMABLE_LEGACY_CONTINUITY');
   });
 });
 

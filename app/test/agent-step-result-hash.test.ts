@@ -90,7 +90,7 @@ async function sqlHash(f: StepResultHashInput): Promise<string> {
 
 const fullSafe: SafeResult = {
   execution_status: 'COMPLETED',
-  safe_metadata: { outcome: 'ok', record_count: 3, truncated: false },
+  safe_metadata: { outcome: 'OK', record_count: 3, truncated: false },
 };
 
 const base: StepResultHashInput = {
@@ -188,7 +188,7 @@ describe('canonical step-result hash — TS↔SQL parity (tests 2, 3)', () => {
       {
         safe_result: {
           execution_status: 'COMPLETED',
-          safe_metadata: { outcome: 'ok', record_count: 4, truncated: false },
+          safe_metadata: { outcome: 'OK', record_count: 4, truncated: false },
         },
       },
       { previous_step_hash: 'b'.repeat(64) },
@@ -203,8 +203,8 @@ describe('canonical step-result hash — TS↔SQL parity (tests 2, 3)', () => {
   });
 
   it('a present-null metadata key differs from an absent key (canonical safe result)', async () => {
-    const withNull: SafeResult = { execution_status: 'X', safe_metadata: { truncated: null } };
-    const withAbsent: SafeResult = { execution_status: 'X' };
+    const withNull: SafeResult = { execution_status: 'COMPLETED', safe_metadata: { truncated: null } };
+    const withAbsent: SafeResult = { execution_status: 'COMPLETED' };
     expect(canonicalSafeResult(withNull)).not.toBe(canonicalSafeResult(withAbsent));
 
     const a = { ...base, safe_result: withNull };

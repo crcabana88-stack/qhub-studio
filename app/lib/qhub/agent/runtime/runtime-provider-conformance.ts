@@ -271,6 +271,7 @@ export class GovernedRunHarness {
   private _storedStep(
     state: HarnessRunState,
     stepIndex: number,
+    stepKind: ProposedAction['step_kind'],
     actionType: ProposedAction['action_type'],
     inputHash: string,
     d: GateDecision,
@@ -283,6 +284,7 @@ export class GovernedRunHarness {
       run_id: state.run_id,
       org_id: ORG_ID,
       step_index: stepIndex,
+      step_kind: stepKind,
       action_type: actionType,
       decision: d.decision,
       reason_codes: [],
@@ -389,7 +391,10 @@ export class GovernedRunHarness {
         }
 
         const d = this._gate.enforce(action, `${state.run_id}:${stepIndex}`);
-        this._record(state, this._storedStep(state, stepIndex, action.action_type, inputHashOf(action), d));
+        this._record(
+          state,
+          this._storedStep(state, stepIndex, action.step_kind, action.action_type, inputHashOf(action), d),
+        );
 
         if (d.decision === 'DENY') {
           state.state = 'FAILED';
@@ -454,6 +459,7 @@ export class GovernedRunHarness {
       this._storedStep(
         state,
         pauseIndex,
+        reconstruction.paused_action.step_kind,
         reconstruction.paused_action.action_type,
         inputHashOf(reconstruction.paused_action),
         d,

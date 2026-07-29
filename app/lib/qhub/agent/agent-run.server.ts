@@ -27,7 +27,9 @@ import type { GovernedActionResult, ProposedAction, RuntimeManifestView } from '
 import {
   reconstructForResume,
   verifyPausedActionBinding,
+  verifyStoredResultHashes,
   type StoredRunStep,
+  type StoredEvaluationForHash,
   type PersistedEvaluation,
 } from './runtime/run-reconstruction';
 import { buildSafeResult, type SafeResult } from './runtime/safe-result';
@@ -573,51 +575,39 @@ interface StepRecord {
   summary: string;
 }
 
-/** The server-owned safe result for a terminal step (allowlisted, never raw). */
+/** The server-owned safe result for a terminal step (enum-only, never raw). */
 function safeResultForStep(result: GovernedActionResult): SafeResult {
-  const executionStatus =
-    typeof result.safe_result?.execution_status === 'string'
-      ? result.safe_result.execution_status
-      : result.decision === 'DENY'
-        ? 'DENIED'
-        : result.decision;
+  const fromReceipt =
+    typeof result.safe_result?.execution_status === 'string' ? result.safe_result.execution_status : null;
+  const byDecision =
+    result.decision === 'DENY'
+      ? 'DENIED'
+      : result.decision === 'EXECUTED'
+        ? 'EXECUTED'
+        : result.decision === 'SIMULATED'
+          ? 'SIMULATED'
+          : 'ALLOWED';
 
-  return buildSafeResult({ execution_status: executionStatus });
+  return buildSafeResult({ execution_status: fromReceipt ?? byDecision });
 }
 
 /**
- * Record a REQUIRE_APPROVAL pause step (non-terminal, no continuity fields). An
- * explicit update-or-insert on (run_id, step_index) — robust regardless of
- * on-conflict target resolution — that the defensive trigger permits.
+ * Record a REQUIRE_APPROVAL pause step (non-terminal, no continuity fields)
+ * through the service-role-only create-step RPC. Direct table writes are denied
+ * to service_role (SELECT-only); the SECURITY DEFINER RPC is the ONLY write path.
  */
 async function recordPendingStep(sb: SupabaseClient, step: StepRecord): Promise<boolean> {
-  const { data: existing } = await sb
-    .from('qhub_agent_run_steps')
-    .select('step_id')
-    .eq('run_id', step.run_id)
-    .eq('step_index', step.step_index)
-    .maybeSingle();
-
-  if (existing) {
-    const { error } = await sb
-      .from('qhub_agent_run_steps')
-      .update({
-        step_kind: step.step_kind,
-        action_type: step.action_type,
-        evaluation_id: step.evaluation_id,
-        decision: step.decision,
-        reason_codes: step.reason_codes,
-        receipt_id: step.receipt_id,
-        input_hash: step.input_hash,
-        summary: step.summary,
-      })
-      .eq('run_id', step.run_id)
-      .eq('step_index', step.step_index);
-
-    return !error;
-  }
-
-  const { error } = await sb.from('qhub_agent_run_steps').insert(step);
+  const { error } = await sb.rpc('qhub_create_agent_run_step_pending', {
+    p_run_id: step.run_id,
+    p_org_id: step.org_id,
+    p_step_index: step.step_index,
+    p_step_kind: step.step_kind,
+    p_action_type: step.action_type,
+    p_evaluation_id: step.evaluation_id,
+    p_reason_codes: step.reason_codes,
+    p_input_hash: step.input_hash,
+    p_summary: step.summary,
+  });
 
   return !error;
 }
@@ -625,11 +615,11 @@ async function recordPendingStep(sb: SupabaseClient, step: StepRecord): Promise<
 /**
  * Persist a governed step. A terminal decision is finalized through the
  * service-role-only qhub_finalize_agent_run_step RPC, which validates ownership,
- * the state transition, the strict safe_result, and the previous-step hash chain,
- * then computes result_hash + previous_step_hash from AUTHORITATIVE records (never
- * a caller argument). A REQUIRE_APPROVAL pause is a plain pending record. Any
- * failure returns false so the caller fails closed (an unrecorded governed action
- * is never treated as done).
+ * the state transition, the strict safe_result, all authoritative records, and the
+ * previous-step hash chain, then computes result_hash + previous_step_hash from
+ * AUTHORITATIVE records (never a caller argument). A REQUIRE_APPROVAL pause is a
+ * plain pending record (also RPC-only). Any failure returns false so the caller
+ * fails closed (an unrecorded governed action is never treated as done).
  */
 async function persistStep(sb: SupabaseClient, step: StepRecord, result: GovernedActionResult): Promise<boolean> {
   if (step.decision === 'REQUIRE_APPROVAL') {
@@ -814,7 +804,7 @@ export async function resumeAgentRun(input: {
   const stepsRes = await sb
     .from('qhub_agent_run_steps')
     .select(
-      'run_id, org_id, step_index, action_type, decision, reason_codes, receipt_id, input_hash, evaluation_id, result_hash, safe_result, previous_step_hash',
+      'run_id, org_id, step_index, step_kind, action_type, decision, reason_codes, receipt_id, input_hash, evaluation_id, result_hash, safe_result, previous_step_hash',
     )
     .eq('run_id', input.run_id)
     .eq('org_id', session.orgId)
@@ -822,6 +812,60 @@ export async function resumeAgentRun(input: {
 
   if (stepsRes.error) {
     return { ok: false, run_id: input.run_id, state: 'BLOCKED', reason_codes: ['EVIDENCE_WRITE_FAILED'] };
+  }
+
+  const storedSteps = (stepsRes.data ?? []) as unknown as StoredRunStep[];
+
+  /*
+   * FULL HASH RECOMPUTATION (pre-Gate-04): recompute every finalized step's
+   * result_hash from CURRENT authoritative run/version/evaluation data and compare
+   * to the stored value. Detects any hash-bound authoritative-data drift or stored-
+   * hash tampering and fails closed BEFORE any Gate 04 request. Uses the persisted
+   * safe_result only; legacy NULL-continuity rows are non-resumable.
+   */
+  const evalIds = Array.from(
+    new Set(storedSteps.filter((s) => s.result_hash && s.evaluation_id).map((s) => s.evaluation_id as string)),
+  );
+  const evaluationById = new Map<string, StoredEvaluationForHash>();
+
+  if (evalIds.length > 0) {
+    const evalRows = await sb
+      .from('qhub_control_evaluations')
+      .select(
+        'evaluation_id, action_request_id, action_digest, policy_profile_id, policy_profile_version, policy_profile_hash, enforcement_plan_id, enforcement_plan_version, enforcement_plan_hash',
+      )
+      .in('evaluation_id', evalIds)
+      .eq('org_id', session.orgId);
+
+    if (evalRows.error) {
+      return { ok: false, run_id: input.run_id, state: 'BLOCKED', reason_codes: ['RECONSTRUCTION_FAILED'] };
+    }
+
+    for (const row of (evalRows.data ?? []) as unknown as StoredEvaluationForHash[]) {
+      evaluationById.set(row.evaluation_id, row);
+    }
+  }
+
+  const hashVerify = verifyStoredResultHashes(
+    {
+      run_id: input.run_id,
+      org_id: session.orgId,
+      qhub_app_id: run.qhub_app_id as string,
+      agent_id: run.agent_id as string,
+      agent_version_id: run.agent_version_id as string,
+      release_candidate_id: (run.release_candidate_id as string) ?? null,
+      release_candidate_hash: (run.release_candidate_hash as string) ?? null,
+      manifest_hash: version.manifest_hash,
+      runtime_provider_id: run.runtime_provider as string,
+      runtime_provider_version: run.runtime_provider_version as string,
+    },
+    storedSteps,
+    evaluationById,
+  );
+
+  if (!hashVerify.ok) {
+    // Fail closed: no provider step, no Gate 04 request, no approval, no receipt.
+    return { ok: false, run_id: input.run_id, state: 'BLOCKED', reason_codes: ['RECONSTRUCTION_FAILED'] };
   }
 
   const reconstruction = await reconstructForResume({
@@ -837,7 +881,7 @@ export async function resumeAgentRun(input: {
       current_step: stepIndex,
       pending_evaluation_id: (run.pending_evaluation_id as string) ?? null,
     },
-    steps: (stepsRes.data ?? []) as unknown as StoredRunStep[],
+    steps: storedSteps,
     approvedEvaluationId: input.approved_evaluation_id,
   });
 

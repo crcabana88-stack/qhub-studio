@@ -21,6 +21,8 @@ import type { AgentRuntimeProvider, GovernedActionResult, ProposedAction } from 
 import type { RunActionDecision } from '~/lib/qhub/agent/agent-run';
 import { canonicalActionRequestString } from '~/lib/qhub/enforcement-plan';
 import type { CanonicalActionRequest } from '~/lib/qhub/enforcement';
+import { computeStepResultHash, type StepResultHashInput } from './step-result-hash';
+import type { SafeResult } from './safe-result';
 
 const sha256 = (s: string) => createHash('sha256').update(s).digest('hex');
 
@@ -49,6 +51,7 @@ export interface StoredRunStep {
   run_id: string;
   org_id: string;
   step_index: number;
+  step_kind: string;
   action_type: string | null;
   decision: RunActionDecision | null;
   reason_codes: string[];
@@ -105,6 +108,117 @@ function executedContinuityReason(
   }
 
   return null;
+}
+
+/*
+ * --------------------------------------------------------------------------
+ * Full result-hash recomputation from CURRENT authoritative data (Blocker H)
+ * --------------------------------------------------------------------------
+ */
+
+/** Authoritative run + version identity needed to recompute a step result hash. */
+export interface ResultHashRecomputeRun {
+  run_id: string;
+  org_id: string;
+  qhub_app_id: string;
+  agent_id: string;
+  agent_version_id: string;
+  release_candidate_id: string | null;
+  release_candidate_hash: string | null;
+  manifest_hash: string;
+  runtime_provider_id: string;
+  runtime_provider_version: string;
+}
+
+/** The authoritative Gate 04 evaluation fields bound into a step's result hash. */
+export interface StoredEvaluationForHash {
+  evaluation_id: string;
+  action_request_id: string | null;
+  action_digest: string | null;
+  policy_profile_id: string | null;
+  policy_profile_version: number | null;
+  policy_profile_hash: string | null;
+  enforcement_plan_id: string | null;
+  enforcement_plan_version: number | null;
+  enforcement_plan_hash: string | null;
+}
+
+export type ResultHashVerifyReason =
+  | 'NON_RESUMABLE_LEGACY_CONTINUITY'
+  | 'MISSING_EVALUATION_FOR_HASH'
+  | 'RESULT_HASH_MISMATCH';
+
+export interface ResultHashVerifyResult {
+  ok: boolean;
+  reason?: ResultHashVerifyReason;
+  step_index?: number;
+}
+
+/**
+ * Recompute every FINALIZED step's result_hash from CURRENT authoritative run/
+ * version/evaluation data and compare it to the stored value. Detects drift in
+ * any hash-bound authoritative record and any stored-hash tampering. Fails closed
+ * on a legacy row, a missing evaluation, or a mismatch. The database independently
+ * recomputes on write; this is the runtime's pre-Gate-04 defense in depth.
+ */
+export function verifyStoredResultHashes(
+  run: ResultHashRecomputeRun,
+  steps: StoredRunStep[],
+  evaluationById: Map<string, StoredEvaluationForHash>,
+): ResultHashVerifyResult {
+  const ordered = [...steps].sort((a, b) => a.step_index - b.step_index);
+
+  for (const step of ordered) {
+    if (step.result_hash === null) {
+      continue; // pending (REQUIRE_APPROVAL) rows carry no continuity yet
+    }
+
+    if (step.safe_result === null) {
+      return { ok: false, reason: 'NON_RESUMABLE_LEGACY_CONTINUITY', step_index: step.step_index };
+    }
+
+    const ev = step.evaluation_id ? evaluationById.get(step.evaluation_id) : undefined;
+
+    if (step.evaluation_id && !ev) {
+      return { ok: false, reason: 'MISSING_EVALUATION_FOR_HASH', step_index: step.step_index };
+    }
+
+    const input: StepResultHashInput = {
+      org_id: run.org_id,
+      qhub_app_id: run.qhub_app_id,
+      agent_id: run.agent_id,
+      agent_version_id: run.agent_version_id,
+      release_candidate_id: run.release_candidate_id,
+      release_candidate_hash: run.release_candidate_hash,
+      manifest_hash: run.manifest_hash,
+      run_id: run.run_id,
+      runtime_provider_id: run.runtime_provider_id,
+      runtime_provider_version: run.runtime_provider_version,
+      step_index: step.step_index,
+      step_kind: step.step_kind,
+      action_type: step.action_type,
+      input_hash: step.input_hash,
+      decision: step.decision as string,
+      evaluation_id: step.evaluation_id,
+      action_request_id: ev?.action_request_id ?? null,
+      action_digest: ev?.action_digest ?? null,
+      policy_profile_id: ev?.policy_profile_id ?? null,
+      policy_profile_version: ev?.policy_profile_version ?? null,
+      policy_profile_hash: ev?.policy_profile_hash ?? null,
+      enforcement_plan_id: ev?.enforcement_plan_id ?? null,
+      enforcement_plan_version: ev?.enforcement_plan_version ?? null,
+      enforcement_plan_hash: ev?.enforcement_plan_hash ?? null,
+      receipt_id: step.receipt_id,
+      safe_result: step.safe_result as unknown as SafeResult,
+      previous_step_hash: step.previous_step_hash,
+    };
+
+    if (computeStepResultHash(input) !== step.result_hash) {
+      return { ok: false, reason: 'RESULT_HASH_MISMATCH', step_index: step.step_index };
+    }
+  }
+
+  return { ok: true };
 }
 
 /*

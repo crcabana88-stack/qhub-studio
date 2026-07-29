@@ -3,51 +3,71 @@
  * app/lib/qhub/agent/runtime/safe-result.ts
  *
  * The single strict, versioned schema for the server-generated `safe_result`
- * persisted on a finalized run step. A safe result carries ONLY the minimal,
- * non-sensitive execution summary the supervised runtime needs to reconstruct a
- * run — never raw prompts, chain-of-thought, customer records, credentials,
- * tokens, keys, cookies, authorization headers, or any secret.
+ * persisted on a finalized run step. A safe result carries ONLY a minimal,
+ * ENUM-CONSTRAINED, non-sensitive execution summary — never raw prompts,
+ * chain-of-thought, customer records, credentials, tokens, keys, cookies,
+ * authorization headers, or any secret.
  *
- * This module is the TypeScript half of an EQUIVALENT TS + PostgreSQL contract.
- * `20260728_agent_run_step_result_continuity.sql` implements the identical rules
- * in SQL (qhub_agent_safe_result_valid / qhub_agent_canonical_safe_result), and
- * adversarial fixtures in app/test/agent-safe-result.test.ts pin TS↔SQL parity.
+ * CONTENT CONTRACT (Codex hardening — Option 1, enum-only):
+ *   - `execution_status` is a controlled allowlist value (or null) — NOT free text.
+ *   - `safe_metadata` keys are a fixed allowlist; every value is a controlled enum
+ *     (outcome, result_kind), a bounded non-negative integer (record_count,
+ *     duration_ms, status_code), or a boolean (truncated).
+ *   - There are NO unrestricted free-form string fields, so the database does not
+ *     rely on content-scanning arbitrary strings for secrets: a secret literally
+ *     cannot be expressed in a valid safe_result.
+ *   - The runtime constructs safe results ONLY from these server-generated,
+ *     allowlisted, normalized values (see buildSafeResult / normalizeExecutionStatus).
  *
- * INVARIANTS (identical in SQL):
- *   - strict top-level allowlist: {execution_status, safe_metadata} only
- *   - no additional top-level properties
- *   - execution_status: bounded string or null
- *   - safe_metadata: object whose keys are drawn ONLY from SAFE_METADATA_KEYS
- *   - safe_metadata values: bounded string | safe integer | boolean | null only
- *       (no nested objects, no arrays, no floats — parity-safe scalars only)
- *   - bounded string and metadata lengths
- *   - canonical serialized size <= MAX_SAFE_RESULT_BYTES (16 KiB)
- *
- * The runtime provider MUST NEVER supply an unrestricted safe_result object; the
- * server builds one from an allowlisted execution summary and validates it here
- * (and again in the database) before it is ever persisted.
+ * This module is the TypeScript half of an EQUIVALENT TS + PostgreSQL contract;
+ * `20260728_agent_run_step_result_continuity.sql` implements identical rules in
+ * SQL (qhub_agent_safe_result_valid / qhub_agent_canonical_safe_result), and
+ * shared fixtures in app/test/agent-safe-result.test.ts pin TS↔SQL parity.
  */
 
 /** Versioned so the schema can evolve without silently accepting old shapes. */
 export const SAFE_RESULT_SCHEMA_VERSION = 'agent-safe-result-1.0.0';
 
-/** Maximum canonical serialized size of a safe result: 16 KiB. */
-export const MAX_SAFE_RESULT_BYTES = 16 * 1024;
+/**
+ * Defense-in-depth cap on the canonical serialized size. Because every field is
+ * enum/bounded-integer/boolean, a VALID safe result is small and cannot approach
+ * 16 KiB — the historical 16 KiB claim is intentionally dropped. MAX_SAFE_RESULT_BYTES
+ * is a hard ceiling well above the true maximum (see MAX_CANONICAL_SAFE_RESULT_BYTES).
+ */
+export const MAX_SAFE_RESULT_BYTES = 1024;
 
-/** Bounded lengths (bytes) for the individual scalar fields. */
-export const MAX_EXECUTION_STATUS_BYTES = 64;
-export const MAX_META_KEY_BYTES = 64;
-export const MAX_META_STRING_BYTES = 256;
+/** Controlled allowlist for execution_status (server-generated). */
+export const EXECUTION_STATUS_VALUES = [
+  'SUCCEEDED',
+  'FAILED',
+  'SIMULATED_SUCCESS',
+  'SIMULATED',
+  'EXECUTED',
+  'ALLOWED',
+  'DENIED',
+  'COMPLETED',
+  'UNKNOWN',
+] as const;
 
-/** Metadata integers are bounded to a parity-safe signed range. */
-export const MIN_SAFE_META_INT = -1_000_000_000_000;
-export const MAX_SAFE_META_INT = 1_000_000_000_000;
+/** Controlled allowlist for safe_metadata.outcome. */
+export const OUTCOME_VALUES = ['OK', 'ERROR', 'DISCREPANCY', 'NO_DISCREPANCY', 'PARTIAL', 'SKIPPED'] as const;
+
+/** Controlled allowlist for safe_metadata.result_kind. */
+export const RESULT_KIND_VALUES = ['SUMMARY', 'RECEIPT', 'SIMULATION', 'ANALYSIS', 'PROPOSAL'] as const;
+
+/** Bounded non-negative integer ranges for the numeric metadata keys. */
+export const MAX_RECORD_COUNT = 1_000_000_000;
+export const MAX_DURATION_MS = 1_000_000_000_000;
+export const MAX_STATUS_CODE = 599;
+
+export type ExecutionStatus = (typeof EXECUTION_STATUS_VALUES)[number];
+export type Outcome = (typeof OUTCOME_VALUES)[number];
+export type ResultKind = (typeof RESULT_KIND_VALUES)[number];
 
 /**
  * The FIXED allowlist of safe_metadata keys, in the canonical (sorted) order used
- * for serialization. Any key outside this set — including anything resembling a
- * raw prompt, secret, token, header, or customer record — is rejected. KEEP IN
- * SYNC with qhub_agent_canonical_safe_result / qhub_agent_safe_result_valid.
+ * for serialization. KEEP IN SYNC with qhub_agent_canonical_safe_result /
+ * qhub_agent_safe_result_valid.
  */
 export const SAFE_METADATA_KEYS = [
   'duration_ms',
@@ -60,15 +80,25 @@ export const SAFE_METADATA_KEYS = [
 
 export type SafeMetadataKey = (typeof SAFE_METADATA_KEYS)[number];
 
-export type SafeMetadataValue = string | number | boolean | null;
+export interface SafeMetadata {
+  duration_ms?: number | null;
+  outcome?: Outcome | null;
+  record_count?: number | null;
+  result_kind?: ResultKind | null;
+  status_code?: number | null;
+  truncated?: boolean | null;
+}
 
 export interface SafeResult {
-  execution_status: string | null;
-  safe_metadata?: Partial<Record<SafeMetadataKey, SafeMetadataValue>>;
+  execution_status: ExecutionStatus | null;
+  safe_metadata?: SafeMetadata;
 }
 
 const ALLOWED_TOP_LEVEL_KEYS: ReadonlySet<string> = new Set(['execution_status', 'safe_metadata']);
 const ALLOWED_META_KEYS: ReadonlySet<string> = new Set(SAFE_METADATA_KEYS);
+const EXECUTION_STATUS_SET: ReadonlySet<string> = new Set(EXECUTION_STATUS_VALUES);
+const OUTCOME_SET: ReadonlySet<string> = new Set(OUTCOME_VALUES);
+const RESULT_KIND_SET: ReadonlySet<string> = new Set(RESULT_KIND_VALUES);
 
 function byteLen(s: string): number {
   // Matches PostgreSQL octet_length(convert_to(s,'UTF8')).
@@ -78,14 +108,15 @@ function byteLen(s: string): number {
 export type SafeResultReason =
   | 'NOT_AN_OBJECT'
   | 'DISALLOWED_TOP_LEVEL_KEY'
-  | 'EXECUTION_STATUS_TYPE'
-  | 'EXECUTION_STATUS_TOO_LONG'
+  | 'EXECUTION_STATUS_NOT_ALLOWED'
   | 'SAFE_METADATA_TYPE'
   | 'DISALLOWED_METADATA_KEY'
-  | 'METADATA_KEY_TOO_LONG'
-  | 'METADATA_VALUE_TYPE'
-  | 'METADATA_STRING_TOO_LONG'
-  | 'METADATA_NUMBER_NOT_SAFE_INTEGER'
+  | 'OUTCOME_NOT_ALLOWED'
+  | 'RESULT_KIND_NOT_ALLOWED'
+  | 'RECORD_COUNT_OUT_OF_RANGE'
+  | 'DURATION_MS_OUT_OF_RANGE'
+  | 'STATUS_CODE_OUT_OF_RANGE'
+  | 'TRUNCATED_NOT_BOOLEAN'
   | 'CANONICAL_TOO_LARGE';
 
 export interface SafeResultValidation {
@@ -106,53 +137,70 @@ export function cell(value: string | null): string {
 }
 
 /**
- * Canonical text for one safe_metadata value. A leading type tag makes the
- * number 1, the string "1", and the boolean true impossible to confuse, and an
- * absent key is distinct from a present null. Floats are rejected upstream so the
- * integer rendering is byte-identical to PostgreSQL's.
+ * Canonical text for one safe_metadata value. A leading type tag makes an enum
+ * string, an integer, and a boolean impossible to confuse, and an absent key is
+ * distinct from a present null.
  */
-function metaValueText(present: boolean, value: SafeMetadataValue): string {
+function metaValueText(present: boolean, value: unknown): string {
   if (!present) {
     return 'absent';
   }
 
-  if (value === null) {
+  if (value === null || value === undefined) {
     return 'null';
-  }
-
-  if (typeof value === 'string') {
-    return `s:${value}`;
   }
 
   if (typeof value === 'boolean') {
     return `b:${value ? 'true' : 'false'}`;
   }
 
-  return `n:${value}`;
+  if (typeof value === 'number') {
+    return `n:${value}`;
+  }
+
+  return `s:${String(value)}`;
 }
 
 /**
- * The canonical serialization of a VALID safe result: schema version, the
- * execution status, and every allowlisted metadata key in fixed order (absent
- * keys explicitly marked). Deterministic and byte-identical to the SQL
+ * The canonical serialization of a VALID safe result. Byte-identical to the SQL
  * qhub_agent_canonical_safe_result(). Only call on a validated value.
  */
 export function canonicalSafeResult(safe: SafeResult): string {
-  const meta = safe.safe_metadata ?? {};
+  const meta = (safe.safe_metadata ?? {}) as Record<string, unknown>;
   let out = `V${cell(SAFE_RESULT_SCHEMA_VERSION)}` + cell(safe.execution_status ?? null);
 
   for (const key of SAFE_METADATA_KEYS) {
     const present = Object.prototype.hasOwnProperty.call(meta, key);
-    out += cell(metaValueText(present, present ? (meta[key] as SafeMetadataValue) : null));
+    out += cell(metaValueText(present, present ? meta[key] : null));
   }
 
   return out;
 }
 
+/** The exact maximum canonical byte-length a valid safe result can reach. */
+export const MAX_CANONICAL_SAFE_RESULT_BYTES = (() => {
+  const maximal: SafeResult = {
+    execution_status: 'SIMULATED_SUCCESS',
+    safe_metadata: {
+      duration_ms: MAX_DURATION_MS,
+      outcome: 'NO_DISCREPANCY',
+      record_count: MAX_RECORD_COUNT,
+      result_kind: 'SIMULATION',
+      status_code: MAX_STATUS_CODE,
+      truncated: true,
+    },
+  };
+
+  return byteLen(canonicalSafeResult(maximal));
+})();
+
+function isSafeInt(v: unknown, max: number): v is number {
+  return typeof v === 'number' && Number.isInteger(v) && v >= 0 && v <= max;
+}
+
 /**
- * Strictly validate an untrusted candidate against the safe-result contract.
- * Returns the canonical serialization on success so callers hash exactly what
- * was validated.
+ * Strictly validate an untrusted candidate against the enum-only safe-result
+ * contract. Returns the canonical serialization on success.
  */
 export function validateSafeResult(candidate: unknown): SafeResultValidation {
   if (!isPlainObject(candidate)) {
@@ -167,58 +215,74 @@ export function validateSafeResult(candidate: unknown): SafeResultValidation {
 
   const executionStatus = candidate.execution_status ?? null;
 
-  if (executionStatus !== null && typeof executionStatus !== 'string') {
-    return { ok: false, reason: 'EXECUTION_STATUS_TYPE' };
+  if (executionStatus !== null && (typeof executionStatus !== 'string' || !EXECUTION_STATUS_SET.has(executionStatus))) {
+    return { ok: false, reason: 'EXECUTION_STATUS_NOT_ALLOWED' };
   }
 
-  if (typeof executionStatus === 'string' && byteLen(executionStatus) > MAX_EXECUTION_STATUS_BYTES) {
-    return { ok: false, reason: 'EXECUTION_STATUS_TOO_LONG' };
-  }
-
+  const safe: SafeResult = { execution_status: executionStatus as ExecutionStatus | null };
   const rawMeta = candidate.safe_metadata;
-  const safe: SafeResult = { execution_status: executionStatus };
 
   if (rawMeta !== undefined) {
     if (!isPlainObject(rawMeta)) {
       return { ok: false, reason: 'SAFE_METADATA_TYPE' };
     }
 
-    const meta: Partial<Record<SafeMetadataKey, SafeMetadataValue>> = {};
+    const meta: SafeMetadata = {};
 
     for (const [key, value] of Object.entries(rawMeta)) {
       if (!ALLOWED_META_KEYS.has(key)) {
         return { ok: false, reason: 'DISALLOWED_METADATA_KEY' };
       }
 
-      if (byteLen(key) > MAX_META_KEY_BYTES) {
-        return { ok: false, reason: 'METADATA_KEY_TOO_LONG' };
-      }
-
-      if (value === null || typeof value === 'boolean') {
-        meta[key as SafeMetadataKey] = value;
+      if (value === null) {
+        (meta as Record<string, unknown>)[key] = null;
         continue;
       }
 
-      if (typeof value === 'string') {
-        if (byteLen(value) > MAX_META_STRING_BYTES) {
-          return { ok: false, reason: 'METADATA_STRING_TOO_LONG' };
-        }
+      switch (key as SafeMetadataKey) {
+        case 'outcome':
+          if (typeof value !== 'string' || !OUTCOME_SET.has(value)) {
+            return { ok: false, reason: 'OUTCOME_NOT_ALLOWED' };
+          }
 
-        meta[key as SafeMetadataKey] = value;
-        continue;
+          meta.outcome = value as Outcome;
+          break;
+        case 'result_kind':
+          if (typeof value !== 'string' || !RESULT_KIND_SET.has(value)) {
+            return { ok: false, reason: 'RESULT_KIND_NOT_ALLOWED' };
+          }
+
+          meta.result_kind = value as ResultKind;
+          break;
+        case 'record_count':
+          if (!isSafeInt(value, MAX_RECORD_COUNT)) {
+            return { ok: false, reason: 'RECORD_COUNT_OUT_OF_RANGE' };
+          }
+
+          meta.record_count = value;
+          break;
+        case 'duration_ms':
+          if (!isSafeInt(value, MAX_DURATION_MS)) {
+            return { ok: false, reason: 'DURATION_MS_OUT_OF_RANGE' };
+          }
+
+          meta.duration_ms = value;
+          break;
+        case 'status_code':
+          if (!isSafeInt(value, MAX_STATUS_CODE)) {
+            return { ok: false, reason: 'STATUS_CODE_OUT_OF_RANGE' };
+          }
+
+          meta.status_code = value;
+          break;
+        case 'truncated':
+          if (typeof value !== 'boolean') {
+            return { ok: false, reason: 'TRUNCATED_NOT_BOOLEAN' };
+          }
+
+          meta.truncated = value;
+          break;
       }
-
-      if (typeof value === 'number') {
-        if (!Number.isInteger(value) || value < MIN_SAFE_META_INT || value > MAX_SAFE_META_INT) {
-          return { ok: false, reason: 'METADATA_NUMBER_NOT_SAFE_INTEGER' };
-        }
-
-        meta[key as SafeMetadataKey] = value;
-        continue;
-      }
-
-      // objects, arrays, functions, symbols, bigints, undefined values → rejected
-      return { ok: false, reason: 'METADATA_VALUE_TYPE' };
     }
 
     safe.safe_metadata = meta;
@@ -233,35 +297,49 @@ export function validateSafeResult(candidate: unknown): SafeResultValidation {
   return { ok: true, canonical };
 }
 
+/** Coerce any input to an allowlisted execution_status (defaults to UNKNOWN). */
+export function normalizeExecutionStatus(value: unknown): ExecutionStatus {
+  return typeof value === 'string' && EXECUTION_STATUS_SET.has(value) ? (value as ExecutionStatus) : 'UNKNOWN';
+}
+
 /**
- * Build a safe result from an allowlisted execution summary. This is the ONLY
- * sanctioned construction path for the runtime — it drops any key not on the
- * allowlist rather than trusting a provider-supplied object.
+ * Build a safe result from a server-generated execution summary. The ONLY
+ * sanctioned construction path for the runtime: execution_status is normalized to
+ * the allowlist and metadata is dropped unless it is an allowlisted, in-range
+ * scalar. It is impossible to smuggle free-form or secret content through it.
  */
 export function buildSafeResult(input: {
-  execution_status: string | null;
+  execution_status: unknown;
   safe_metadata?: Record<string, unknown>;
 }): SafeResult {
-  const safe: SafeResult = { execution_status: input.execution_status };
+  const safe: SafeResult = { execution_status: normalizeExecutionStatus(input.execution_status) };
 
   if (input.safe_metadata) {
-    const meta: Partial<Record<SafeMetadataKey, SafeMetadataValue>> = {};
+    const meta: SafeMetadata = {};
+    const src = input.safe_metadata;
 
-    for (const key of SAFE_METADATA_KEYS) {
-      if (!Object.prototype.hasOwnProperty.call(input.safe_metadata, key)) {
-        continue;
-      }
+    if (typeof src.outcome === 'string' && OUTCOME_SET.has(src.outcome)) {
+      meta.outcome = src.outcome as Outcome;
+    }
 
-      const value = input.safe_metadata[key];
+    if (typeof src.result_kind === 'string' && RESULT_KIND_SET.has(src.result_kind)) {
+      meta.result_kind = src.result_kind as ResultKind;
+    }
 
-      if (
-        value === null ||
-        typeof value === 'boolean' ||
-        typeof value === 'string' ||
-        (typeof value === 'number' && Number.isInteger(value))
-      ) {
-        meta[key] = value as SafeMetadataValue;
-      }
+    if (isSafeInt(src.record_count, MAX_RECORD_COUNT)) {
+      meta.record_count = src.record_count;
+    }
+
+    if (isSafeInt(src.duration_ms, MAX_DURATION_MS)) {
+      meta.duration_ms = src.duration_ms;
+    }
+
+    if (isSafeInt(src.status_code, MAX_STATUS_CODE)) {
+      meta.status_code = src.status_code;
+    }
+
+    if (typeof src.truncated === 'boolean') {
+      meta.truncated = src.truncated;
     }
 
     if (Object.keys(meta).length > 0) {

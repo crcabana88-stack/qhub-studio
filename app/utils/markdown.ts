@@ -3,7 +3,6 @@ import remarkGfm from 'remark-gfm';
 import type { PluggableList, Plugin } from 'unified';
 import rehypeSanitize, { defaultSchema, type Options as RehypeSanitizeOptions } from 'rehype-sanitize';
 import { SKIP, visit } from 'unist-util-visit';
-import type { UnistNode, UnistParent } from 'node_modules/unist-util-visit/lib';
 
 export const allowedHTMLElements = [
   'a',
@@ -129,9 +128,17 @@ const limitedMarkdownPlugin: Plugin = () => {
   return (tree, file) => {
     const contents = file.toString();
 
-    visit(tree, (node: UnistNode, index, parent: UnistParent) => {
+    visit(tree, (rawNode, index, rawParent) => {
+      /*
+       * Minimal structural view of a unist node/parent (avoids a deep @types/unist
+       * import that pnpm does not hoist; behaviour is unchanged).
+       */
+      const node = rawNode as { type: string; position?: { start: { offset: number }; end: { offset: number } } };
+      const parent = rawParent as { children: unknown[] } | null | undefined;
+
       if (
         index == null ||
+        parent == null ||
         ['paragraph', 'text', 'inlineCode', 'code', 'strong', 'emphasis'].includes(node.type) ||
         !node.position
       ) {
@@ -147,7 +154,7 @@ const limitedMarkdownPlugin: Plugin = () => {
       parent.children[index] = {
         type: 'text',
         value,
-      } as any;
+      } as unknown;
 
       return [SKIP, index] as const;
     });
