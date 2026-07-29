@@ -3,7 +3,14 @@ import remarkGfm from 'remark-gfm';
 import type { PluggableList, Plugin } from 'unified';
 import rehypeSanitize, { defaultSchema, type Options as RehypeSanitizeOptions } from 'rehype-sanitize';
 import { SKIP, visit } from 'unist-util-visit';
-import type { UnistNode, UnistParent } from 'node_modules/unist-util-visit/lib';
+
+/*
+ * Minimal structural types for the unist nodes we touch below. The upstream type
+ * entrypoint is not resolvable in this workspace (pnpm does not hoist @types/unist),
+ * so we describe only the fields used here rather than importing a broken path.
+ */
+type UnistNode = { type: string; position?: { start: { offset?: number }; end: { offset?: number } } };
+type UnistParent = { children: unknown[] };
 
 export const allowedHTMLElements = [
   'a',
