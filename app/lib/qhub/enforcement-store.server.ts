@@ -13,6 +13,7 @@
  */
 
 import { createClient, type SupabaseClient } from '@supabase/supabase-js';
+import { commitEvaluationEvidence } from './evidence-authority.server';
 import type { EnforcementPlan, GatheredApproval } from './enforcement';
 
 function admin(env: Record<string, string | undefined>): SupabaseClient {
@@ -406,6 +407,18 @@ export async function markActionEvidence(
   state: 'COMMITTED' | 'FAILED',
   env: Record<string, string | undefined>,
 ): Promise<boolean> {
+  /*
+   * EVIDENCE-AUTHORITY BOUNDARY (R4): the general runtime (service_role) has NO
+   * database path to set action_event_state='COMMITTED' — a guard trigger rejects
+   * it. Committing evidence is the exclusive duty of the separate evidence
+   * authority (qhub_evidence_writer). We hand off the COMMITTED transition to that
+   * authority; if its credential is absent we FAIL CLOSED. Non-committal states
+   * (FAILED) remain a general-runtime update.
+   */
+  if (state === 'COMMITTED') {
+    return commitEvaluationEvidence(evaluationId, orgId, env);
+  }
+
   const sb = admin(env);
   const { data, error } = await sb
     .from('qhub_control_evaluations')

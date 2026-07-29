@@ -34,7 +34,7 @@ const SCHEMA_VERIFIER_RPC = 'qhub_verify_governance_schema';
  * Agent Framework schema — separate contract so Gate 04's stays stable.
  * KEEP IN SYNC with app/lib/qhub/agent/agent-schema-check.server.ts.
  */
-const EXPECTED_AGENT_SCHEMA_VERSION = '2026-07-29.agent-result-continuity-r3';
+const EXPECTED_AGENT_SCHEMA_VERSION = '2026-07-29.agent-result-continuity-r4';
 const AGENT_SCHEMA_VERIFIER_RPC = 'qhub_verify_agent_schema';
 
 /** @type {{table:string,column:string,migration:string}[]} */

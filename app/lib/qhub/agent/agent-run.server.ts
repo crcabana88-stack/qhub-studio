@@ -36,6 +36,7 @@ import {
   type PersistedEvaluation,
 } from './runtime/run-reconstruction';
 import { buildSafeResult, type SafeResult } from './runtime/safe-result';
+import { commitGovernedActionReceipt } from '~/lib/qhub/evidence-authority.server';
 import { assertBuildIntegrity } from '~/lib/qhub/build-integrity.server';
 import { getEvaluationById, gatherApprovals, getActivePlan } from '~/lib/qhub/enforcement-store.server';
 import { checkApprovalSet } from '~/lib/qhub/enforcement-decision';
@@ -433,6 +434,7 @@ async function driveRun(ctx: DriveContext): Promise<RunResult> {
         },
         decision.result,
         decision.receipt,
+        env,
       );
 
       if (!stepRecorded) {
@@ -505,6 +507,8 @@ interface ReceiptBindingInput {
   evidence_seq: number | null;
   committed_at: string;
   action_type: string;
+  action_request_id: string;
+  action_digest: string;
 }
 
 async function routeThroughGate04(
@@ -579,6 +583,8 @@ async function routeThroughGate04(
           evidence_seq: r.ledger_seq ?? null,
           committed_at: r.completed_at,
           action_type: r.action_type,
+          action_request_id: r.action_request_id,
+          action_digest: r.action_digest,
         }
       : null,
   };
@@ -661,36 +667,44 @@ async function persistStep(
   step: StepRecord,
   result: GovernedActionResult,
   receipt: ReceiptBindingInput | null,
+  env: Record<string, string | undefined>,
 ): Promise<boolean> {
   if (step.decision === 'REQUIRE_APPROVAL') {
     return recordPendingStep(sb, step);
   }
 
   /*
-   * Receipt-binding step (durable ledger append already succeeded inside Gate 04):
-   * persist the authoritative relational binding of the receipt + evidence
-   * commitment to this exact run/evaluation/action BEFORE terminal finalization.
-   * Idempotent on exact retry. If binding fails, do NOT finalize (fail closed).
+   * EVIDENCE-AUTHORITY commitment (R4): the general runtime CANNOT create a receipt
+   * binding. It hands off to the separate evidence authority (qhub_evidence_writer),
+   * which atomically marks evidence COMMITTED and inserts the immutable binding from
+   * the durable ledger append result — BEFORE terminal finalization. Idempotent on
+   * exact retry. If the authority commitment fails (or its credential is absent) we
+   * do NOT finalize (fail closed) — service_role has no path to fabricate it.
    */
-  if ((step.decision === 'EXECUTED' || step.decision === 'SIMULATED') && receipt) {
-    const bind = await sb.rpc('qhub_bind_governed_action_receipt', {
-      p_run_id: step.run_id,
-      p_org_id: step.org_id,
-      p_evaluation_id: step.evaluation_id,
-      p_decision: step.decision,
-      p_action_type: receipt.action_type,
-      p_receipt_id: receipt.receipt_id,
-      p_receipt_type: receipt.receipt_type,
-      p_receipt_schema_version: receipt.receipt_schema_version,
-      p_receipt_hash: receipt.receipt_hash,
-      p_evidence_chain_id: receipt.evidence_chain_id,
-      p_evidence_event_id: receipt.evidence_event_id,
-      p_evidence_event_hash: receipt.evidence_event_hash,
-      p_evidence_seq: receipt.evidence_seq,
-      p_committed_at: receipt.committed_at,
-    });
+  if ((step.decision === 'EXECUTED' || step.decision === 'SIMULATED') && receipt && step.evaluation_id) {
+    const committed = await commitGovernedActionReceipt(
+      {
+        run_id: step.run_id,
+        org_id: step.org_id,
+        evaluation_id: step.evaluation_id,
+        decision: step.decision,
+        action_type: receipt.action_type,
+        action_request_id: receipt.action_request_id,
+        action_digest: receipt.action_digest,
+        receipt_id: receipt.receipt_id,
+        receipt_type: receipt.receipt_type,
+        receipt_schema_version: receipt.receipt_schema_version,
+        receipt_hash: receipt.receipt_hash,
+        evidence_chain_id: receipt.evidence_chain_id,
+        evidence_event_id: receipt.evidence_event_id,
+        evidence_event_hash: receipt.evidence_event_hash,
+        evidence_seq: receipt.evidence_seq,
+        committed_at: receipt.committed_at,
+      },
+      env,
+    );
 
-    if (bind.error) {
+    if (!committed) {
       return false;
     }
   }
@@ -1138,6 +1152,7 @@ export async function resumeAgentRun(input: {
     },
     decision.result,
     decision.receipt,
+    env,
   );
 
   if (!recorded) {

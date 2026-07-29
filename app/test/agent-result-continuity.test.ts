@@ -138,27 +138,36 @@ interface BindOpts {
   org_id?: string;
 }
 
+/** Commit a receipt through the evidence AUTHORITY role (never service_role). */
 async function seedBinding(runId: string, evalId: string, o: BindOpts = {}): Promise<Record<string, unknown>> {
-  const r = await db.query<{ r: Record<string, unknown> }>(
-    `select public.qhub_bind_governed_action_receipt(
-       $1::uuid,$2::text,$3::uuid,$4::text,$5::text,$6::text,$7::text,$8::text,$9::text,$10::text,$11::text,$12::text,$13::bigint,$14::timestamptz) r`,
-    [
-      runId,
-      o.org_id ?? ORG,
-      evalId,
-      o.decision ?? 'EXECUTED',
-      o.action_type ?? 'CONNECTOR_ACTION',
-      o.receipt_id ?? 'rcpt_1',
-      o.receipt_type ?? 'SANDBOX',
-      'gate04-receipt-1.0.0',
-      o.receipt_hash ?? 'receipt_hash_1',
-      null,
-      o.evidence_event_id ?? 'evt_1',
-      o.evidence_event_hash ?? 'evt_hash_1',
-      1,
-      new Date().toISOString(),
-    ],
+  const ev = await db.query<{ ar: string; ad: string }>(
+    'select action_request_id ar, action_digest ad from public.qhub_control_evaluations where evaluation_id=$1',
+    [evalId],
   );
+  const call = () =>
+    db.query<{ r: Record<string, unknown> }>(
+      `select public.qhub_commit_governed_action_receipt(
+         $1::uuid,$2::text,$3::uuid,$4::text,$5::text,$6::uuid,$7::text,$8::text,$9::text,$10::text,$11::text,$12::text,$13::text,$14::text,$15::bigint,$16::timestamptz) r`,
+      [
+        runId,
+        o.org_id ?? ORG,
+        evalId,
+        o.decision ?? 'EXECUTED',
+        o.action_type ?? 'CONNECTOR_ACTION',
+        ev.rows[0].ar,
+        ev.rows[0].ad,
+        o.receipt_id ?? 'rcpt_1',
+        o.receipt_type ?? 'SANDBOX',
+        'gate04-receipt-1.0.0',
+        o.receipt_hash ?? 'receipt_hash_1',
+        null,
+        o.evidence_event_id ?? 'evt_1',
+        o.evidence_event_hash ?? 'evt_hash_1',
+        1,
+        '2026-07-29T00:00:00.000Z',
+      ],
+    );
+  const r = await asRole('qhub_evidence_writer', call);
 
   return r.rows[0].r;
 }
@@ -367,10 +376,17 @@ describe('finalization + valid path (tests 13, 14, 15, 21, 24)', () => {
 });
 
 describe('receipt-binding authority (tests 11-24)', () => {
-  it('rejects a fabricated receipt (uncommitted evidence) (tests 11, 18)', async () => {
+  it('the authority atomically sets COMMITTED + inserts the binding from NONE (tests 7, 18)', async () => {
     const run = await seedRun();
     const evalId = await seedEval({ action_event_state: 'NONE' });
-    await expect(seedBinding(run, evalId)).rejects.toThrow(/evidence is not COMMITTED/);
+    const out = await seedBinding(run, evalId, { receipt_id: 'r_commit' });
+    expect(out.committed).toBe(true);
+
+    const st = await db.query<{ s: string }>(
+      'select action_event_state s from public.qhub_control_evaluations where evaluation_id=$1',
+      [evalId],
+    );
+    expect(st.rows[0].s).toBe('COMMITTED');
   });
 
   it('rejects a cross-tenant receipt binding (test 14)', async () => {
@@ -409,7 +425,7 @@ describe('receipt-binding authority (tests 11-24)', () => {
     expect(again.idempotent).toBe(true);
     expect(again.binding_id).toBe(first.binding_id);
     await expect(seedBinding(run, evalId, { receipt_id: 'r_i2', evidence_event_hash: 'h2' })).rejects.toThrow(
-      /different receipt is already bound/,
+      /materially different receipt is already committed/,
     );
   });
 
@@ -572,30 +588,79 @@ describe('privilege-based authorization — no forgeable path (tests 1-6 receipt
 
   it('the guard trigger references no forgeable GUC gate', async () => {
     const src = await db.query<{ prosrc: string }>(
-      `select prosrc from pg_proc where oid='public.qhub_agent_run_step_guard()'::regprocedure`,
+      `select prosrc from pg_proc where oid='qhub_private.qhub_agent_run_step_guard()'::regprocedure`,
     );
     expect(src.rows[0].prosrc).not.toMatch(/current_setting|allow_finalize|set_config/);
   });
 
-  it('the finalize + bind RPCs work for service_role while direct writes do not', async () => {
+  it('EVIDENCE AUTHORITY: service_role cannot commit; the writer can; finalize is service_role (tests 1,2,7)', async () => {
     const run = await seedRun();
-    const evalId = await seedEval();
-    const out = await asRole('service_role', async () => {
-      await seedBinding(run, evalId, { receipt_id: 'r_svc' });
-      return finalize(run, { step_index: 0, evaluation_id: evalId, receipt_id: 'r_svc' });
+    const evalId = await seedEval({ action_event_state: 'NONE' });
+    const ar = await db.query<{ ar: string; ad: string }>(
+      'select action_request_id ar, action_digest ad from public.qhub_control_evaluations where evaluation_id=$1',
+      [evalId],
+    );
+    const commitArgs = [
+      run,
+      ORG,
+      evalId,
+      'EXECUTED',
+      'CONNECTOR_ACTION',
+      ar.rows[0].ar,
+      ar.rows[0].ad,
+      'r_auth',
+      'SANDBOX',
+      'gate04-receipt-1.0.0',
+      'rh',
+      null,
+      'evt',
+      'evth',
+      1,
+      new Date().toISOString(),
+    ];
+    const commitCall = () =>
+      db.query(
+        `select public.qhub_commit_governed_action_receipt($1::uuid,$2,$3::uuid,$4,$5,$6::uuid,$7,$8,$9,$10,$11,$12,$13,$14,$15::bigint,$16::timestamptz)`,
+        commitArgs,
+      );
+
+    // 1. service_role cannot set COMMITTED directly.
+    await asRole('service_role', async () => {
+      await expect(
+        db.query(`update public.qhub_control_evaluations set action_event_state='COMMITTED' where evaluation_id=$1`, [
+          evalId,
+        ]),
+      ).rejects.toThrow(/may only be set by the evidence authority/);
+
+      // 2. service_role cannot execute the commit RPC.
+      await expect(commitCall()).rejects.toThrow(/permission denied/i);
     });
+
+    // 7. the evidence writer commits atomically; then service_role finalizes.
+    await asRole('qhub_evidence_writer', commitCall);
+
+    const out = await asRole('service_role', () =>
+      finalize(run, { step_index: 0, evaluation_id: evalId, receipt_id: 'r_auth' }),
+    );
     expect(out.finalized).toBe(true);
   });
 
-  it('browser roles cannot execute helpers or the bind RPC', async () => {
-    const r = await db.query<{ a: boolean; b: boolean; c: boolean }>(
-      `select has_function_privilege('anon','public.qhub_agent_safe_result_valid(jsonb)','EXECUTE') a,
-              has_function_privilege('authenticated','public.qhub_bind_governed_action_receipt(uuid,text,uuid,text,text,text,text,text,text,text,text,text,bigint,timestamptz)','EXECUTE') b,
-              has_function_privilege('service_role','public.qhub_receipt_binding_immutable()','EXECUTE') c`,
+  it('service_role is not a member of qhub_evidence_writer (cannot inherit) (tests 3, 4)', async () => {
+    const r = await db.query<{ m: boolean }>(`select pg_has_role('service_role','qhub_evidence_writer','MEMBER') m`);
+    expect(r.rows[0].m).toBe(false);
+  });
+
+  it('browser + service roles cannot execute helpers or the commit RPC (tests 5, 6)', async () => {
+    const r = await db.query<{ a: boolean; b: boolean; c: boolean; d: boolean }>(
+      `select has_function_privilege('anon','qhub_private.qhub_agent_safe_result_valid(jsonb)','EXECUTE') a,
+              has_function_privilege('authenticated','public.qhub_commit_governed_action_receipt(uuid,text,uuid,text,text,uuid,text,text,text,text,text,text,text,text,bigint,timestamptz)','EXECUTE') b,
+              has_function_privilege('service_role','public.qhub_commit_governed_action_receipt(uuid,text,uuid,text,text,uuid,text,text,text,text,text,text,text,text,bigint,timestamptz)','EXECUTE') c,
+              has_function_privilege('service_role','qhub_private.qhub_receipt_binding_immutable()','EXECUTE') d`,
     );
     expect(r.rows[0].a).toBe(false);
     expect(r.rows[0].b).toBe(false);
     expect(r.rows[0].c).toBe(false);
+    expect(r.rows[0].d).toBe(false);
   });
 });
 
@@ -664,7 +729,7 @@ describe('verifier superset + drift + no-op (tests 25-36)', () => {
 
   it('reports READY at r3 and preserves foundation checks (test 36)', async () => {
     const v = await verify(db);
-    expect(v.expected_version).toBe('2026-07-29.agent-result-continuity-r3');
+    expect(v.expected_version).toBe('2026-07-29.agent-result-continuity-r4');
     expect(v.ready).toBe(true);
 
     for (const id of [
@@ -680,22 +745,22 @@ describe('verifier superset + drift + no-op (tests 25-36)', () => {
   const drifts: Array<[string, string, string]> = [
     [
       'helper owner drift (test 25)',
-      'ALTER FUNCTION public.qhub_agent_safe_result_valid(jsonb) OWNER TO service_role;',
+      'ALTER FUNCTION qhub_private.qhub_agent_safe_result_valid(jsonb) OWNER TO service_role;',
       'function.owners_pinned',
     ],
     [
       'helper search_path drift (test 26)',
-      'ALTER FUNCTION public.qhub_agent_safe_result_valid(jsonb) SET search_path = public;',
+      'ALTER FUNCTION qhub_private.qhub_agent_safe_result_valid(jsonb) SET search_path = public;',
       'function.search_paths_pinned',
     ],
     [
       'helper ACL drift (test 27)',
-      'GRANT EXECUTE ON FUNCTION public.qhub_agent_safe_result_valid(jsonb) TO anon;',
+      'GRANT EXECUTE ON FUNCTION qhub_private.qhub_agent_safe_result_valid(jsonb) TO anon;',
       'privilege.helpers_locked',
     ],
     [
       'helper body drift (test 28)',
-      'CREATE OR REPLACE FUNCTION public.qhub_agent_hash_intcell(v INT) RETURNS TEXT LANGUAGE sql IMMUTABLE SET search_path=pg_catalog,public AS $q$ SELECT $1::text $q$;',
+      'CREATE OR REPLACE FUNCTION qhub_private.qhub_agent_hash_intcell(v INT) RETURNS TEXT LANGUAGE sql IMMUTABLE SET search_path=pg_catalog,public AS $q$ SELECT $1::text $q$;',
       'function.bodies_pinned',
     ],
     [
@@ -771,7 +836,7 @@ describe('verifier superset + drift + no-op (tests 25-36)', () => {
 
     // Hand-mutate a pinned function body, then re-run the migration → it must abort.
     await d.exec(
-      'CREATE OR REPLACE FUNCTION public.qhub_agent_hash_intcell(v INT) RETURNS TEXT LANGUAGE sql IMMUTABLE SET search_path=pg_catalog,public AS $q$ SELECT $1::text $q$;',
+      'CREATE OR REPLACE FUNCTION qhub_private.qhub_agent_hash_intcell(v INT) RETURNS TEXT LANGUAGE sql IMMUTABLE SET search_path=pg_catalog,public AS $q$ SELECT $1::text $q$;',
     );
     await expect(d.exec(readFileSync(MIG(CONTINUITY), 'utf8'))).rejects.toThrow(/drift — aborting/);
     await d.close();

@@ -250,7 +250,11 @@ function fakeClient() {
   };
 
   const rpc = (fn: string, args: any) => {
-    if (fn === 'qhub_bind_governed_action_receipt') {
+    if (fn === 'qhub_commit_evaluation_evidence') {
+      return Promise.resolve({ data: { committed: true }, error: null });
+    }
+
+    if (fn === 'qhub_commit_governed_action_receipt') {
       const ev = evalFor(args.p_evaluation_id ?? null, args.p_org_id);
       const existing = STORE.bindings.find((b) => b.evaluation_id === args.p_evaluation_id);
 
@@ -260,11 +264,11 @@ function fakeClient() {
           receipt_id: args.p_receipt_id,
           run_id: args.p_run_id,
           org_id: args.p_org_id,
-          action_digest: ev?.action_digest ?? null,
+          action_digest: args.p_action_digest ?? ev?.action_digest ?? null,
         });
       }
 
-      return Promise.resolve({ data: { bound: true, receipt_id: args.p_receipt_id }, error: null });
+      return Promise.resolve({ data: { committed: true, receipt_id: args.p_receipt_id }, error: null });
     }
 
     if (fn === 'qhub_create_agent_run_step_pending') {
@@ -432,7 +436,11 @@ async function setupValidResume(inputs: any) {
   return ev;
 }
 
-const ENV = { SUPABASE_URL: 'https://p.supabase.co', SUPABASE_SERVICE_ROLE_KEY: 'k' };
+const ENV = {
+  SUPABASE_URL: 'https://p.supabase.co',
+  SUPABASE_SERVICE_ROLE_KEY: 'k',
+  SUPABASE_EVIDENCE_WRITER_KEY: 'ew',
+};
 const SESSION = { userId: 'user-1', orgId: 'client-smoke', role: 'owner' };
 
 function makeVersion(over: any = {}) {

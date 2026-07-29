@@ -59,7 +59,42 @@ ALTER TABLE public.qhub_agent_run_steps ADD COLUMN IF NOT EXISTS previous_step_h
 ALTER TABLE public.qhub_agent_run_steps ADD COLUMN IF NOT EXISTS finalized_at               TIMESTAMPTZ;
 ALTER TABLE public.qhub_agent_run_steps ADD COLUMN IF NOT EXISTS result_hash_schema_version TEXT;
 
--- ─── 2. Canonical-encoding primitives (SECURITY INVOKER; browser-denied) ─────
+-- ─── 1b. EVIDENCE-AUTHORITY TRUST BOUNDARY (R4) ──────────────────────────────
+-- The general QHub runtime (service_role) may request Gate 04 authorization and
+-- orchestrate runs, but CANNOT manufacture durable evidence, mark evidence
+-- COMMITTED, create receipt bindings, or finalize EXECUTED/SIMULATED without an
+-- authority-created binding. A distinct, NOLOGIN, ungranted role
+-- `qhub_evidence_writer` is the SOLE role permitted to execute the atomic evidence
+-- commitment RPCs. Only the separate Trust Spine / evidence-writer service is
+-- provisioned that credential in production (a later human checkpoint) — the
+-- general runtime process must never possess it. Privileged helper functions live
+-- in the private `qhub_private` schema (no Data API exposure, search_path never
+-- includes public), and public-schema CREATE is revoked from every client role so
+-- no privileged search_path can be shadowed.
+DO $$
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'qhub_evidence_writer') THEN
+    CREATE ROLE qhub_evidence_writer NOLOGIN;
+  END IF;
+  IF NOT EXISTS (SELECT 1 FROM pg_namespace WHERE nspname = 'qhub_private') THEN
+    CREATE SCHEMA qhub_private;
+  END IF;
+  -- Public CREATE lockdown (idempotent-guarded).
+  IF has_schema_privilege('service_role', 'public', 'CREATE')
+     OR has_schema_privilege('anon', 'public', 'CREATE')
+     OR has_schema_privilege('authenticated', 'public', 'CREATE') THEN
+    REVOKE CREATE ON SCHEMA public FROM PUBLIC, anon, authenticated, service_role;
+  END IF;
+  -- qhub_private is owner-only (public wrappers run as owner; no client USAGE).
+  IF has_schema_privilege('service_role', 'qhub_private', 'USAGE')
+     OR has_schema_privilege('anon', 'qhub_private', 'USAGE')
+     OR has_schema_privilege('authenticated', 'qhub_private', 'USAGE') THEN
+    REVOKE ALL ON SCHEMA qhub_private FROM PUBLIC, anon, authenticated, service_role;
+  END IF;
+END
+$$;
+
+-- ─── 2. Canonical-encoding primitives (private; browser+service_role denied) ──
 -- cell(v) = '<utf8-byte-length>:<v>;'  |  '-1:;' for NULL. Byte-identical to the
 -- TypeScript `cell` in app/lib/qhub/agent/runtime/safe-result.ts.
 DO $mig$
@@ -67,23 +102,23 @@ DECLARE b text := $body$
   SELECT CASE WHEN v IS NULL THEN '-1:;' ELSE octet_length(v)::text || ':' || v || ';' END
 $body$;
 BEGIN
-  IF to_regprocedure('public.qhub_agent_hash_cell(text)') IS NULL THEN
-    EXECUTE format($ddl$CREATE FUNCTION public.qhub_agent_hash_cell(v TEXT) RETURNS TEXT
-      LANGUAGE sql IMMUTABLE SET search_path = pg_catalog, public AS %L$ddl$, b);
-  ELSIF (SELECT prosrc FROM pg_proc WHERE oid = 'public.qhub_agent_hash_cell(text)'::regprocedure) IS DISTINCT FROM b THEN
+  IF to_regprocedure('qhub_private.qhub_agent_hash_cell(text)') IS NULL THEN
+    EXECUTE format($ddl$CREATE FUNCTION qhub_private.qhub_agent_hash_cell(v TEXT) RETURNS TEXT
+      LANGUAGE sql IMMUTABLE SET search_path = pg_catalog, qhub_private AS %L$ddl$, b);
+  ELSIF (SELECT prosrc FROM pg_proc WHERE oid = 'qhub_private.qhub_agent_hash_cell(text)'::regprocedure) IS DISTINCT FROM b THEN
     RAISE EXCEPTION 'qhub_agent_hash_cell drift — aborting rather than replacing';
   END IF;
 END $mig$;
 
 DO $mig$
 DECLARE b text := $body$
-  SELECT public.qhub_agent_hash_cell(CASE WHEN v IS NULL THEN NULL ELSE v::text END)
+  SELECT qhub_private.qhub_agent_hash_cell(CASE WHEN v IS NULL THEN NULL ELSE v::text END)
 $body$;
 BEGIN
-  IF to_regprocedure('public.qhub_agent_hash_intcell(int)') IS NULL THEN
-    EXECUTE format($ddl$CREATE FUNCTION public.qhub_agent_hash_intcell(v INT) RETURNS TEXT
-      LANGUAGE sql IMMUTABLE SET search_path = pg_catalog, public AS %L$ddl$, b);
-  ELSIF (SELECT prosrc FROM pg_proc WHERE oid = 'public.qhub_agent_hash_intcell(int)'::regprocedure) IS DISTINCT FROM b THEN
+  IF to_regprocedure('qhub_private.qhub_agent_hash_intcell(int)') IS NULL THEN
+    EXECUTE format($ddl$CREATE FUNCTION qhub_private.qhub_agent_hash_intcell(v INT) RETURNS TEXT
+      LANGUAGE sql IMMUTABLE SET search_path = pg_catalog, qhub_private AS %L$ddl$, b);
+  ELSIF (SELECT prosrc FROM pg_proc WHERE oid = 'qhub_private.qhub_agent_hash_intcell(int)'::regprocedure) IS DISTINCT FROM b THEN
     RAISE EXCEPTION 'qhub_agent_hash_intcell drift — aborting rather than replacing';
   END IF;
 END $mig$;
@@ -96,8 +131,8 @@ DECLARE
   meta JSONB := sr -> 'safe_metadata';
   keys TEXT[] := ARRAY['duration_ms','outcome','record_count','result_kind','status_code','truncated'];
   k    TEXT;
-  out  TEXT := 'V' || public.qhub_agent_hash_cell('agent-safe-result-1.0.0')
-               || public.qhub_agent_hash_cell(sr ->> 'execution_status');
+  out  TEXT := 'V' || qhub_private.qhub_agent_hash_cell('agent-safe-result-1.0.0')
+               || qhub_private.qhub_agent_hash_cell(sr ->> 'execution_status');
   tv   TEXT;
 BEGIN
   FOREACH k IN ARRAY keys LOOP
@@ -112,16 +147,16 @@ BEGIN
     ELSE
       tv := 's:' || (meta ->> k);
     END IF;
-    out := out || public.qhub_agent_hash_cell(tv);
+    out := out || qhub_private.qhub_agent_hash_cell(tv);
   END LOOP;
   RETURN out;
 END
 $body$;
 BEGIN
-  IF to_regprocedure('public.qhub_agent_canonical_safe_result(jsonb)') IS NULL THEN
-    EXECUTE format($ddl$CREATE FUNCTION public.qhub_agent_canonical_safe_result(sr JSONB) RETURNS TEXT
-      LANGUAGE plpgsql IMMUTABLE SET search_path = pg_catalog, public AS %L$ddl$, b);
-  ELSIF (SELECT prosrc FROM pg_proc WHERE oid = 'public.qhub_agent_canonical_safe_result(jsonb)'::regprocedure) IS DISTINCT FROM b THEN
+  IF to_regprocedure('qhub_private.qhub_agent_canonical_safe_result(jsonb)') IS NULL THEN
+    EXECUTE format($ddl$CREATE FUNCTION qhub_private.qhub_agent_canonical_safe_result(sr JSONB) RETURNS TEXT
+      LANGUAGE plpgsql IMMUTABLE SET search_path = pg_catalog, qhub_private AS %L$ddl$, b);
+  ELSIF (SELECT prosrc FROM pg_proc WHERE oid = 'qhub_private.qhub_agent_canonical_safe_result(jsonb)'::regprocedure) IS DISTINCT FROM b THEN
     RAISE EXCEPTION 'qhub_agent_canonical_safe_result drift — aborting rather than replacing';
   END IF;
 END $mig$;
@@ -180,15 +215,15 @@ BEGIN
     END LOOP;
   END IF;
 
-  IF octet_length(public.qhub_agent_canonical_safe_result(sr)) > 1024 THEN RETURN FALSE; END IF;
+  IF octet_length(qhub_private.qhub_agent_canonical_safe_result(sr)) > 1024 THEN RETURN FALSE; END IF;
   RETURN TRUE;
 END
 $body$;
 BEGIN
-  IF to_regprocedure('public.qhub_agent_safe_result_valid(jsonb)') IS NULL THEN
-    EXECUTE format($ddl$CREATE FUNCTION public.qhub_agent_safe_result_valid(sr JSONB) RETURNS BOOLEAN
-      LANGUAGE plpgsql IMMUTABLE SET search_path = pg_catalog, public AS %L$ddl$, b);
-  ELSIF (SELECT prosrc FROM pg_proc WHERE oid = 'public.qhub_agent_safe_result_valid(jsonb)'::regprocedure) IS DISTINCT FROM b THEN
+  IF to_regprocedure('qhub_private.qhub_agent_safe_result_valid(jsonb)') IS NULL THEN
+    EXECUTE format($ddl$CREATE FUNCTION qhub_private.qhub_agent_safe_result_valid(sr JSONB) RETURNS BOOLEAN
+      LANGUAGE plpgsql IMMUTABLE SET search_path = pg_catalog, qhub_private AS %L$ddl$, b);
+  ELSIF (SELECT prosrc FROM pg_proc WHERE oid = 'qhub_private.qhub_agent_safe_result_valid(jsonb)'::regprocedure) IS DISTINCT FROM b THEN
     RAISE EXCEPTION 'qhub_agent_safe_result_valid drift — aborting rather than replacing';
   END IF;
 END $mig$;
@@ -197,48 +232,48 @@ END $mig$;
 DO $mig$
 DECLARE b text := $body$
   SELECT encode(sha256(convert_to(
-    public.qhub_agent_hash_cell('agent-step-result-1.0.0')
-    || public.qhub_agent_hash_cell(p_org_id)
-    || public.qhub_agent_hash_cell(p_qhub_app_id)
-    || public.qhub_agent_hash_cell(p_agent_id)
-    || public.qhub_agent_hash_cell(p_agent_version_id)
-    || public.qhub_agent_hash_cell(p_release_candidate_id)
-    || public.qhub_agent_hash_cell(p_release_candidate_hash)
-    || public.qhub_agent_hash_cell(p_manifest_hash)
-    || public.qhub_agent_hash_cell(p_run_id)
-    || public.qhub_agent_hash_cell(p_runtime_provider_id)
-    || public.qhub_agent_hash_cell(p_runtime_provider_version)
-    || public.qhub_agent_hash_intcell(p_step_index)
-    || public.qhub_agent_hash_cell(p_step_kind)
-    || public.qhub_agent_hash_cell(p_action_type)
-    || public.qhub_agent_hash_cell(p_input_hash)
-    || public.qhub_agent_hash_cell(p_decision)
-    || public.qhub_agent_hash_cell(p_evaluation_id)
-    || public.qhub_agent_hash_cell(p_action_request_id)
-    || public.qhub_agent_hash_cell(p_action_digest)
-    || public.qhub_agent_hash_cell(p_policy_profile_id)
-    || public.qhub_agent_hash_intcell(p_policy_profile_version)
-    || public.qhub_agent_hash_cell(p_policy_profile_hash)
-    || public.qhub_agent_hash_cell(p_enforcement_plan_id)
-    || public.qhub_agent_hash_intcell(p_enforcement_plan_version)
-    || public.qhub_agent_hash_cell(p_enforcement_plan_hash)
-    || public.qhub_agent_hash_cell(p_receipt_id)
-    || public.qhub_agent_hash_cell(CASE WHEN p_safe_result IS NULL THEN NULL
-                                        ELSE public.qhub_agent_canonical_safe_result(p_safe_result) END)
-    || public.qhub_agent_hash_cell(p_previous_step_hash)
+    qhub_private.qhub_agent_hash_cell('agent-step-result-1.0.0')
+    || qhub_private.qhub_agent_hash_cell(p_org_id)
+    || qhub_private.qhub_agent_hash_cell(p_qhub_app_id)
+    || qhub_private.qhub_agent_hash_cell(p_agent_id)
+    || qhub_private.qhub_agent_hash_cell(p_agent_version_id)
+    || qhub_private.qhub_agent_hash_cell(p_release_candidate_id)
+    || qhub_private.qhub_agent_hash_cell(p_release_candidate_hash)
+    || qhub_private.qhub_agent_hash_cell(p_manifest_hash)
+    || qhub_private.qhub_agent_hash_cell(p_run_id)
+    || qhub_private.qhub_agent_hash_cell(p_runtime_provider_id)
+    || qhub_private.qhub_agent_hash_cell(p_runtime_provider_version)
+    || qhub_private.qhub_agent_hash_intcell(p_step_index)
+    || qhub_private.qhub_agent_hash_cell(p_step_kind)
+    || qhub_private.qhub_agent_hash_cell(p_action_type)
+    || qhub_private.qhub_agent_hash_cell(p_input_hash)
+    || qhub_private.qhub_agent_hash_cell(p_decision)
+    || qhub_private.qhub_agent_hash_cell(p_evaluation_id)
+    || qhub_private.qhub_agent_hash_cell(p_action_request_id)
+    || qhub_private.qhub_agent_hash_cell(p_action_digest)
+    || qhub_private.qhub_agent_hash_cell(p_policy_profile_id)
+    || qhub_private.qhub_agent_hash_intcell(p_policy_profile_version)
+    || qhub_private.qhub_agent_hash_cell(p_policy_profile_hash)
+    || qhub_private.qhub_agent_hash_cell(p_enforcement_plan_id)
+    || qhub_private.qhub_agent_hash_intcell(p_enforcement_plan_version)
+    || qhub_private.qhub_agent_hash_cell(p_enforcement_plan_hash)
+    || qhub_private.qhub_agent_hash_cell(p_receipt_id)
+    || qhub_private.qhub_agent_hash_cell(CASE WHEN p_safe_result IS NULL THEN NULL
+                                        ELSE qhub_private.qhub_agent_canonical_safe_result(p_safe_result) END)
+    || qhub_private.qhub_agent_hash_cell(p_previous_step_hash)
   , 'UTF8')), 'hex')
 $body$;
 BEGIN
-  IF to_regprocedure('public.qhub_agent_step_result_hash(text,text,text,text,text,text,text,text,text,text,int,text,text,text,text,text,text,text,text,int,text,text,int,text,text,jsonb,text)') IS NULL THEN
-    EXECUTE format($ddl$CREATE FUNCTION public.qhub_agent_step_result_hash(
+  IF to_regprocedure('qhub_private.qhub_agent_step_result_hash(text,text,text,text,text,text,text,text,text,text,int,text,text,text,text,text,text,text,text,int,text,text,int,text,text,jsonb,text)') IS NULL THEN
+    EXECUTE format($ddl$CREATE FUNCTION qhub_private.qhub_agent_step_result_hash(
       p_org_id TEXT, p_qhub_app_id TEXT, p_agent_id TEXT, p_agent_version_id TEXT, p_release_candidate_id TEXT,
       p_release_candidate_hash TEXT, p_manifest_hash TEXT, p_run_id TEXT, p_runtime_provider_id TEXT,
       p_runtime_provider_version TEXT, p_step_index INT, p_step_kind TEXT, p_action_type TEXT, p_input_hash TEXT,
       p_decision TEXT, p_evaluation_id TEXT, p_action_request_id TEXT, p_action_digest TEXT, p_policy_profile_id TEXT,
       p_policy_profile_version INT, p_policy_profile_hash TEXT, p_enforcement_plan_id TEXT, p_enforcement_plan_version INT,
       p_enforcement_plan_hash TEXT, p_receipt_id TEXT, p_safe_result JSONB, p_previous_step_hash TEXT)
-      RETURNS TEXT LANGUAGE sql IMMUTABLE SET search_path = pg_catalog, public AS %L$ddl$, b);
-  ELSIF (SELECT prosrc FROM pg_proc WHERE oid = 'public.qhub_agent_step_result_hash(text,text,text,text,text,text,text,text,text,text,int,text,text,text,text,text,text,text,text,int,text,text,int,text,text,jsonb,text)'::regprocedure) IS DISTINCT FROM b THEN
+      RETURNS TEXT LANGUAGE sql IMMUTABLE SET search_path = pg_catalog, qhub_private AS %L$ddl$, b);
+  ELSIF (SELECT prosrc FROM pg_proc WHERE oid = 'qhub_private.qhub_agent_step_result_hash(text,text,text,text,text,text,text,text,text,text,int,text,text,text,text,text,text,text,text,int,text,text,int,text,text,jsonb,text)'::regprocedure) IS DISTINCT FROM b THEN
     RAISE EXCEPTION 'qhub_agent_step_result_hash drift — aborting rather than replacing';
   END IF;
 END $mig$;
@@ -271,7 +306,7 @@ BEGIN
     IF NOT FOUND THEN RAISE EXCEPTION 'qhub_compute_agent_step_result_hash: evaluation % not found', p_evaluation_id; END IF;
   END IF;
 
-  RETURN public.qhub_agent_step_result_hash(
+  RETURN qhub_private.qhub_agent_step_result_hash(
     r.org_id, r.qhub_app_id::text, r.agent_id::text, r.agent_version_id::text,
     r.release_candidate_id::text, r.release_candidate_hash, v_manifest_hash,
     p_run_id::text, r.runtime_provider, r.runtime_provider_version,
@@ -282,12 +317,12 @@ BEGIN
 END
 $body$;
 BEGIN
-  IF to_regprocedure('public.qhub_compute_agent_step_result_hash(uuid,int,jsonb,text,text,text,text,text,uuid,text)') IS NULL THEN
-    EXECUTE format($ddl$CREATE FUNCTION public.qhub_compute_agent_step_result_hash(
+  IF to_regprocedure('qhub_private.qhub_compute_agent_step_result_hash(uuid,int,jsonb,text,text,text,text,text,uuid,text)') IS NULL THEN
+    EXECUTE format($ddl$CREATE FUNCTION qhub_private.qhub_compute_agent_step_result_hash(
       p_run_id UUID, p_step_index INT, p_safe_result JSONB, p_previous_step_hash TEXT, p_decision TEXT,
       p_input_hash TEXT, p_step_kind TEXT, p_action_type TEXT, p_evaluation_id UUID, p_receipt_id TEXT)
-      RETURNS TEXT LANGUAGE plpgsql STABLE SECURITY DEFINER SET search_path = pg_catalog, public AS %L$ddl$, b);
-  ELSIF (SELECT prosrc FROM pg_proc WHERE oid = 'public.qhub_compute_agent_step_result_hash(uuid,int,jsonb,text,text,text,text,text,uuid,text)'::regprocedure) IS DISTINCT FROM b THEN
+      RETURNS TEXT LANGUAGE plpgsql STABLE SECURITY DEFINER SET search_path = pg_catalog, qhub_private AS %L$ddl$, b);
+  ELSIF (SELECT prosrc FROM pg_proc WHERE oid = 'qhub_private.qhub_compute_agent_step_result_hash(uuid,int,jsonb,text,text,text,text,text,uuid,text)'::regprocedure) IS DISTINCT FROM b THEN
     RAISE EXCEPTION 'qhub_compute_agent_step_result_hash drift — aborting rather than replacing';
   END IF;
 END $mig$;
@@ -336,7 +371,7 @@ BEGIN
     IF NEW.finalized_at IS NULL OR NEW.result_hash_schema_version IS DISTINCT FROM 'agent-step-result-1.0.0' THEN
       RAISE EXCEPTION 'qhub_agent_run_steps: finalized row requires finalized_at + result_hash_schema_version';
     END IF;
-    IF NEW.safe_result IS NULL OR NOT public.qhub_agent_safe_result_valid(NEW.safe_result) THEN
+    IF NEW.safe_result IS NULL OR NOT qhub_private.qhub_agent_safe_result_valid(NEW.safe_result) THEN
       RAISE EXCEPTION 'qhub_agent_run_steps: finalized row requires a valid strict safe_result';
     END IF;
     IF NEW.decision IN ('EXECUTED','SIMULATED') AND NEW.receipt_id IS NULL THEN
@@ -369,7 +404,7 @@ BEGIN
       END IF;
     END IF;
 
-    recomputed := public.qhub_compute_agent_step_result_hash(
+    recomputed := qhub_private.qhub_compute_agent_step_result_hash(
       NEW.run_id, NEW.step_index, NEW.safe_result, NEW.previous_step_hash, NEW.decision,
       NEW.input_hash, NEW.step_kind, NEW.action_type, NEW.evaluation_id, NEW.receipt_id);
     IF NEW.result_hash IS DISTINCT FROM recomputed THEN
@@ -392,10 +427,10 @@ BEGIN
 END
 $body$;
 BEGIN
-  IF to_regprocedure('public.qhub_agent_run_step_guard()') IS NULL THEN
-    EXECUTE format($ddl$CREATE FUNCTION public.qhub_agent_run_step_guard() RETURNS TRIGGER
-      LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, public AS %L$ddl$, b);
-  ELSIF (SELECT prosrc FROM pg_proc WHERE oid = 'public.qhub_agent_run_step_guard()'::regprocedure) IS DISTINCT FROM b THEN
+  IF to_regprocedure('qhub_private.qhub_agent_run_step_guard()') IS NULL THEN
+    EXECUTE format($ddl$CREATE FUNCTION qhub_private.qhub_agent_run_step_guard() RETURNS TRIGGER
+      LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, qhub_private AS %L$ddl$, b);
+  ELSIF (SELECT prosrc FROM pg_proc WHERE oid = 'qhub_private.qhub_agent_run_step_guard()'::regprocedure) IS DISTINCT FROM b THEN
     RAISE EXCEPTION 'qhub_agent_run_step_guard drift — aborting rather than replacing';
   END IF;
 END $mig$;
@@ -405,11 +440,11 @@ BEGIN
   IF NOT EXISTS (SELECT 1 FROM pg_trigger WHERE tgname='trg_qhub_agent_run_step_guard'
                  AND tgrelid='public.qhub_agent_run_steps'::regclass AND NOT tgisinternal) THEN
     CREATE TRIGGER trg_qhub_agent_run_step_guard BEFORE INSERT OR UPDATE ON public.qhub_agent_run_steps
-      FOR EACH ROW EXECUTE FUNCTION public.qhub_agent_run_step_guard();
+      FOR EACH ROW EXECUTE FUNCTION qhub_private.qhub_agent_run_step_guard();
   ELSIF NOT EXISTS (SELECT 1 FROM pg_trigger WHERE tgname='trg_qhub_agent_run_step_guard'
                  AND tgrelid='public.qhub_agent_run_steps'::regclass AND NOT tgisinternal
                  AND tgtype = 23 AND tgenabled = 'O'
-                 AND tgfoid = 'public.qhub_agent_run_step_guard()'::regprocedure) THEN
+                 AND tgfoid = 'qhub_private.qhub_agent_run_step_guard()'::regprocedure) THEN
     RAISE EXCEPTION 'trg_qhub_agent_run_step_guard exists but does not match expected timing/events/function/enabled';
   END IF;
 END $$;
@@ -441,10 +476,10 @@ BEGIN
 END
 $body$;
 BEGIN
-  IF to_regprocedure('public.qhub_agent_run_identity_guard()') IS NULL THEN
-    EXECUTE format($ddl$CREATE FUNCTION public.qhub_agent_run_identity_guard() RETURNS TRIGGER
-      LANGUAGE plpgsql SET search_path = pg_catalog, public AS %L$ddl$, b);
-  ELSIF (SELECT prosrc FROM pg_proc WHERE oid = 'public.qhub_agent_run_identity_guard()'::regprocedure) IS DISTINCT FROM b THEN
+  IF to_regprocedure('qhub_private.qhub_agent_run_identity_guard()') IS NULL THEN
+    EXECUTE format($ddl$CREATE FUNCTION qhub_private.qhub_agent_run_identity_guard() RETURNS TRIGGER
+      LANGUAGE plpgsql SET search_path = pg_catalog, qhub_private AS %L$ddl$, b);
+  ELSIF (SELECT prosrc FROM pg_proc WHERE oid = 'qhub_private.qhub_agent_run_identity_guard()'::regprocedure) IS DISTINCT FROM b THEN
     RAISE EXCEPTION 'qhub_agent_run_identity_guard drift — aborting rather than replacing';
   END IF;
 END $mig$;
@@ -454,11 +489,11 @@ BEGIN
   IF NOT EXISTS (SELECT 1 FROM pg_trigger WHERE tgname='trg_qhub_agent_run_identity_guard'
                  AND tgrelid='public.qhub_agent_runs'::regclass AND NOT tgisinternal) THEN
     CREATE TRIGGER trg_qhub_agent_run_identity_guard BEFORE UPDATE ON public.qhub_agent_runs
-      FOR EACH ROW EXECUTE FUNCTION public.qhub_agent_run_identity_guard();
+      FOR EACH ROW EXECUTE FUNCTION qhub_private.qhub_agent_run_identity_guard();
   ELSIF NOT EXISTS (SELECT 1 FROM pg_trigger WHERE tgname='trg_qhub_agent_run_identity_guard'
                  AND tgrelid='public.qhub_agent_runs'::regclass AND NOT tgisinternal
                  AND tgtype = 19 AND tgenabled = 'O'
-                 AND tgfoid = 'public.qhub_agent_run_identity_guard()'::regprocedure) THEN
+                 AND tgfoid = 'qhub_private.qhub_agent_run_identity_guard()'::regprocedure) THEN
     RAISE EXCEPTION 'trg_qhub_agent_run_identity_guard exists but does not match expected timing/events/function/enabled';
   END IF;
 END $$;
@@ -474,10 +509,10 @@ BEGIN
 END
 $body$;
 BEGIN
-  IF to_regprocedure('public.qhub_agent_version_manifest_guard()') IS NULL THEN
-    EXECUTE format($ddl$CREATE FUNCTION public.qhub_agent_version_manifest_guard() RETURNS TRIGGER
-      LANGUAGE plpgsql SET search_path = pg_catalog, public AS %L$ddl$, b);
-  ELSIF (SELECT prosrc FROM pg_proc WHERE oid = 'public.qhub_agent_version_manifest_guard()'::regprocedure) IS DISTINCT FROM b THEN
+  IF to_regprocedure('qhub_private.qhub_agent_version_manifest_guard()') IS NULL THEN
+    EXECUTE format($ddl$CREATE FUNCTION qhub_private.qhub_agent_version_manifest_guard() RETURNS TRIGGER
+      LANGUAGE plpgsql SET search_path = pg_catalog, qhub_private AS %L$ddl$, b);
+  ELSIF (SELECT prosrc FROM pg_proc WHERE oid = 'qhub_private.qhub_agent_version_manifest_guard()'::regprocedure) IS DISTINCT FROM b THEN
     RAISE EXCEPTION 'qhub_agent_version_manifest_guard drift — aborting rather than replacing';
   END IF;
 END $mig$;
@@ -487,11 +522,11 @@ BEGIN
   IF NOT EXISTS (SELECT 1 FROM pg_trigger WHERE tgname='trg_qhub_agent_version_manifest_guard'
                  AND tgrelid='public.qhub_agent_versions'::regclass AND NOT tgisinternal) THEN
     CREATE TRIGGER trg_qhub_agent_version_manifest_guard BEFORE UPDATE ON public.qhub_agent_versions
-      FOR EACH ROW EXECUTE FUNCTION public.qhub_agent_version_manifest_guard();
+      FOR EACH ROW EXECUTE FUNCTION qhub_private.qhub_agent_version_manifest_guard();
   ELSIF NOT EXISTS (SELECT 1 FROM pg_trigger WHERE tgname='trg_qhub_agent_version_manifest_guard'
                  AND tgrelid='public.qhub_agent_versions'::regclass AND NOT tgisinternal
                  AND tgtype = 19 AND tgenabled = 'O'
-                 AND tgfoid = 'public.qhub_agent_version_manifest_guard()'::regprocedure) THEN
+                 AND tgfoid = 'qhub_private.qhub_agent_version_manifest_guard()'::regprocedure) THEN
     RAISE EXCEPTION 'trg_qhub_agent_version_manifest_guard exists but does not match expected timing/events/function/enabled';
   END IF;
 END $$;
@@ -556,10 +591,10 @@ BEGIN
 END
 $body$;
 BEGIN
-  IF to_regprocedure('public.qhub_receipt_binding_immutable()') IS NULL THEN
-    EXECUTE format($ddl$CREATE FUNCTION public.qhub_receipt_binding_immutable() RETURNS TRIGGER
-      LANGUAGE plpgsql SET search_path = pg_catalog, public AS %L$ddl$, b);
-  ELSIF (SELECT prosrc FROM pg_proc WHERE oid = 'public.qhub_receipt_binding_immutable()'::regprocedure) IS DISTINCT FROM b THEN
+  IF to_regprocedure('qhub_private.qhub_receipt_binding_immutable()') IS NULL THEN
+    EXECUTE format($ddl$CREATE FUNCTION qhub_private.qhub_receipt_binding_immutable() RETURNS TRIGGER
+      LANGUAGE plpgsql SET search_path = pg_catalog, qhub_private AS %L$ddl$, b);
+  ELSIF (SELECT prosrc FROM pg_proc WHERE oid = 'qhub_private.qhub_receipt_binding_immutable()'::regprocedure) IS DISTINCT FROM b THEN
     RAISE EXCEPTION 'qhub_receipt_binding_immutable drift — aborting rather than replacing';
   END IF;
 END $mig$;
@@ -569,19 +604,59 @@ BEGIN
   IF NOT EXISTS (SELECT 1 FROM pg_trigger WHERE tgname='trg_qhub_receipt_binding_immutable'
                  AND tgrelid='public.qhub_governed_action_receipt_bindings'::regclass AND NOT tgisinternal) THEN
     CREATE TRIGGER trg_qhub_receipt_binding_immutable BEFORE UPDATE ON public.qhub_governed_action_receipt_bindings
-      FOR EACH ROW EXECUTE FUNCTION public.qhub_receipt_binding_immutable();
+      FOR EACH ROW EXECUTE FUNCTION qhub_private.qhub_receipt_binding_immutable();
   ELSIF NOT EXISTS (SELECT 1 FROM pg_trigger WHERE tgname='trg_qhub_receipt_binding_immutable'
                  AND tgrelid='public.qhub_governed_action_receipt_bindings'::regclass AND NOT tgisinternal
                  AND tgtype = 19 AND tgenabled = 'O'
-                 AND tgfoid = 'public.qhub_receipt_binding_immutable()'::regprocedure) THEN
+                 AND tgfoid = 'qhub_private.qhub_receipt_binding_immutable()'::regprocedure) THEN
     RAISE EXCEPTION 'trg_qhub_receipt_binding_immutable exists but does not match expected timing/events/function/enabled';
   END IF;
 END $$;
 
--- ─── 7.6 Receipt-binding RPC (service-role only; ownership DB-derived) ────────
--- Ownership fields are LOADED from the authoritative run + evaluation rows; only
--- the receipt + durable evidence commitment come from the trusted server runtime.
--- No binding is created from caller ownership assertions alone.
+-- ─── 7.6 COMMITTED-state guard (only the authority owner may commit evidence) ─
+-- General service_role has NO path to set action_event_state='COMMITTED'. Only the
+-- owner context (the authority commit RPCs, which are SECURITY DEFINER owned by the
+-- migration owner and executable ONLY by qhub_evidence_writer) may transition to
+-- COMMITTED. Direct service_role updates are rejected.
+DO $mig$
+DECLARE b text := $body$
+BEGIN
+  IF NEW.action_event_state = 'COMMITTED' AND OLD.action_event_state IS DISTINCT FROM 'COMMITTED'
+     AND current_user <> (SELECT rolname FROM pg_roles WHERE oid = (SELECT relowner FROM pg_class WHERE oid = 'public.qhub_control_evaluations'::regclass)) THEN
+    RAISE EXCEPTION 'qhub_control_evaluations: action_event_state COMMITTED may only be set by the evidence authority';
+  END IF;
+  RETURN NEW;
+END
+$body$;
+BEGIN
+  IF to_regprocedure('qhub_private.qhub_evaluation_commit_guard()') IS NULL THEN
+    EXECUTE format($ddl$CREATE FUNCTION qhub_private.qhub_evaluation_commit_guard() RETURNS TRIGGER
+      LANGUAGE plpgsql SET search_path = pg_catalog, qhub_private AS %L$ddl$, b);
+  ELSIF (SELECT prosrc FROM pg_proc WHERE oid = 'qhub_private.qhub_evaluation_commit_guard()'::regprocedure) IS DISTINCT FROM b THEN
+    RAISE EXCEPTION 'qhub_evaluation_commit_guard drift — aborting rather than replacing';
+  END IF;
+END $mig$;
+
+DO $$
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_trigger WHERE tgname='trg_qhub_evaluation_commit_guard'
+                 AND tgrelid='public.qhub_control_evaluations'::regclass AND NOT tgisinternal) THEN
+    CREATE TRIGGER trg_qhub_evaluation_commit_guard BEFORE UPDATE ON public.qhub_control_evaluations
+      FOR EACH ROW EXECUTE FUNCTION qhub_private.qhub_evaluation_commit_guard();
+  ELSIF NOT EXISTS (SELECT 1 FROM pg_trigger WHERE tgname='trg_qhub_evaluation_commit_guard'
+                 AND tgrelid='public.qhub_control_evaluations'::regclass AND NOT tgisinternal
+                 AND tgtype = 19 AND tgenabled = 'O'
+                 AND tgfoid = 'qhub_private.qhub_evaluation_commit_guard()'::regprocedure) THEN
+    RAISE EXCEPTION 'trg_qhub_evaluation_commit_guard exists but does not match expected timing/events/function/enabled';
+  END IF;
+END $$;
+
+-- ─── 7.7 Evidence-authority atomic commit RPC (qhub_evidence_writer ONLY) ─────
+-- The SOLE path that (1) marks the exact evaluation's evidence COMMITTED and (2)
+-- inserts the immutable receipt binding — atomically, from the durable ledger
+-- append result supplied by the separate Trust Spine. Ownership is DB-derived from
+-- authoritative run + evaluation rows; only the receipt + evidence commitment come
+-- from the caller. service_role and browser roles have NO EXECUTE.
 DO $mig$
 DECLARE b text := $body$
 DECLARE
@@ -591,42 +666,49 @@ DECLARE
   plan RECORD;
   bnd  RECORD;
 BEGIN
-  IF p_decision NOT IN ('ALLOW','SIMULATED','EXECUTED') THEN
-    RAISE EXCEPTION 'qhub_bind_governed_action_receipt: only executed/simulated actions bind a receipt (got %)', p_decision;
+  IF p_decision NOT IN ('SIMULATED','EXECUTED') THEN
+    RAISE EXCEPTION 'qhub_commit_governed_action_receipt: only executed/simulated actions commit a receipt (got %)', p_decision;
   END IF;
-  IF p_receipt_id IS NULL OR p_receipt_type IS NULL OR p_receipt_hash IS NULL
-     OR p_evidence_event_id IS NULL OR p_evidence_event_hash IS NULL OR p_committed_at IS NULL THEN
-    RAISE EXCEPTION 'qhub_bind_governed_action_receipt: receipt + durable evidence commitment are required';
+  IF p_receipt_id IS NULL OR btrim(p_receipt_id) = '' OR p_receipt_type IS NULL OR p_receipt_hash IS NULL OR btrim(p_receipt_hash) = ''
+     OR p_evidence_event_id IS NULL OR btrim(p_evidence_event_id) = '' OR p_evidence_event_hash IS NULL OR btrim(p_evidence_event_hash) = ''
+     OR p_committed_at IS NULL OR p_receipt_schema_version IS NULL OR btrim(p_receipt_schema_version) = '' THEN
+    RAISE EXCEPTION 'qhub_commit_governed_action_receipt: receipt + durable evidence commitment are required (strict formats)';
   END IF;
   IF p_receipt_type NOT IN ('SIMULATION','SANDBOX','PRODUCTION') THEN
-    RAISE EXCEPTION 'qhub_bind_governed_action_receipt: invalid receipt_type %', p_receipt_type;
+    RAISE EXCEPTION 'qhub_commit_governed_action_receipt: invalid receipt_type %', p_receipt_type;
+  END IF;
+  IF p_decision = 'SIMULATED' AND p_receipt_type NOT IN ('SIMULATION','SANDBOX') THEN
+    RAISE EXCEPTION 'qhub_commit_governed_action_receipt: SIMULATED requires a simulation/sandbox receipt';
+  END IF;
+  IF p_decision = 'EXECUTED' AND p_receipt_type NOT IN ('PRODUCTION','SANDBOX') THEN
+    RAISE EXCEPTION 'qhub_commit_governed_action_receipt: EXECUTED requires a production/sandbox receipt';
   END IF;
 
   SELECT * INTO run FROM public.qhub_agent_runs WHERE run_id = p_run_id AND org_id = p_org_id FOR UPDATE;
-  IF NOT FOUND THEN RAISE EXCEPTION 'qhub_bind_governed_action_receipt: run % not found for org %', p_run_id, p_org_id; END IF;
+  IF NOT FOUND THEN RAISE EXCEPTION 'qhub_commit_governed_action_receipt: run % not found for org %', p_run_id, p_org_id; END IF;
   IF run.current_state NOT IN ('RUNNING','AWAITING_APPROVAL') THEN
-    RAISE EXCEPTION 'qhub_bind_governed_action_receipt: run % not in a bindable state (%)', p_run_id, run.current_state;
+    RAISE EXCEPTION 'qhub_commit_governed_action_receipt: run % not in a bindable state (%)', p_run_id, run.current_state;
   END IF;
 
   SELECT org_id, qhub_app_id, action_type, decision, action_event_state, action_request_id, action_digest,
          policy_profile_id, policy_profile_version, policy_profile_hash,
          enforcement_plan_id, enforcement_plan_version, enforcement_plan_hash
-    INTO ev FROM public.qhub_control_evaluations WHERE evaluation_id = p_evaluation_id;
+    INTO ev FROM public.qhub_control_evaluations WHERE evaluation_id = p_evaluation_id FOR UPDATE;
   IF NOT FOUND OR ev.org_id IS DISTINCT FROM run.org_id OR ev.qhub_app_id IS DISTINCT FROM run.qhub_app_id THEN
-    RAISE EXCEPTION 'qhub_bind_governed_action_receipt: evaluation ownership mismatch';
+    RAISE EXCEPTION 'qhub_commit_governed_action_receipt: evaluation ownership mismatch';
   END IF;
   IF ev.decision <> 'ALLOW' THEN
-    RAISE EXCEPTION 'qhub_bind_governed_action_receipt: a receipt binding requires an ALLOW evaluation (got %)', ev.decision;
+    RAISE EXCEPTION 'qhub_commit_governed_action_receipt: a receipt binding requires an ALLOW evaluation (got %)', ev.decision;
   END IF;
-  IF ev.action_event_state <> 'COMMITTED' THEN
-    RAISE EXCEPTION 'qhub_bind_governed_action_receipt: evidence is not COMMITTED (%)', ev.action_event_state;
+  IF p_action_request_id IS DISTINCT FROM ev.action_request_id OR p_action_digest IS DISTINCT FROM ev.action_digest THEN
+    RAISE EXCEPTION 'qhub_commit_governed_action_receipt: action_request_id/action_digest mismatch';
   END IF;
   IF p_action_type IS DISTINCT FROM ev.action_type THEN
-    RAISE EXCEPTION 'qhub_bind_governed_action_receipt: action_type mismatch';
+    RAISE EXCEPTION 'qhub_commit_governed_action_receipt: action_type mismatch';
   END IF;
   IF ev.policy_profile_hash IS DISTINCT FROM run.policy_profile_hash
      OR ev.enforcement_plan_hash IS DISTINCT FROM run.enforcement_plan_hash THEN
-    RAISE EXCEPTION 'qhub_bind_governed_action_receipt: policy/plan hash does not match the run';
+    RAISE EXCEPTION 'qhub_commit_governed_action_receipt: policy/plan hash does not match the run';
   END IF;
 
   IF run.release_candidate_id IS NOT NULL THEN
@@ -634,33 +716,42 @@ BEGIN
       FROM public.qhub_release_candidates WHERE release_candidate_id = run.release_candidate_id;
     IF NOT FOUND OR rel.org_id IS DISTINCT FROM run.org_id OR rel.qhub_app_id IS DISTINCT FROM run.qhub_app_id
        OR rel.release_candidate_hash IS DISTINCT FROM run.release_candidate_hash OR rel.status NOT IN ('APPROVED','DEPLOYED') THEN
-      RAISE EXCEPTION 'qhub_bind_governed_action_receipt: release candidate invalid';
+      RAISE EXCEPTION 'qhub_commit_governed_action_receipt: release candidate invalid';
     END IF;
   END IF;
   IF ev.enforcement_plan_id IS NOT NULL THEN
     SELECT status, enforcement_plan_hash INTO plan FROM public.qhub_enforcement_plans WHERE enforcement_plan_id = ev.enforcement_plan_id;
     IF NOT FOUND OR plan.status <> 'ACTIVE' OR plan.enforcement_plan_hash IS DISTINCT FROM ev.enforcement_plan_hash THEN
-      RAISE EXCEPTION 'qhub_bind_governed_action_receipt: enforcement plan invalid';
+      RAISE EXCEPTION 'qhub_commit_governed_action_receipt: enforcement plan invalid';
     END IF;
   END IF;
 
-  -- Idempotency: an exact repeat returns the existing binding; a material difference is rejected.
+  -- Idempotency across EVERY material field.
   SELECT * INTO bnd FROM public.qhub_governed_action_receipt_bindings WHERE evaluation_id = p_evaluation_id;
   IF FOUND THEN
-    IF bnd.receipt_id = p_receipt_id AND bnd.receipt_hash = p_receipt_hash AND bnd.receipt_type = p_receipt_type
-       AND bnd.evidence_event_id = p_evidence_event_id AND bnd.evidence_event_hash = p_evidence_event_hash THEN
-      RETURN jsonb_build_object('bound', true, 'idempotent', true, 'binding_id', bnd.binding_id, 'receipt_id', bnd.receipt_id);
+    IF bnd.receipt_schema_version = p_receipt_schema_version AND bnd.receipt_id = p_receipt_id
+       AND bnd.receipt_type = p_receipt_type AND bnd.receipt_hash = p_receipt_hash
+       AND bnd.evidence_chain_id IS NOT DISTINCT FROM p_evidence_chain_id AND bnd.evidence_seq IS NOT DISTINCT FROM p_evidence_seq
+       AND bnd.evidence_event_id = p_evidence_event_id AND bnd.evidence_event_hash = p_evidence_event_hash
+       AND bnd.committed_at = p_committed_at AND bnd.decision = 'ALLOW' AND bnd.run_id = run.run_id
+       AND bnd.action_request_id = ev.action_request_id AND bnd.action_digest = ev.action_digest
+       AND bnd.policy_profile_hash = ev.policy_profile_hash AND bnd.enforcement_plan_hash = ev.enforcement_plan_hash THEN
+      RETURN jsonb_build_object('committed', true, 'idempotent', true, 'binding_id', bnd.binding_id, 'receipt_id', bnd.receipt_id);
     END IF;
-    RAISE EXCEPTION 'qhub_bind_governed_action_receipt: a different receipt is already bound to evaluation %', p_evaluation_id;
+    RAISE EXCEPTION 'qhub_commit_governed_action_receipt: a materially different receipt is already committed to evaluation %', p_evaluation_id;
   END IF;
 
+  -- (1) Authoritatively mark evidence COMMITTED (owner context passes the guard).
+  UPDATE public.qhub_control_evaluations SET action_event_state = 'COMMITTED' WHERE evaluation_id = p_evaluation_id;
+
+  -- (2) Insert the immutable binding.
   INSERT INTO public.qhub_governed_action_receipt_bindings (
     receipt_id, receipt_type, receipt_schema_version, receipt_hash, org_id, qhub_app_id, run_id, agent_id,
     agent_version_id, release_candidate_id, evaluation_id, action_request_id, action_digest, action_type, decision,
     policy_profile_id, policy_profile_version, policy_profile_hash, enforcement_plan_id, enforcement_plan_version,
     enforcement_plan_hash, evidence_chain_id, evidence_event_id, evidence_event_hash, evidence_seq, committed_at)
   VALUES (
-    p_receipt_id, p_receipt_type, COALESCE(p_receipt_schema_version,'gate04-receipt-1.0.0'), p_receipt_hash,
+    p_receipt_id, p_receipt_type, p_receipt_schema_version, p_receipt_hash,
     run.org_id, run.qhub_app_id, run.run_id, run.agent_id, run.agent_version_id, run.release_candidate_id,
     p_evaluation_id, ev.action_request_id, ev.action_digest, ev.action_type, ev.decision,
     ev.policy_profile_id, ev.policy_profile_version, ev.policy_profile_hash, ev.enforcement_plan_id,
@@ -668,18 +759,48 @@ BEGIN
     p_evidence_event_hash, p_evidence_seq, p_committed_at)
   RETURNING * INTO bnd;
 
-  RETURN jsonb_build_object('bound', true, 'idempotent', false, 'binding_id', bnd.binding_id, 'receipt_id', bnd.receipt_id);
+  RETURN jsonb_build_object('committed', true, 'idempotent', false, 'binding_id', bnd.binding_id, 'receipt_id', bnd.receipt_id);
 END
 $body$;
 BEGIN
-  IF to_regprocedure('public.qhub_bind_governed_action_receipt(uuid,text,uuid,text,text,text,text,text,text,text,text,text,bigint,timestamptz)') IS NULL THEN
-    EXECUTE format($ddl$CREATE FUNCTION public.qhub_bind_governed_action_receipt(
-      p_run_id UUID, p_org_id TEXT, p_evaluation_id UUID, p_decision TEXT, p_action_type TEXT, p_receipt_id TEXT,
-      p_receipt_type TEXT, p_receipt_schema_version TEXT, p_receipt_hash TEXT, p_evidence_chain_id TEXT,
-      p_evidence_event_id TEXT, p_evidence_event_hash TEXT, p_evidence_seq BIGINT, p_committed_at TIMESTAMPTZ)
-      RETURNS JSONB LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, public AS %L$ddl$, b);
-  ELSIF (SELECT prosrc FROM pg_proc WHERE oid = 'public.qhub_bind_governed_action_receipt(uuid,text,uuid,text,text,text,text,text,text,text,text,text,bigint,timestamptz)'::regprocedure) IS DISTINCT FROM b THEN
-    RAISE EXCEPTION 'qhub_bind_governed_action_receipt drift — aborting rather than replacing';
+  IF to_regprocedure('public.qhub_commit_governed_action_receipt(uuid,text,uuid,text,text,uuid,text,text,text,text,text,text,text,text,bigint,timestamptz)') IS NULL THEN
+    EXECUTE format($ddl$CREATE FUNCTION public.qhub_commit_governed_action_receipt(
+      p_run_id UUID, p_org_id TEXT, p_evaluation_id UUID, p_decision TEXT, p_action_type TEXT, p_action_request_id UUID,
+      p_action_digest TEXT, p_receipt_id TEXT, p_receipt_type TEXT, p_receipt_schema_version TEXT, p_receipt_hash TEXT,
+      p_evidence_chain_id TEXT, p_evidence_event_id TEXT, p_evidence_event_hash TEXT, p_evidence_seq BIGINT, p_committed_at TIMESTAMPTZ)
+      RETURNS JSONB LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, qhub_private AS %L$ddl$, b);
+  ELSIF (SELECT prosrc FROM pg_proc WHERE oid = 'public.qhub_commit_governed_action_receipt(uuid,text,uuid,text,text,uuid,text,text,text,text,text,text,text,text,bigint,timestamptz)'::regprocedure) IS DISTINCT FROM b THEN
+    RAISE EXCEPTION 'qhub_commit_governed_action_receipt drift — aborting rather than replacing';
+  END IF;
+END $mig$;
+
+-- ─── 7.8 General evidence-COMMIT RPC (qhub_evidence_writer ONLY) ──────────────
+-- The authority path for the broader Gate 04 evidence-commit flow (non-agent
+-- governed actions). Marks the exact evaluation's action_event_state COMMITTED
+-- (owner context passes the guard). The general runtime (service_role) has no
+-- EXECUTE and no direct COMMITTED path; it hands off to the evidence authority.
+DO $mig$
+DECLARE b text := $body$
+DECLARE ev RECORD;
+BEGIN
+  SELECT org_id, action_event_state INTO ev FROM public.qhub_control_evaluations
+   WHERE evaluation_id = p_evaluation_id AND org_id = p_org_id FOR UPDATE;
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'qhub_commit_evaluation_evidence: evaluation % not found for org %', p_evaluation_id, p_org_id;
+  END IF;
+  IF ev.action_event_state = 'COMMITTED' THEN
+    RETURN jsonb_build_object('committed', true, 'idempotent', true, 'evaluation_id', p_evaluation_id);
+  END IF;
+  UPDATE public.qhub_control_evaluations SET action_event_state = 'COMMITTED' WHERE evaluation_id = p_evaluation_id;
+  RETURN jsonb_build_object('committed', true, 'idempotent', false, 'evaluation_id', p_evaluation_id);
+END
+$body$;
+BEGIN
+  IF to_regprocedure('public.qhub_commit_evaluation_evidence(uuid,text)') IS NULL THEN
+    EXECUTE format($ddl$CREATE FUNCTION public.qhub_commit_evaluation_evidence(p_evaluation_id UUID, p_org_id TEXT)
+      RETURNS JSONB LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, qhub_private AS %L$ddl$, b);
+  ELSIF (SELECT prosrc FROM pg_proc WHERE oid = 'public.qhub_commit_evaluation_evidence(uuid,text)'::regprocedure) IS DISTINCT FROM b THEN
+    RAISE EXCEPTION 'qhub_commit_evaluation_evidence drift — aborting rather than replacing';
   END IF;
 END $mig$;
 
@@ -744,7 +865,7 @@ BEGIN
     EXECUTE format($ddl$CREATE FUNCTION public.qhub_create_agent_run_step_pending(
       p_run_id UUID, p_org_id TEXT, p_step_index INT, p_step_kind TEXT, p_action_type TEXT, p_evaluation_id UUID,
       p_reason_codes TEXT[], p_input_hash TEXT, p_summary TEXT)
-      RETURNS JSONB LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, public AS %L$ddl$, b);
+      RETURNS JSONB LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, qhub_private AS %L$ddl$, b);
   ELSIF (SELECT prosrc FROM pg_proc WHERE oid = 'public.qhub_create_agent_run_step_pending(uuid,text,int,text,text,uuid,text[],text,text)'::regprocedure) IS DISTINCT FROM b THEN
     RAISE EXCEPTION 'qhub_create_agent_run_step_pending drift — aborting rather than replacing';
   END IF;
@@ -773,7 +894,7 @@ BEGIN
   IF p_evaluation_id IS NULL THEN
     RAISE EXCEPTION 'qhub_finalize_agent_run_step: a terminal step requires an authoritative evaluation';
   END IF;
-  IF NOT public.qhub_agent_safe_result_valid(p_safe_result) THEN
+  IF NOT qhub_private.qhub_agent_safe_result_valid(p_safe_result) THEN
     RAISE EXCEPTION 'qhub_finalize_agent_run_step: safe_result failed strict validation';
   END IF;
 
@@ -899,7 +1020,7 @@ BEGIN
     END IF;
   END IF;
 
-  new_hash := public.qhub_compute_agent_step_result_hash(
+  new_hash := qhub_private.qhub_compute_agent_step_result_hash(
     p_run_id, p_step_index, p_safe_result, prev_hash, p_decision, p_input_hash, p_step_kind, p_action_type, p_evaluation_id, v_receipt_id);
 
   -- Idempotency: exact repeat = no-op; materially different repeat = rejected.
@@ -936,7 +1057,7 @@ BEGIN
     EXECUTE format($ddl$CREATE FUNCTION public.qhub_finalize_agent_run_step(
       p_run_id UUID, p_org_id TEXT, p_step_index INT, p_step_kind TEXT, p_action_type TEXT, p_evaluation_id UUID,
       p_decision TEXT, p_reason_codes TEXT[], p_receipt_id TEXT, p_input_hash TEXT, p_summary TEXT, p_safe_result JSONB)
-      RETURNS JSONB LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, public AS %L$ddl$, b);
+      RETURNS JSONB LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, qhub_private AS %L$ddl$, b);
   ELSIF (SELECT prosrc FROM pg_proc WHERE oid = 'public.qhub_finalize_agent_run_step(uuid,text,int,text,text,uuid,text,text[],text,text,text,jsonb)'::regprocedure) IS DISTINCT FROM b THEN
     RAISE EXCEPTION 'qhub_finalize_agent_run_step drift — aborting rather than replacing';
   END IF;
@@ -948,37 +1069,43 @@ END $mig$;
 -- independently proves the final state.
 DO $$
 DECLARE
-  hashsig      text := 'public.qhub_agent_step_result_hash(text,text,text,text,text,text,text,text,text,text,int,text,text,text,text,text,text,text,text,int,text,text,int,text,text,jsonb,text)';
+  hashsig      text := 'qhub_private.qhub_agent_step_result_hash(text,text,text,text,text,text,text,text,text,text,int,text,text,text,text,text,text,text,text,int,text,text,int,text,text,jsonb,text)';
   finalsig     text := 'public.qhub_finalize_agent_run_step(uuid,text,int,text,text,uuid,text,text[],text,text,text,jsonb)';
   createsig    text := 'public.qhub_create_agent_run_step_pending(uuid,text,int,text,text,uuid,text[],text,text)';
-  bindsig      text := 'public.qhub_bind_governed_action_receipt(uuid,text,uuid,text,text,text,text,text,text,text,text,text,bigint,timestamptz)';
+  commitsig    text := 'public.qhub_commit_governed_action_receipt(uuid,text,uuid,text,text,uuid,text,text,text,text,text,text,text,text,bigint,timestamptz)';
 BEGIN
   IF has_function_privilege('service_role', hashsig, 'EXECUTE')                 -- helper still exposed, OR
      OR NOT has_function_privilege('service_role', finalsig, 'EXECUTE')          -- finalize not yet granted, OR
      OR NOT has_function_privilege('service_role', createsig, 'EXECUTE')         -- create not yet granted, OR
-     OR NOT has_function_privilege('service_role', bindsig, 'EXECUTE')           -- bind not yet granted, OR
+     OR has_function_privilege('service_role', commitsig, 'EXECUTE')             -- authority RPC service_role-exposed, OR
+     OR NOT has_function_privilege('qhub_evidence_writer', commitsig, 'EXECUTE') -- authority not yet granted, OR
      OR has_table_privilege('service_role','public.qhub_agent_run_steps','INSERT')  -- direct write present, OR
      OR has_table_privilege('service_role','public.qhub_governed_action_receipt_bindings','INSERT')  -- binding direct write, OR
      OR NOT has_table_privilege('service_role','public.qhub_agent_run_steps','SELECT') THEN  -- read missing
     -- Helpers: executable by NO client role (owner-only; called within DEFINER fns).
-    REVOKE ALL ON FUNCTION public.qhub_agent_hash_cell(text) FROM PUBLIC, anon, authenticated, service_role;
-    REVOKE ALL ON FUNCTION public.qhub_agent_hash_intcell(int) FROM PUBLIC, anon, authenticated, service_role;
-    REVOKE ALL ON FUNCTION public.qhub_agent_canonical_safe_result(jsonb) FROM PUBLIC, anon, authenticated, service_role;
-    REVOKE ALL ON FUNCTION public.qhub_agent_safe_result_valid(jsonb) FROM PUBLIC, anon, authenticated, service_role;
+    REVOKE ALL ON FUNCTION qhub_private.qhub_agent_hash_cell(text) FROM PUBLIC, anon, authenticated, service_role;
+    REVOKE ALL ON FUNCTION qhub_private.qhub_agent_hash_intcell(int) FROM PUBLIC, anon, authenticated, service_role;
+    REVOKE ALL ON FUNCTION qhub_private.qhub_agent_canonical_safe_result(jsonb) FROM PUBLIC, anon, authenticated, service_role;
+    REVOKE ALL ON FUNCTION qhub_private.qhub_agent_safe_result_valid(jsonb) FROM PUBLIC, anon, authenticated, service_role;
     EXECUTE 'REVOKE ALL ON FUNCTION ' || hashsig || ' FROM PUBLIC, anon, authenticated, service_role';
-    REVOKE ALL ON FUNCTION public.qhub_compute_agent_step_result_hash(uuid,int,jsonb,text,text,text,text,text,uuid,text) FROM PUBLIC, anon, authenticated, service_role;
-    REVOKE ALL ON FUNCTION public.qhub_agent_run_step_guard() FROM PUBLIC, anon, authenticated, service_role;
-    REVOKE ALL ON FUNCTION public.qhub_agent_run_identity_guard() FROM PUBLIC, anon, authenticated, service_role;
-    REVOKE ALL ON FUNCTION public.qhub_agent_version_manifest_guard() FROM PUBLIC, anon, authenticated, service_role;
-    REVOKE ALL ON FUNCTION public.qhub_receipt_binding_immutable() FROM PUBLIC, anon, authenticated, service_role;
+    REVOKE ALL ON FUNCTION qhub_private.qhub_compute_agent_step_result_hash(uuid,int,jsonb,text,text,text,text,text,uuid,text) FROM PUBLIC, anon, authenticated, service_role;
+    REVOKE ALL ON FUNCTION qhub_private.qhub_agent_run_step_guard() FROM PUBLIC, anon, authenticated, service_role;
+    REVOKE ALL ON FUNCTION qhub_private.qhub_agent_run_identity_guard() FROM PUBLIC, anon, authenticated, service_role;
+    REVOKE ALL ON FUNCTION qhub_private.qhub_agent_version_manifest_guard() FROM PUBLIC, anon, authenticated, service_role;
+    REVOKE ALL ON FUNCTION qhub_private.qhub_receipt_binding_immutable() FROM PUBLIC, anon, authenticated, service_role;
+    REVOKE ALL ON FUNCTION qhub_private.qhub_evaluation_commit_guard() FROM PUBLIC, anon, authenticated, service_role;
 
-    -- Write RPCs: executable ONLY by service_role.
+    -- General runtime write RPCs: executable ONLY by service_role.
     EXECUTE 'REVOKE ALL ON FUNCTION ' || createsig || ' FROM PUBLIC, anon, authenticated';
     EXECUTE 'GRANT EXECUTE ON FUNCTION ' || createsig || ' TO service_role';
     EXECUTE 'REVOKE ALL ON FUNCTION ' || finalsig || ' FROM PUBLIC, anon, authenticated';
     EXECUTE 'GRANT EXECUTE ON FUNCTION ' || finalsig || ' TO service_role';
-    EXECUTE 'REVOKE ALL ON FUNCTION ' || bindsig || ' FROM PUBLIC, anon, authenticated';
-    EXECUTE 'GRANT EXECUTE ON FUNCTION ' || bindsig || ' TO service_role';
+
+    -- Evidence-authority RPCs: executable ONLY by qhub_evidence_writer (NOT service_role).
+    EXECUTE 'REVOKE ALL ON FUNCTION ' || commitsig || ' FROM PUBLIC, anon, authenticated, service_role';
+    EXECUTE 'GRANT EXECUTE ON FUNCTION ' || commitsig || ' TO qhub_evidence_writer';
+    REVOKE ALL ON FUNCTION public.qhub_commit_evaluation_evidence(uuid,text) FROM PUBLIC, anon, authenticated, service_role;
+    GRANT EXECUTE ON FUNCTION public.qhub_commit_evaluation_evidence(uuid,text) TO qhub_evidence_writer;
 
     -- Verifier: browser-denied, service-role-only (re-asserted after replace).
     REVOKE ALL ON FUNCTION public.qhub_verify_agent_schema() FROM PUBLIC, anon, authenticated;
@@ -1031,26 +1158,27 @@ fk_count AS (
   WHERE c.contype='f' AND n.nspname='public'
     AND t.relname IN ('qhub_agents','qhub_agent_versions','qhub_agent_runs','qhub_agent_run_steps') AND c.convalidated
 ),
-hashsig AS (SELECT 'public.qhub_agent_step_result_hash(text,text,text,text,text,text,text,text,text,text,int,text,text,text,text,text,text,text,text,int,text,text,int,text,text,jsonb,text)'::text s),
-computesig AS (SELECT 'public.qhub_compute_agent_step_result_hash(uuid,int,jsonb,text,text,text,text,text,uuid,text)'::text s),
+hashsig AS (SELECT 'qhub_private.qhub_agent_step_result_hash(text,text,text,text,text,text,text,text,text,text,int,text,text,text,text,text,text,text,text,int,text,text,int,text,text,jsonb,text)'::text s),
+computesig AS (SELECT 'qhub_private.qhub_compute_agent_step_result_hash(uuid,int,jsonb,text,text,text,text,text,uuid,text)'::text s),
 finalsig AS (SELECT 'public.qhub_finalize_agent_run_step(uuid,text,int,text,text,uuid,text,text[],text,text,text,jsonb)'::text s),
 createsig AS (SELECT 'public.qhub_create_agent_run_step_pending(uuid,text,int,text,text,uuid,text[],text,text)'::text s),
-bindsig AS (SELECT 'public.qhub_bind_governed_action_receipt(uuid,text,uuid,text,text,text,text,text,text,text,text,text,bigint,timestamptz)'::text s),
+commitsig AS (SELECT 'public.qhub_commit_governed_action_receipt(uuid,text,uuid,text,text,uuid,text,text,text,text,text,text,text,text,bigint,timestamptz)'::text s),
 -- Pinned functions: exact owner + search_path + security mode + body digest.
 pf(sig, secdef, digest) AS (VALUES
-  ('public.qhub_agent_hash_cell(text)', false, '5592c0cbc562233aca23a2cc5f15c369'),
-  ('public.qhub_agent_hash_intcell(int)', false, '2c533fd3f0ead14808a94a8259683b01'),
-  ('public.qhub_agent_canonical_safe_result(jsonb)', false, '8c4ab040da4403a12dd90cbdf713441e'),
-  ('public.qhub_agent_safe_result_valid(jsonb)', false, '7cabd0ddec84e985995c88f31361708f'),
-  ('public.qhub_agent_step_result_hash(text,text,text,text,text,text,text,text,text,text,int,text,text,text,text,text,text,text,text,int,text,text,int,text,text,jsonb,text)', false, '806d9709cada40257c151ee750af6370'),
-  ('public.qhub_compute_agent_step_result_hash(uuid,int,jsonb,text,text,text,text,text,uuid,text)', true, '63b5c755552b5c4e3d29e892039b52f1'),
-  ('public.qhub_agent_run_step_guard()', true, '276ff733fd04875ea7a727cd5932620a'),
-  ('public.qhub_agent_run_identity_guard()', false, 'dd57c916293a5ef8ed73412f69b928c6'),
-  ('public.qhub_agent_version_manifest_guard()', false, '2d51507ec314288172479f594e2ac269'),
-  ('public.qhub_receipt_binding_immutable()', false, 'fcd03e86bf0fd73a88a686d6bb028e96'),
+  ('qhub_private.qhub_agent_hash_cell(text)', false, '5592c0cbc562233aca23a2cc5f15c369'),
+  ('qhub_private.qhub_agent_hash_intcell(int)', false, '0c999cfa0b51734383df116e80701988'),
+  ('qhub_private.qhub_agent_canonical_safe_result(jsonb)', false, '97b9ba0f2aa60ed362cfd6b0c2746947'),
+  ('qhub_private.qhub_agent_safe_result_valid(jsonb)', false, '8feeacdf7a531981d516fe7c67e23d9e'),
+  ('qhub_private.qhub_agent_step_result_hash(text,text,text,text,text,text,text,text,text,text,int,text,text,text,text,text,text,text,text,int,text,text,int,text,text,jsonb,text)', false, 'b3e2794206a93ac0ff9eccb81a93ca89'),
+  ('qhub_private.qhub_compute_agent_step_result_hash(uuid,int,jsonb,text,text,text,text,text,uuid,text)', true, '407ef3fcef2ba9efe7753c7dfd75c759'),
+  ('qhub_private.qhub_agent_run_step_guard()', true, '5cd1caf65571297737bdafc10bbf462d'),
+  ('qhub_private.qhub_agent_run_identity_guard()', false, 'dd57c916293a5ef8ed73412f69b928c6'),
+  ('qhub_private.qhub_agent_version_manifest_guard()', false, '2d51507ec314288172479f594e2ac269'),
+  ('qhub_private.qhub_receipt_binding_immutable()', false, 'fcd03e86bf0fd73a88a686d6bb028e96'),
+  ('qhub_private.qhub_evaluation_commit_guard()', false, 'cf3b574d7f2ef5cfaa55859dddba2c48'),
   ('public.qhub_create_agent_run_step_pending(uuid,text,int,text,text,uuid,text[],text,text)', true, 'fdb3b9458915dbae80ae154bdb265741'),
-  ('public.qhub_bind_governed_action_receipt(uuid,text,uuid,text,text,text,text,text,text,text,text,text,bigint,timestamptz)', true, '6915c271d9bd0a10699df899a9ccb0b5'),
-  ('public.qhub_finalize_agent_run_step(uuid,text,int,text,text,uuid,text,text[],text,text,text,jsonb)', true, '1b462a0db34440db5df577313794ee48')
+  ('public.qhub_commit_governed_action_receipt(uuid,text,uuid,text,text,uuid,text,text,text,text,text,text,text,text,bigint,timestamptz)', true, 'a57615b32e7b62be85c40c903a04c0a7'),
+  ('public.qhub_finalize_agent_run_step(uuid,text,int,text,text,uuid,text,text[],text,text,text,jsonb)', true, '08f9f87bee2e0a0922c9202ffd250d3d')
 ),
 pfmeta AS (
   SELECT pf.sig, pf.secdef AS want_secdef, pf.digest AS want_digest,
@@ -1134,7 +1262,7 @@ checks(identifier, category, ready, reason_code) AS (
     -- ── Functions: presence + exact owner + search_path + security mode + body digest ──
     ('function.all_present', 'FUNCTION', (SELECT bool_and(present) FROM pfmeta), 'FUNCTION_MISSING'),
     ('function.owners_pinned', 'FUNCTION', (SELECT bool_and(proowner = (SELECT oid FROM owner_oid)) FROM pfmeta WHERE present), 'FUNCTION_OWNER_DRIFT'),
-    ('function.search_paths_pinned', 'FUNCTION', (SELECT bool_and(cfg = ARRAY['search_path=pg_catalog, public']) FROM pfmeta WHERE present), 'FUNCTION_SEARCH_PATH_DRIFT'),
+    ('function.search_paths_pinned', 'FUNCTION', (SELECT bool_and(cfg = ARRAY['search_path=pg_catalog, qhub_private']) FROM pfmeta WHERE present), 'FUNCTION_SEARCH_PATH_DRIFT'),
     ('function.security_modes_pinned', 'FUNCTION', (SELECT bool_and(secdef = want_secdef) FROM pfmeta WHERE present), 'FUNCTION_SECURITY_MODE_DRIFT'),
     ('function.bodies_pinned', 'FUNCTION', (SELECT bool_and(digest = want_digest) FROM pfmeta WHERE present), 'FUNCTION_BODY_DRIFT'),
 
@@ -1142,39 +1270,69 @@ checks(identifier, category, ready, reason_code) AS (
     ('privilege.helpers_locked', 'FUNCTION', (
       NOT has_function_privilege('anon', (SELECT s FROM hashsig), 'EXECUTE') AND NOT has_function_privilege('service_role', (SELECT s FROM hashsig), 'EXECUTE')
       AND NOT has_function_privilege('anon', (SELECT s FROM computesig), 'EXECUTE') AND NOT has_function_privilege('service_role', (SELECT s FROM computesig), 'EXECUTE')
-      AND NOT has_function_privilege('anon', 'public.qhub_agent_safe_result_valid(jsonb)', 'EXECUTE')
-      AND NOT has_function_privilege('authenticated', 'public.qhub_agent_safe_result_valid(jsonb)', 'EXECUTE')
-      AND NOT has_function_privilege('service_role', 'public.qhub_agent_safe_result_valid(jsonb)', 'EXECUTE')
-      AND NOT has_function_privilege('anon', 'public.qhub_agent_canonical_safe_result(jsonb)', 'EXECUTE')
-      AND NOT has_function_privilege('service_role', 'public.qhub_agent_canonical_safe_result(jsonb)', 'EXECUTE')
-      AND NOT has_function_privilege('anon', 'public.qhub_agent_run_step_guard()', 'EXECUTE')
-      AND NOT has_function_privilege('authenticated', 'public.qhub_agent_run_step_guard()', 'EXECUTE')
-      AND NOT has_function_privilege('service_role', 'public.qhub_agent_run_step_guard()', 'EXECUTE')
-      AND NOT has_function_privilege('service_role', 'public.qhub_receipt_binding_immutable()', 'EXECUTE')
+      AND NOT has_function_privilege('anon', 'qhub_private.qhub_agent_safe_result_valid(jsonb)', 'EXECUTE')
+      AND NOT has_function_privilege('authenticated', 'qhub_private.qhub_agent_safe_result_valid(jsonb)', 'EXECUTE')
+      AND NOT has_function_privilege('service_role', 'qhub_private.qhub_agent_safe_result_valid(jsonb)', 'EXECUTE')
+      AND NOT has_function_privilege('anon', 'qhub_private.qhub_agent_canonical_safe_result(jsonb)', 'EXECUTE')
+      AND NOT has_function_privilege('service_role', 'qhub_private.qhub_agent_canonical_safe_result(jsonb)', 'EXECUTE')
+      AND NOT has_function_privilege('anon', 'qhub_private.qhub_agent_run_step_guard()', 'EXECUTE')
+      AND NOT has_function_privilege('authenticated', 'qhub_private.qhub_agent_run_step_guard()', 'EXECUTE')
+      AND NOT has_function_privilege('service_role', 'qhub_private.qhub_agent_run_step_guard()', 'EXECUTE')
+      AND NOT has_function_privilege('service_role', 'qhub_private.qhub_receipt_binding_immutable()', 'EXECUTE')
     ), 'HELPER_EXPOSED'),
     ('function.finalize_rpc', 'FUNCTION', (
       NOT has_function_privilege('anon', (SELECT s FROM finalsig), 'EXECUTE') AND NOT has_function_privilege('authenticated', (SELECT s FROM finalsig), 'EXECUTE')
       AND has_function_privilege('service_role', (SELECT s FROM finalsig), 'EXECUTE')), 'FINALIZE_RPC_EXPOSED'),
     ('function.create_step_rpc', 'FUNCTION', (
       NOT has_function_privilege('anon', (SELECT s FROM createsig), 'EXECUTE') AND has_function_privilege('service_role', (SELECT s FROM createsig), 'EXECUTE')), 'CREATE_RPC_EXPOSED'),
-    ('function.bind_rpc', 'FUNCTION', (
-      to_regprocedure((SELECT s FROM bindsig)) IS NOT NULL
-      AND NOT has_function_privilege('anon', (SELECT s FROM bindsig), 'EXECUTE') AND NOT has_function_privilege('authenticated', (SELECT s FROM bindsig), 'EXECUTE')
-      AND has_function_privilege('service_role', (SELECT s FROM bindsig), 'EXECUTE')), 'BIND_RPC_MISSING_OR_EXPOSED'),
+    -- Evidence-authority commit RPC: exists, EXECUTE ONLY qhub_evidence_writer (NOT service_role/browser).
+    ('function.commit_rpc_authority_only', 'FUNCTION', (
+      to_regprocedure((SELECT s FROM commitsig)) IS NOT NULL AND to_regprocedure('public.qhub_commit_evaluation_evidence(uuid,text)') IS NOT NULL
+      AND NOT has_function_privilege('anon', (SELECT s FROM commitsig), 'EXECUTE')
+      AND NOT has_function_privilege('authenticated', (SELECT s FROM commitsig), 'EXECUTE')
+      AND NOT has_function_privilege('service_role', (SELECT s FROM commitsig), 'EXECUTE')
+      AND has_function_privilege('qhub_evidence_writer', (SELECT s FROM commitsig), 'EXECUTE')
+      AND NOT has_function_privilege('service_role', 'public.qhub_commit_evaluation_evidence(uuid,text)', 'EXECUTE')
+      AND NOT has_function_privilege('anon', 'public.qhub_commit_evaluation_evidence(uuid,text)', 'EXECUTE')
+      AND has_function_privilege('qhub_evidence_writer', 'public.qhub_commit_evaluation_evidence(uuid,text)', 'EXECUTE')
+      AND (SELECT prosecdef AND proconfig = ARRAY['search_path=pg_catalog, qhub_private'] AND proowner = (SELECT oid FROM owner_oid)
+             FROM pg_proc WHERE oid='public.qhub_commit_evaluation_evidence(uuid,text)'::regprocedure)), 'COMMIT_RPC_MISSING_OR_EXPOSED'),
     ('function.no_dynamic_sql_in_rpcs', 'FUNCTION', (
       SELECT bool_and(prosrc NOT ILIKE '%execute %') FROM pg_proc WHERE oid IN (
-        (SELECT s FROM finalsig)::regprocedure, (SELECT s FROM createsig)::regprocedure, (SELECT s FROM bindsig)::regprocedure,
-        'public.qhub_agent_run_step_guard()'::regprocedure)), 'DYNAMIC_SQL_PRESENT'),
+        (SELECT s FROM finalsig)::regprocedure, (SELECT s FROM createsig)::regprocedure, (SELECT s FROM commitsig)::regprocedure,
+        'qhub_private.qhub_agent_run_step_guard()'::regprocedure)), 'DYNAMIC_SQL_PRESENT'),
+
+    -- ── R4 evidence-authority role + private schema + COMMITTED guard ──
+    ('role.evidence_writer_exists_nologin', 'FUNCTION', (
+      EXISTS (SELECT 1 FROM pg_roles WHERE rolname='qhub_evidence_writer' AND NOT rolcanlogin)), 'EVIDENCE_WRITER_ROLE_MISSING_OR_LOGIN'),
+    ('role.evidence_writer_not_inherited', 'FUNCTION', (
+      -- No client role is a member of qhub_evidence_writer (cannot SET ROLE / inherit).
+      NOT pg_has_role('service_role','qhub_evidence_writer','MEMBER')
+      AND NOT pg_has_role('anon','qhub_evidence_writer','MEMBER')
+      AND NOT pg_has_role('authenticated','qhub_evidence_writer','MEMBER')), 'EVIDENCE_WRITER_MEMBERSHIP_LEAK'),
+    ('schema.qhub_private_locked', 'FUNCTION', (
+      to_regnamespace('qhub_private') IS NOT NULL
+      AND (SELECT nspowner FROM pg_namespace WHERE nspname='qhub_private') = (SELECT oid FROM owner_oid)
+      AND NOT has_schema_privilege('service_role','qhub_private','USAGE') AND NOT has_schema_privilege('service_role','qhub_private','CREATE')
+      AND NOT has_schema_privilege('anon','qhub_private','USAGE') AND NOT has_schema_privilege('authenticated','qhub_private','USAGE')), 'PRIVATE_SCHEMA_EXPOSED'),
+    ('schema.public_create_revoked', 'FUNCTION', (
+      NOT has_schema_privilege('service_role','public','CREATE') AND NOT has_schema_privilege('anon','public','CREATE')
+      AND NOT has_schema_privilege('authenticated','public','CREATE')), 'PUBLIC_CREATE_EXPOSED'),
+    ('privilege.service_role_cannot_commit', 'FUNCTION', (
+      -- No column-level UPDATE nor a path for service_role to set COMMITTED (guard trigger present).
+      EXISTS (SELECT 1 FROM pg_trigger WHERE tgname='trg_qhub_evaluation_commit_guard'
+        AND tgrelid='public.qhub_control_evaluations'::regclass AND NOT tgisinternal AND tgtype=19 AND tgenabled='O'
+        AND tgfoid='qhub_private.qhub_evaluation_commit_guard()'::regprocedure)), 'COMMITTED_GUARD_MISSING'),
 
     -- ── Triggers (exact table/timing/events/function/enabled) ──
     ('trigger.step_guard', 'CONSTRAINT', EXISTS (SELECT 1 FROM pg_trigger WHERE tgname='trg_qhub_agent_run_step_guard'
-      AND tgrelid='public.qhub_agent_run_steps'::regclass AND NOT tgisinternal AND tgtype=23 AND tgenabled='O' AND tgfoid='public.qhub_agent_run_step_guard()'::regprocedure), 'TRIGGER_MISSING_OR_MISMATCH'),
+      AND tgrelid='public.qhub_agent_run_steps'::regclass AND NOT tgisinternal AND tgtype=23 AND tgenabled='O' AND tgfoid='qhub_private.qhub_agent_run_step_guard()'::regprocedure), 'TRIGGER_MISSING_OR_MISMATCH'),
     ('trigger.run_identity_guard', 'CONSTRAINT', EXISTS (SELECT 1 FROM pg_trigger WHERE tgname='trg_qhub_agent_run_identity_guard'
-      AND tgrelid='public.qhub_agent_runs'::regclass AND NOT tgisinternal AND tgtype=19 AND tgenabled='O' AND tgfoid='public.qhub_agent_run_identity_guard()'::regprocedure), 'RUN_IDENTITY_GUARD_MISSING'),
+      AND tgrelid='public.qhub_agent_runs'::regclass AND NOT tgisinternal AND tgtype=19 AND tgenabled='O' AND tgfoid='qhub_private.qhub_agent_run_identity_guard()'::regprocedure), 'RUN_IDENTITY_GUARD_MISSING'),
     ('trigger.version_manifest_guard', 'CONSTRAINT', EXISTS (SELECT 1 FROM pg_trigger WHERE tgname='trg_qhub_agent_version_manifest_guard'
-      AND tgrelid='public.qhub_agent_versions'::regclass AND NOT tgisinternal AND tgtype=19 AND tgenabled='O' AND tgfoid='public.qhub_agent_version_manifest_guard()'::regprocedure), 'VERSION_MANIFEST_GUARD_MISSING'),
+      AND tgrelid='public.qhub_agent_versions'::regclass AND NOT tgisinternal AND tgtype=19 AND tgenabled='O' AND tgfoid='qhub_private.qhub_agent_version_manifest_guard()'::regprocedure), 'VERSION_MANIFEST_GUARD_MISSING'),
     ('trigger.receipt_binding_immutable', 'CONSTRAINT', EXISTS (SELECT 1 FROM pg_trigger WHERE tgname='trg_qhub_receipt_binding_immutable'
-      AND tgrelid='public.qhub_governed_action_receipt_bindings'::regclass AND NOT tgisinternal AND tgtype=19 AND tgenabled='O' AND tgfoid='public.qhub_receipt_binding_immutable()'::regprocedure), 'RECEIPT_BINDING_TRIGGER_MISSING'),
+      AND tgrelid='public.qhub_governed_action_receipt_bindings'::regclass AND NOT tgisinternal AND tgtype=19 AND tgenabled='O' AND tgfoid='qhub_private.qhub_receipt_binding_immutable()'::regprocedure), 'RECEIPT_BINDING_TRIGGER_MISSING'),
 
     -- ── Privileges: no direct writes on steps or receipt bindings ──
     ('privilege.steps_no_direct_write', 'FUNCTION', (
@@ -1221,7 +1379,7 @@ checks(identifier, category, ready, reason_code) AS (
 ),
 normalized AS (SELECT identifier, category, ready, CASE WHEN ready THEN 'OK' ELSE reason_code END AS reason_code FROM checks)
 SELECT jsonb_build_object(
-  'expected_version', '2026-07-29.agent-result-continuity-r3',
+  'expected_version', '2026-07-29.agent-result-continuity-r4',
   'ready', bool_and(ready),
   'checks', jsonb_agg(jsonb_build_object('identifier', identifier, 'category', category, 'ready', ready, 'reason_code', reason_code) ORDER BY category, identifier)
 ) FROM normalized
@@ -1229,10 +1387,10 @@ $body$;
 BEGIN
   IF to_regprocedure('public.qhub_verify_agent_schema()') IS NULL THEN
     EXECUTE format($ddl$CREATE FUNCTION public.qhub_verify_agent_schema() RETURNS JSONB
-      LANGUAGE sql STABLE SECURITY DEFINER SET search_path = pg_catalog, public AS %L$ddl$, b);
+      LANGUAGE sql STABLE SECURITY DEFINER SET search_path = pg_catalog, qhub_private AS %L$ddl$, b);
   ELSIF (SELECT prosrc FROM pg_proc WHERE oid = 'public.qhub_verify_agent_schema()'::regprocedure) IS DISTINCT FROM b THEN
     EXECUTE format($ddl$CREATE OR REPLACE FUNCTION public.qhub_verify_agent_schema() RETURNS JSONB
-      LANGUAGE sql STABLE SECURITY DEFINER SET search_path = pg_catalog, public AS %L$ddl$, b);
+      LANGUAGE sql STABLE SECURITY DEFINER SET search_path = pg_catalog, qhub_private AS %L$ddl$, b);
   END IF;
 END $mig$;
 

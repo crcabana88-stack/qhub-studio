@@ -50,7 +50,7 @@ afterAll(async () => {
 /** Call the SQL canonical hash with EXACTLY the TS field set. */
 async function sqlHash(f: StepResultHashInput): Promise<string> {
   const r = await db.query<{ h: string }>(
-    `select public.qhub_agent_step_result_hash(
+    `select qhub_private.qhub_agent_step_result_hash(
        $1::text,$2::text,$3::text,$4::text,$5::text,$6::text,$7::text,$8::text,$9::text,$10::text,
        $11::int,$12::text,$13::text,$14::text,$15::text,$16::text,$17::text,$18::text,$19::text,$20::int,
        $21::text,$22::text,$23::int,$24::text,$25::text,$26::jsonb,$27::text) h`,

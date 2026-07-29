@@ -52,7 +52,7 @@ afterAll(async () => {
 });
 
 async function sqlValid(value: unknown): Promise<boolean> {
-  const r = await db.query<{ ok: boolean }>('select public.qhub_agent_safe_result_valid($1::jsonb) ok', [
+  const r = await db.query<{ ok: boolean }>('select qhub_private.qhub_agent_safe_result_valid($1::jsonb) ok', [
     JSON.stringify(value),
   ]);
 
@@ -60,7 +60,7 @@ async function sqlValid(value: unknown): Promise<boolean> {
 }
 
 async function sqlCanonical(value: SafeResult): Promise<string> {
-  const r = await db.query<{ c: string }>('select public.qhub_agent_canonical_safe_result($1::jsonb) c', [
+  const r = await db.query<{ c: string }>('select qhub_private.qhub_agent_canonical_safe_result($1::jsonb) c', [
     JSON.stringify(value),
   ]);
 
