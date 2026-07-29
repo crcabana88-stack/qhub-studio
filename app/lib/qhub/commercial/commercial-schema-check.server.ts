@@ -1,5 +1,5 @@
 /**
- * QHUB Commercial Launch R4 — CENTRAL COMMERCIAL SCHEMA READINESS (SERVER ONLY)
+ * QHUB Commercial Launch R5 — CENTRAL COMMERCIAL SCHEMA READINESS (SERVER ONLY)
  * app/lib/qhub/commercial/commercial-schema-check.server.ts
  *
  * The ONE place that calls qhub_verify_commercial_schema(). It requires the exact
@@ -7,16 +7,17 @@
  * closed for every non-READY state and exposes only ALLOWLISTED, compact reason codes —
  * never SQL, secrets, Stripe payloads, tenant data, project URLs, or exception text.
  *
- * NON-BYPASSABLE BOUNDARY: a READY result mints a branded CommercialReadyToken bound to
- * the exact (schemaVersion, targetKey). Only this module constructs the token; every
- * exported commercial mutation/protected service requires it and re-validates it against
- * the current target before any protected side effect (see mutator() in the store).
- *
- * TARGET-KEYED: readiness (and the token) are scoped to a non-sensitive target key that
- * binds the schema version, normalized Supabase URL, deployment environment, and verifier
- * identity — so a READY for staging can never satisfy production, or target A satisfy B.
+ * RUNTIME-UNFORGEABLE BOUNDARY: a READY result mints a genuine ReadyToken CLASS instance
+ * (a JS #private-branded object registered in a module-private WeakSet). Ordinary code
+ * cannot manufacture one — plain objects, Object.create/prototype tricks, JSON round-trips,
+ * structured clones, copied fields, and `as CommercialReadyToken` casts are ALL rejected
+ * at runtime because they are not in the registry. Validation also enforces a cryptographic
+ * SHA-256 target digest, deployment environment, verifier identity, schema version, and
+ * checkedAt/expiresAt freshness (TTL == cache TTL). The token cannot cross a network/request
+ * boundary (a deserialized object is not registered).
  */
 
+import { createHash } from 'node:crypto';
 import { json } from '@remix-run/cloudflare';
 import { createClient } from '@supabase/supabase-js';
 
@@ -24,6 +25,11 @@ export const EXPECTED_COMMERCIAL_SCHEMA_VERSION = '2026-07-30.commercial-launch-
 
 const VERIFIER_RPC = 'qhub_verify_commercial_schema';
 const VERIFIER_IDENTITY = `${VERIFIER_RPC}@${EXPECTED_COMMERCIAL_SCHEMA_VERSION}`;
+
+/** Readiness cache TTL, and the token TTL (a token is never fresher-lived than the cache). */
+const CACHE_MS = 5_000;
+const TOKEN_TTL_MS = CACHE_MS;
+const CLOCK_SKEW_MS = 2_000;
 
 export type ReadinessState = 'READY' | 'NOT_READY' | 'UNAVAILABLE' | 'CONFIGURATION_ERROR';
 
@@ -61,7 +67,15 @@ const INTERNAL_REASON_CODES = new Set<string>([
   'malformed_verifier_response',
   'verifier_probe_failed',
   'version_mismatch',
-  'readiness_token_mismatch',
+  'readiness_token_forged',
+  'readiness_token_version',
+  'readiness_token_verifier',
+  'readiness_token_target',
+  'readiness_token_env',
+  'readiness_token_malformed',
+  'readiness_token_future',
+  'readiness_token_expired',
+  'readiness_token_stale',
 ]);
 
 const UNKNOWN_FAILURE_CODE = 'commercial_schema_unknown_failure';
@@ -83,27 +97,31 @@ export interface CommercialReadiness {
   /** Allowlisted, safe reason codes only — never raw verifier text. */
   failed: string[];
 
-  /** Non-reversible target fingerprint (safe to surface to staff). */
+  /** Non-reversible 128-bit target fingerprint (safe to surface to staff). */
   targetKey: string;
   checkedAt: number;
   cacheAgeMs?: number;
 }
 
-// ─── Target key (non-sensitive, stable, non-reversible) ─────────────────────────
+// ─── Server clock (overridable ONLY under test) ─────────────────────────────────
 
-/** FNV-1a 32-bit → 8-hex. Non-cryptographic but non-reversible and non-sensitive. */
-function fnv1a(input: string): string {
-  let h = 0x811c9dc5;
+let clockNow: () => number = () => Date.now();
 
-  for (let i = 0; i < input.length; i++) {
-    h ^= input.charCodeAt(i);
-    h = Math.imul(h, 0x01000193);
+/**
+ * Test-only server-clock override. Throws in production so the clock can never be moved
+ * by application code at runtime. Pass null to restore the real clock.
+ */
+export function __setServerClockForTests(fn: (() => number) | null): void {
+  if ((process.env.NODE_ENV ?? '').toLowerCase() === 'production') {
+    throw new Error('server clock cannot be overridden in production');
   }
 
-  return (h >>> 0).toString(16).padStart(8, '0');
+  clockNow = fn ?? (() => Date.now());
 }
 
-function normalizedSupabaseUrl(env: Record<string, string | undefined>): string {
+// ─── Cryptographic, collision-resistant target identity ─────────────────────────
+
+function normalizedSupabaseHost(env: Record<string, string | undefined>): string {
   const raw = env.SUPABASE_URL ?? process.env.SUPABASE_URL ?? '';
 
   try {
@@ -113,66 +131,161 @@ function normalizedSupabaseUrl(env: Record<string, string | undefined>): string 
   }
 }
 
+function deploymentEnv(env: Record<string, string | undefined>): string {
+  return (env.QHUB_DEPLOY_ENV ?? process.env.QHUB_DEPLOY_ENV ?? 'unknown').toLowerCase();
+}
+
+/** Deterministic canonical descriptor of the target (never exposed raw). */
+function targetDescriptor(env: Record<string, string | undefined>): string {
+  return JSON.stringify({
+    v: EXPECTED_COMMERCIAL_SCHEMA_VERSION,
+    host: normalizedSupabaseHost(env),
+    deployEnv: deploymentEnv(env),
+    verifier: VERIFIER_IDENTITY,
+  });
+}
+
 /**
- * The readiness/token target key. Binds schema version + normalized Supabase host +
- * deployment environment + verifier identity. A READY for one target NEVER satisfies
- * another (staging vs production, project A vs B). Exposes no raw URL.
+ * Full SHA-256 target digest (256 bits) — the cache key and the token's target binding.
+ * Collision-resistant (replaces the old 32-bit FNV that reproduced a cross-target
+ * collision). A change to host / deploy env / schema version / verifier identity yields a
+ * different digest, so target A can never satisfy target B and staging cannot satisfy prod.
  */
+export function commercialTargetDigest(env: Record<string, string | undefined>): string {
+  return createHash('sha256').update(targetDescriptor(env)).digest('hex');
+}
+
+/** Short (128-bit) NON-reversible fingerprint for diagnostics — never the raw host/URL. */
+export function commercialTargetFingerprint(env: Record<string, string | undefined>): string {
+  return commercialTargetDigest(env).slice(0, 32);
+}
+
+/** Back-compat alias — the cache key is the FULL 256-bit digest. */
 export function commercialTargetKey(env: Record<string, string | undefined>): string {
-  const host = normalizedSupabaseUrl(env);
-  const deployEnv = (env.QHUB_DEPLOY_ENV ?? process.env.QHUB_DEPLOY_ENV ?? 'unknown').toLowerCase();
-  const material = `${EXPECTED_COMMERCIAL_SCHEMA_VERSION}|${host}|${deployEnv}|${VERIFIER_IDENTITY}`;
-
-  return fnv1a(material);
+  return commercialTargetDigest(env);
 }
 
-// ─── Branded, non-forgeable readiness token ─────────────────────────────────────
-
-declare const readyBrand: unique symbol;
+// ─── Runtime-authentic readiness token ──────────────────────────────────────────
 
 /**
- * Proof of an exact READY result for a specific target. Constructible ONLY by this
- * module (mintReadyToken). Callers cannot build it without an `as CommercialReadyToken`
- * cast, which the architecture test forbids outside this module + tests.
+ * The real token. A JS #private field brands the CLASS, and every minted instance is
+ * registered in a module-private WeakSet. Authenticity is proven by registry membership
+ * at validation time, so no forged/copied/cloned/cast object can pass.
  */
-export interface CommercialReadyToken {
-  readonly [readyBrand]: true;
-  readonly schemaVersion: typeof EXPECTED_COMMERCIAL_SCHEMA_VERSION;
-  readonly targetKey: string;
-  readonly checkedAt: string;
+class ReadyToken {
+  readonly #authentic = true;
+  readonly schemaVersion: string;
+  readonly targetDigest: string;
+  readonly deployEnv: string;
+  readonly verifierIdentity: string;
+  readonly checkedAt: number;
+  readonly expiresAt: number;
+
+  constructor(env: Record<string, string | undefined>, now: number) {
+    this.schemaVersion = EXPECTED_COMMERCIAL_SCHEMA_VERSION;
+    this.targetDigest = commercialTargetDigest(env);
+    this.deployEnv = deploymentEnv(env);
+    this.verifierIdentity = VERIFIER_IDENTITY;
+    this.checkedAt = now;
+    this.expiresAt = now + TOKEN_TTL_MS;
+    void this.#authentic;
+  }
 }
+
+/** Only genuine, module-minted instances live here. */
+const tokenRegistry = new WeakSet<object>();
+
+/**
+ * Opaque handle. Application code receives this type but can never see the class or build
+ * an instance — authenticity is a runtime property (registry membership), not a shape.
+ */
+export type CommercialReadyToken = { readonly __commercialReadyToken: unique symbol };
 
 function mintReadyToken(env: Record<string, string | undefined>): CommercialReadyToken {
-  // The ONLY sanctioned cast — this module is the sole token authority.
-  return {
-    schemaVersion: EXPECTED_COMMERCIAL_SCHEMA_VERSION,
-    targetKey: commercialTargetKey(env),
-    checkedAt: new Date().toISOString(),
-  } as CommercialReadyToken;
+  const t = new ReadyToken(env, clockNow());
+  tokenRegistry.add(t);
+
+  return t as unknown as CommercialReadyToken;
 }
 
 /**
- * Re-validate a token against the CURRENT target before a protected side effect. Throws
- * CommercialNotReadyError on any version/target mismatch (a token minted for staging or
- * an older schema can never authorize work here).
+ * Test-only mint of a GENUINE (registered) token. Throws in production. This is not an
+ * `as` bypass — it produces an authentic registry-backed token, and only under test.
+ */
+export function __mintReadyTokenForTests(env: Record<string, string | undefined>): CommercialReadyToken {
+  if ((process.env.NODE_ENV ?? '').toLowerCase() === 'production') {
+    throw new Error('__mintReadyTokenForTests is not available in production');
+  }
+
+  return mintReadyToken(env);
+}
+
+/**
+ * Re-validate a token at the mutation choke point. Throws CommercialNotReadyError on ANY
+ * failure: forgery (not registry-backed), wrong schema version / verifier / target digest /
+ * deployment environment, malformed or future checkedAt, expiry, or age beyond the TTL.
  */
 export function assertReadyToken(token: CommercialReadyToken, env: Record<string, string | undefined>): void {
-  const expectedTarget = commercialTargetKey(env);
+  const now = clockNow();
+  const t = token as unknown as ReadyToken | null | undefined;
 
-  if (!token || token.schemaVersion !== EXPECTED_COMMERCIAL_SCHEMA_VERSION || token.targetKey !== expectedTarget) {
+  const fail = (code: string): never => {
     throw new CommercialNotReadyError({
       state: 'NOT_READY',
       expected: EXPECTED_COMMERCIAL_SCHEMA_VERSION,
-      failed: ['readiness_token_mismatch'],
-      targetKey: expectedTarget,
-      checkedAt: Date.now(),
+      failed: [code],
+      targetKey: commercialTargetFingerprint(env),
+      checkedAt: now,
     });
+  };
+
+  /*
+   * 1. Runtime authenticity — the single non-bypassable check. Only module-minted class
+   * instances are registered; every forgery/clone/cast fails here.
+   */
+  if (!t || typeof t !== 'object' || !tokenRegistry.has(t)) {
+    fail('readiness_token_forged');
+
+    return;
+  }
+
+  // 2. Binding to the exact contract + target.
+  if (t.schemaVersion !== EXPECTED_COMMERCIAL_SCHEMA_VERSION) {
+    fail('readiness_token_version');
+  }
+
+  if (t.verifierIdentity !== VERIFIER_IDENTITY) {
+    fail('readiness_token_verifier');
+  }
+
+  if (t.targetDigest !== commercialTargetDigest(env)) {
+    fail('readiness_token_target');
+  }
+
+  if (t.deployEnv !== deploymentEnv(env)) {
+    fail('readiness_token_env');
+  }
+
+  // 3. Freshness — checkedAt/expiresAt validated on every use, bounded by the cache TTL.
+  if (!Number.isFinite(t.checkedAt) || !Number.isFinite(t.expiresAt)) {
+    fail('readiness_token_malformed');
+  }
+
+  if (t.checkedAt > now + CLOCK_SKEW_MS) {
+    fail('readiness_token_future');
+  }
+
+  if (now >= t.expiresAt) {
+    fail('readiness_token_expired');
+  }
+
+  if (now - t.checkedAt > TOKEN_TTL_MS + CLOCK_SKEW_MS) {
+    fail('readiness_token_stale');
   }
 }
 
 // ─── Target-keyed readiness cache ───────────────────────────────────────────────
 
-const CACHE_MS = 5_000;
 const cache = new Map<string, { at: number; value: CommercialReadiness }>();
 
 /** Test/maintenance hook — clears the entire target-keyed readiness cache. */
@@ -187,27 +300,28 @@ export function isCommercialReady(r: CommercialReadiness): boolean {
 /**
  * Resolve commercial schema readiness for the CURRENT target. Fails closed: any error,
  * malformed response, version mismatch, or failed check yields a non-READY state.
- * Reason codes are allowlisted. Cached per target key with a short TTL.
+ * Reason codes are allowlisted. Cached per full target digest with a short TTL.
  */
 export async function getCommercialSchemaReadiness(
   env: Record<string, string | undefined>,
 ): Promise<CommercialReadiness> {
-  const now = Date.now();
+  const now = clockNow();
   const url = env.SUPABASE_URL ?? process.env.SUPABASE_URL ?? '';
   const key = env.SUPABASE_SERVICE_ROLE_KEY ?? process.env.SUPABASE_SERVICE_ROLE_KEY ?? '';
-  const targetKey = commercialTargetKey(env);
+  const cacheKey = commercialTargetDigest(env);
+  const fingerprint = commercialTargetFingerprint(env);
 
   if (!url || !key) {
     return {
       state: 'CONFIGURATION_ERROR',
       expected: EXPECTED_COMMERCIAL_SCHEMA_VERSION,
       failed: ['missing_supabase_config'],
-      targetKey,
+      targetKey: fingerprint,
       checkedAt: now,
     };
   }
 
-  const hit = cache.get(targetKey);
+  const hit = cache.get(cacheKey);
 
   if (hit && now - hit.at < CACHE_MS) {
     return { ...hit.value, cacheAgeMs: now - hit.at };
@@ -218,10 +332,10 @@ export async function getCommercialSchemaReadiness(
       ...r,
       failed: r.failed.map(safeReasonCode),
       expected: EXPECTED_COMMERCIAL_SCHEMA_VERSION,
-      targetKey,
+      targetKey: fingerprint,
       checkedAt: now,
     };
-    cache.set(targetKey, { at: now, value });
+    cache.set(cacheKey, { at: now, value });
 
     return value;
   };
@@ -269,15 +383,18 @@ export class CommercialNotReadyError extends Error {
   readonly readiness: CommercialReadiness;
 
   constructor(readiness: CommercialReadiness) {
-    super(`commercial schema not ready: ${readiness.state}`);
+    // Include the allowlisted reason codes (safe — never raw verifier/tenant text).
+    super(
+      `commercial schema not ready: ${readiness.state}${readiness.failed.length ? ` (${readiness.failed.join(',')})` : ''}`,
+    );
     this.name = 'CommercialNotReadyError';
     this.readiness = readiness;
   }
 }
 
 /**
- * Throw CommercialNotReadyError unless READY; otherwise return a target-bound
- * CommercialReadyToken. This is the ONLY producer of the token.
+ * Throw CommercialNotReadyError unless READY; otherwise return a target-bound, time-boxed
+ * CommercialReadyToken. This (and requireCommercialReady) is the ONLY producer of a token.
  */
 export async function assertCommercialSchemaReady(
   env: Record<string, string | undefined>,
@@ -292,9 +409,9 @@ export async function assertCommercialSchemaReady(
 }
 
 /**
- * Route-level readiness gate. On READY returns a target-bound token to thread into the
- * protected services; on any non-READY returns a fail-closed generic Response (503 for
- * user routes, 500-retryable for webhooks) — commercial callers never see check detail.
+ * Route-level readiness gate. On READY returns a genuine token to thread into the protected
+ * services; on any non-READY returns a fail-closed generic Response (503 for user routes,
+ * 500-retryable for webhooks) — commercial callers never see check detail.
  */
 export async function requireCommercialReady(
   env: Record<string, string | undefined>,
@@ -311,3 +428,6 @@ export async function requireCommercialReady(
     response: json({ ok: false, error: 'commercial_unavailable' }, { status: opts.webhook ? 500 : 503 }),
   };
 }
+
+/** AST-readable module authority classification (commercial-architecture.test.ts). */
+export const __QHUB_MODULE_CLASSIFICATION = 'INTERNAL_SERVER_ONLY' as const;

@@ -287,3 +287,6 @@ export async function loadOrgEntitlements(
 
   return resolveEntitlements({ planId: snap.planId, status: snap.status, overrides: snap.overrides });
 }
+
+/** AST-readable module authority classification (commercial-architecture.test.ts). */
+export const __QHUB_MODULE_CLASSIFICATION = 'INTERNAL_SERVER_ONLY' as const;

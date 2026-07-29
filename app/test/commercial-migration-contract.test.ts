@@ -546,11 +546,43 @@ describe('commercial-launch R3 migration', () => {
       );
       expect(aud.rows[0].n).toBe(1);
 
-      // Exact repeat is idempotent; the audit row is immutable.
+      // EXACT repeat (every material field matches) is idempotent — no second audit row.
       const rep = await db.query<{ v: { idempotent: boolean } }>(
         `select public.qhub_decide_review('${rid}','staff1',true,'approved','looks fine','v1') v`,
       );
       expect(rep.rows[0].v.idempotent).toBe(true);
+
+      /*
+       * MATERIALLY-changed repeats on a terminal request are deterministic conflicts, never
+       * idempotent: changed reason / policy version / decision / reviewer each reject.
+       */
+      const changedReason = await db.query<{ v: { ok: boolean; reason: string } }>(
+        `select public.qhub_decide_review('${rid}','staff1',true,'approved','DIFFERENT reason','v1') v`,
+      );
+      expect(changedReason.rows[0].v.ok).toBe(false);
+      expect(changedReason.rows[0].v.reason).toBe('decision_conflict');
+
+      const changedPolicy = await db.query<{ v: { reason: string } }>(
+        `select public.qhub_decide_review('${rid}','staff1',true,'approved','looks fine','v2') v`,
+      );
+      expect(changedPolicy.rows[0].v.reason).toBe('decision_conflict');
+
+      const changedDecision = await db.query<{ v: { reason: string } }>(
+        `select public.qhub_decide_review('${rid}','staff1',true,'rejected','looks fine','v1') v`,
+      );
+      expect(changedDecision.rows[0].v.reason).toBe('decision_conflict');
+
+      const changedReviewer = await db.query<{ v: { reason: string } }>(
+        `select public.qhub_decide_review('${rid}','staff2',true,'approved','looks fine','v1') v`,
+      );
+      expect(changedReviewer.rows[0].v.reason).toBe('decision_conflict');
+
+      // Still exactly ONE audit row after the idempotent repeat + all conflict attempts.
+      const aud2 = await db.query<{ n: number }>(
+        `select count(*)::int n from public.qhub_entitlement_audit where change_type='REVIEW_DECISION'`,
+      );
+      expect(aud2.rows[0].n).toBe(1);
+
       await expect(db.exec(`update public.qhub_entitlement_audit set reason='x'`)).rejects.toThrow(/immutable/);
     } finally {
       await db.close();

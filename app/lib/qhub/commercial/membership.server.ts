@@ -91,3 +91,6 @@ export async function resolveStaff(userId: string, env: Record<string, string | 
 export async function isActiveStaff(userId: string, env: Record<string, string | undefined>): Promise<boolean> {
   return (await resolveStaff(userId, env)).isStaff;
 }
+
+/** AST-readable module authority classification (commercial-architecture.test.ts). */
+export const __QHUB_MODULE_CLASSIFICATION = 'INTERNAL_SERVER_ONLY' as const;

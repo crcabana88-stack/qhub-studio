@@ -981,3 +981,6 @@ export async function getInvitationOrg(
 
   return (data?.org_id as string) ?? null;
 }
+
+/** AST-readable module authority classification (commercial-architecture.test.ts). */
+export const __QHUB_MODULE_CLASSIFICATION = 'MIXED_EXPLICIT_EXPORT_CLASSIFICATION' as const;

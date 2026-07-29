@@ -92,12 +92,19 @@ export async function createReviewRequest(
   }
 
   const requestType = input.requestType ?? 'data_review';
-  const requestHash = await sha256Hex(
-    `${ctx.orgId}|${input.projectId ?? ''}|${requestType}|${input.category}|${input.reason}`,
-  );
 
   // SERVER-derived evaluated-under policy version (never from the browser).
   const policyVersion = currentReviewPolicyVersion();
+
+  /*
+   * Server-derived request identity BINDS the current policy version (and the requester),
+   * so a new applicable policy version yields a DISTINCT request — a legitimate re-review
+   * after a policy change — while the prior request + audit remain immutable. An exact
+   * repeat under the SAME policy is idempotent (the unique(org_id, request_hash) constraint).
+   */
+  const requestHash = await sha256Hex(
+    `${ctx.orgId}|${input.projectId ?? ''}|${requestType}|${input.category}|${input.reason}|${policyVersion}|${ctx.userId}`,
+  );
 
   const sb = mutator(token, env);
   const { data, error } = await sb
@@ -330,3 +337,6 @@ export function isProhibitedCategory(category: string): boolean {
 export function reviewEligibleCategories(): DataClass[] {
   return [...REVIEW_DATA_CLASSES];
 }
+
+/** AST-readable module authority classification (commercial-architecture.test.ts). */
+export const __QHUB_MODULE_CLASSIFICATION = 'MIXED_EXPLICIT_EXPORT_CLASSIFICATION' as const;

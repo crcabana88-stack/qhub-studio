@@ -10,7 +10,7 @@
 
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 
 const EXPECTED = '2026-07-30.commercial-launch-r4';
 
@@ -29,7 +29,11 @@ import {
   isCommercialReady,
   resetCommercialReadinessCache,
   commercialTargetKey,
+  commercialTargetDigest,
+  commercialTargetFingerprint,
   safeReasonCode,
+  __mintReadyTokenForTests,
+  __setServerClockForTests,
   CommercialNotReadyError,
   EXPECTED_COMMERCIAL_SCHEMA_VERSION,
 } from '~/lib/qhub/commercial/commercial-schema-check.server';
@@ -147,12 +151,14 @@ describe('assertCommercialSchemaReady / requireCommercialReady', () => {
     await expect(assertCommercialSchemaReady(ENV)).rejects.toBeInstanceOf(CommercialNotReadyError);
   });
 
-  it('assert resolves to a target-bound token when READY', async () => {
+  it('assert resolves to a genuine target-bound token when READY (opaque; validated at use)', async () => {
     rpcReturns({ expected_version: EXPECTED, ready: true, failed: [] });
 
     const token = await assertCommercialSchemaReady(ENV);
-    expect(token.schemaVersion).toBe(EXPECTED);
-    expect(token.targetKey).toBe(commercialTargetKey(ENV)); // bound to this exact target
+
+    // The token is opaque — authenticity/target binding is a RUNTIME property, checked here.
+    expect(() => assertReadyToken(token, ENV)).not.toThrow();
+    expect(() => assertReadyToken(token, ENV_PROD)).toThrow(CommercialNotReadyError);
   });
 
   it('requireCommercialReady returns a generic 503 for user routes when NOT READY', async () => {
@@ -249,6 +255,144 @@ describe('target-keyed readiness cache + token binding', () => {
     expect(() => assertReadyToken({ schemaVersion: 'x', targetKey: 'y', checkedAt: 'z' } as never, ENV)).toThrow(
       CommercialNotReadyError,
     );
+  });
+});
+
+describe('runtime-unforgeable token — forgery probes (isolated negative tests)', () => {
+  afterEach(() => __setServerClockForTests(null));
+
+  // A GENUINE token to copy fields from — copies must still be rejected.
+  function genuineShape() {
+    const t = __mintReadyTokenForTests(ENV) as unknown as Record<string, unknown>;
+    return {
+      schemaVersion: t.schemaVersion,
+      targetDigest: t.targetDigest,
+      deployEnv: t.deployEnv,
+      verifierIdentity: t.verifierIdentity,
+      checkedAt: t.checkedAt,
+      expiresAt: t.expiresAt,
+    };
+  }
+
+  it('a plain-object forgery is rejected', () => {
+    expect(() => assertReadyToken({} as never, ENV)).toThrow(CommercialNotReadyError);
+  });
+
+  it('a copied-property forgery (all fields correct) is rejected — authenticity is not shape', () => {
+    const forged = { ...genuineShape() } as never;
+    expect(() => assertReadyToken(forged, ENV)).toThrow(/readiness_token_forged/);
+  });
+
+  it('an Object.create/prototype forgery is rejected', () => {
+    const proto = genuineShape();
+    const forged = Object.create(proto) as never;
+    expect(() => assertReadyToken(forged, ENV)).toThrow(CommercialNotReadyError);
+  });
+
+  it('a JSON round-trip of a genuine token is rejected', () => {
+    const real = __mintReadyTokenForTests(ENV);
+    const roundTripped = JSON.parse(JSON.stringify(real)) as never;
+    expect(() => assertReadyToken(roundTripped, ENV)).toThrow(CommercialNotReadyError);
+  });
+
+  it('a structured clone of a genuine token is rejected', () => {
+    const real = __mintReadyTokenForTests(ENV);
+
+    if (typeof structuredClone === 'function') {
+      // structuredClone drops the class identity + registry membership.
+      let cloned: never;
+
+      try {
+        cloned = structuredClone(real) as never;
+      } catch {
+        cloned = JSON.parse(JSON.stringify(real)) as never; // class instances may be uncloneable
+      }
+
+      expect(() => assertReadyToken(cloned, ENV)).toThrow(CommercialNotReadyError);
+    }
+  });
+
+  it('a genuine token for the wrong environment / verifier / version is rejected', () => {
+    const staging = __mintReadyTokenForTests(ENV_STAGING);
+    expect(() => assertReadyToken(staging, ENV_PROD)).toThrow(CommercialNotReadyError); // wrong env + target
+  });
+
+  it('a stale token (older than the TTL) is rejected', () => {
+    let t = 1_000_000;
+    __setServerClockForTests(() => t);
+
+    const real = __mintReadyTokenForTests(ENV);
+
+    t += 6_000; // TTL is 5s → now expired/stale
+    expect(() => assertReadyToken(real, ENV)).toThrow(/readiness_token_(expired|stale)/);
+  });
+
+  it('a future-checkedAt token beyond clock skew is rejected', () => {
+    let t = 1_000_000;
+    __setServerClockForTests(() => t);
+
+    const real = __mintReadyTokenForTests(ENV);
+
+    t -= 10_000; // wall clock jumps backward → token checkedAt is now "in the future"
+    expect(() => assertReadyToken(real, ENV)).toThrow(/readiness_token_future/);
+  });
+
+  it('a fresh token within the TTL is accepted', () => {
+    let t = 1_000_000;
+    __setServerClockForTests(() => t);
+
+    const real = __mintReadyTokenForTests(ENV);
+
+    t += 1_000; // within the 5s TTL
+    expect(() => assertReadyToken(real, ENV)).not.toThrow();
+  });
+
+  it('the server clock cannot be overridden in production', () => {
+    const prev = process.env.NODE_ENV;
+    process.env.NODE_ENV = 'production';
+
+    try {
+      expect(() => __setServerClockForTests(() => 0)).toThrow(/production/);
+    } finally {
+      process.env.NODE_ENV = prev;
+    }
+  });
+});
+
+describe('collision-resistant cryptographic target digest', () => {
+  it('the digest is a full 256-bit SHA-256 (64 hex) and the fingerprint is 128-bit (32 hex)', () => {
+    expect(commercialTargetDigest(ENV)).toMatch(/^[0-9a-f]{64}$/);
+    expect(commercialTargetFingerprint(ENV)).toMatch(/^[0-9a-f]{32}$/);
+    expect(commercialTargetDigest(ENV).startsWith(commercialTargetFingerprint(ENV))).toBe(true);
+  });
+
+  it('the previously reproduced 32-bit collision (d53c94b3) no longer collides', () => {
+    // Two DIFFERENT targets that collided under the old FNV-32 must now differ.
+    const a = commercialTargetDigest({ SUPABASE_URL: 'https://project-alpha.supabase.co', QHUB_DEPLOY_ENV: 'staging' });
+    const b = commercialTargetDigest({
+      SUPABASE_URL: 'https://project-bravo.supabase.co',
+      QHUB_DEPLOY_ENV: 'production',
+    });
+    expect(a).not.toBe(b);
+    expect(a.length).toBe(64); // not a 8-hex 32-bit value
+  });
+
+  it('host, deploy env, and (implicitly) version/verifier each change the digest', () => {
+    const base = commercialTargetDigest(ENV);
+    expect(commercialTargetDigest(ENV_B)).not.toBe(base); // host
+    expect(commercialTargetDigest(ENV_PROD)).not.toBe(base); // deploy env
+  });
+
+  it('a configuration change invalidates the cache (fresh probe for the new target)', async () => {
+    rpcReturns({ expected_version: EXPECTED, ready: true, failed: [] });
+    await getCommercialSchemaReadiness(ENV);
+
+    rpcReturns({ expected_version: EXPECTED, ready: false, failed: ['reconcile_rpc_contract'] });
+
+    const changed = await getCommercialSchemaReadiness({ ...ENV, QHUB_DEPLOY_ENV: 'production' });
+
+    expect(changed.state).toBe('NOT_READY');
+    expect(S.rpc).toHaveBeenCalledTimes(2);
   });
 });
 

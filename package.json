@@ -13,7 +13,10 @@
   "scripts": {
     "schema:check": "node scripts/schema-smoke-check.mjs",
     "gate04:live:staging": "node scripts/staging/gate04-authenticated-live-matrix.mjs",
+    "preflight": "node scripts/schema-smoke-check.mjs",
+    "startup:preflight": "node scripts/startup-preflight.mjs",
     "deploy": "npm run schema:check && npm run build && wrangler pages deploy",
+    "pages:deploy": "npm run schema:check && wrangler pages deploy",
     "build": "remix vite:build",
     "dev": "node pre-start.cjs  && remix vite:dev",
     "test": "vitest --run",

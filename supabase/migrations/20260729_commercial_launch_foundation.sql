@@ -831,13 +831,22 @@ BEGIN
     RETURN jsonb_build_object('ok', false, 'reason', 'not_found');
   END IF;
 
-  -- Exact-repeat idempotency: same terminal decision by the same actor.
+  -- Exact-repeat idempotency on an already-terminal request: idempotent ONLY when EVERY
+  -- material field matches (decision, reviewer, normalized reason, and server-derived
+  -- policy version — the resulting Governance Essentials disposition is a pure function of
+  -- the decision, so a matching decision implies a matching disposition). No second audit
+  -- row is written. Any material difference is a deterministic conflict (never idempotent).
   IF r.status <> 'pending' THEN
-    IF r.status = p_decision AND r.decided_by IS NOT DISTINCT FROM p_actor THEN
+    IF r.status = p_decision
+       AND r.decided_by IS NOT DISTINCT FROM p_actor
+       AND btrim(coalesce(r.decision_reason, '')) IS NOT DISTINCT FROM btrim(coalesce(p_reason, ''))
+       AND r.policy_version IS NOT DISTINCT FROM p_policy_version THEN
       RETURN jsonb_build_object('ok', true, 'idempotent', true);
     END IF;
 
-    RETURN jsonb_build_object('ok', false, 'reason', 'not_pending');
+    -- Changed reason / policy version / decision / reviewer / disposition on a terminal
+    -- request → deterministic conflict. A policy-change re-review uses a NEW request.
+    RETURN jsonb_build_object('ok', false, 'reason', 'decision_conflict');
   END IF;
 
   IF p_decision = 'approved' AND r.category IN ('secrets','credentials','mnpi','regulated_records','consequential_action','external_write','autonomous_agent') THEN

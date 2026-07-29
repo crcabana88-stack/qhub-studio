@@ -131,3 +131,6 @@ export function checkRateLimit(key: string, max: number, windowMs: number, now: 
 export function resetRateLimiter(): void {
   buckets.clear();
 }
+
+/** AST-readable module authority classification (commercial-architecture.test.ts). */
+export const __QHUB_MODULE_CLASSIFICATION = 'INTERNAL_SERVER_ONLY' as const;

@@ -53,6 +53,9 @@ COPY functions ./functions
 # no node compat, so the SSR bundle's node: imports (e.g. node:crypto in the
 # governance service) fail to bundle and the worker crashes on boot.
 COPY wrangler.toml ./
+# scripts/ carries the schema verifier + startup preflight — required so the container's
+# CMD can fail-closed on a NOT_READY schema before it starts serving commercial traffic.
+COPY scripts ./scripts
 COPY bindings.sh ./
 # worker-configuration.d.ts lists the env var names that bindings.sh
 # reads from process.env and forwards to wrangler as --binding flags.
@@ -75,5 +78,8 @@ EXPOSE 5173
 HEALTHCHECK --interval=30s --timeout=5s --start-period=45s --retries=3 \
   CMD node -e "require('http').get('http://localhost:5173/login', r => process.exit(r.statusCode >= 200 && r.statusCode < 400 ? 0 : 1))"
 
-# dockerstart binds to 0.0.0.0:5173 (required for Fly.io proxy to reach it)
-CMD ["pnpm", "run", "dockerstart"]
+# Startup preflight (layer B) runs BEFORE the server serves: on a deployed target
+# (QHUB_DEPLOY_ENV=staging/production) it runs the full schema verification and exits
+# nonzero on NOT_READY/UNAVAILABLE, so the container starts in a closed, non-serving state.
+# dockerstart binds to 0.0.0.0:5173 (required for Fly.io proxy to reach it).
+CMD ["sh", "-c", "node scripts/startup-preflight.mjs && pnpm run dockerstart"]

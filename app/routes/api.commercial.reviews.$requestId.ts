@@ -1,3 +1,4 @@
+// @qhub-route: COMMERCIAL_READY
 /**
  * QHUB Commercial Launch R3 — GET /api/commercial/reviews/:requestId  (customer view)
  * app/routes/api.commercial.reviews.$requestId.ts

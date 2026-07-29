@@ -253,3 +253,6 @@ export async function requestCommercialPublication(
   // Publication requires an approved review (or a clean proceed disposition).
   return { ok: true, value: { projectId: ctx.projectId, publishable: isPublicationAllowed(gov) } };
 }
+
+/** AST-readable module authority classification (commercial-architecture.test.ts). */
+export const __QHUB_MODULE_CLASSIFICATION = 'MIXED_EXPLICIT_EXPORT_CLASSIFICATION' as const;

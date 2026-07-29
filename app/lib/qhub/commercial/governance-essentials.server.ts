@@ -279,3 +279,6 @@ export function buildEvidenceExport(rec: GovernanceRecord): Record<string, unkno
     schema: 'qhub-governance-essentials-1.0.0',
   };
 }
+
+/** AST-readable module authority classification (commercial-architecture.test.ts). */
+export const __QHUB_MODULE_CLASSIFICATION = 'MIXED_EXPLICIT_EXPORT_CLASSIFICATION' as const;

@@ -526,3 +526,6 @@ export function planIdForConfiguredPrice(priceId: string, env: Record<string, st
 export function createBillingProvider(env: Record<string, string | undefined>): BillingProvider {
   return new StripeBillingProvider(env);
 }
+
+/** AST-readable module authority classification (commercial-architecture.test.ts). */
+export const __QHUB_MODULE_CLASSIFICATION = 'INTERNAL_SERVER_ONLY' as const;

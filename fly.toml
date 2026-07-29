@@ -11,6 +11,13 @@ primary_region = "iad"   # us-east (IAD) — closest to NY financial clients
 [build]
   dockerfile = "Dockerfile"
 
+# Release-phase preflight (layer A): Fly runs this in a temporary machine BEFORE the new
+# release goes live. It executes the full schema verification (Gate 01–05 + Agent +
+# Commercial R4); a NOT_READY / UNAVAILABLE schema fails the release. There is no
+# staging/production skip flag.
+[deploy]
+  release_command = "node scripts/schema-smoke-check.mjs"
+
 [env]
   NODE_ENV = "production"
   VITE_LOG_LEVEL = "warn"
