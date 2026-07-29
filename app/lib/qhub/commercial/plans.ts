@@ -229,7 +229,9 @@ export const PLAN_CATALOG: Record<Exclude<PlanId, 'none'>, PlanConfig> = {
     },
     entitlements: {
       seats: 5,
-      maxProjects: 5,
+
+      // Product = exactly ONE active launch application (enforced in DB + guard + tests).
+      maxProjects: 1,
       buildCreditsPerMonth: 1000,
       maxRiskTier: 'T1',
       appBuilding: true,

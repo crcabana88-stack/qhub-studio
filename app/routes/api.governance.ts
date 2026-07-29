@@ -29,18 +29,26 @@
  */
 
 import { json, type ActionFunctionArgs } from '@remix-run/cloudflare';
-import { getSession } from '~/lib/auth/session';
+import { requireCommercialContext } from '~/lib/qhub/commercial/commercial-context.server';
 import { createGovernanceService, type GovernanceIntent } from '~/lib/qhub/governance-service.server';
 import { generateStableSessionId } from '~/lib/qhub/session-id.server';
 
 export async function action({ request, context }: ActionFunctionArgs) {
-  // ── 1. Authentication ───────────────────────────────────────────────────────
+  // ── 1. Authoritative context + capability (APP_BUILD) ─────────────────────────
   const env = (context.cloudflare?.env as unknown as Record<string, string | undefined>) ?? {};
-  const session = await getSession(request, env);
+  const guard = await requireCommercialContext(request, env, 'APP_BUILD');
 
-  if (!session) {
-    return json({ ok: false, error: 'Unauthenticated' }, { status: 401 });
+  if (!guard.ok) {
+    return guard.response;
   }
+
+  const ctx = guard.ctx;
+
+  if (!ctx.orgId) {
+    return json({ ok: false, error: 'no_org_context' }, { status: 403 });
+  }
+
+  const session = { userId: ctx.userId, orgId: ctx.orgId, role: ctx.role ?? 'staff' };
 
   // ── 2. Parse intent ─────────────────────────────────────────────────────────
   let intent: GovernanceIntent;

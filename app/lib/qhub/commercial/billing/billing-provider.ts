@@ -72,17 +72,42 @@ export interface NormalizedBillingEvent {
   rawType: string;
   providerCustomerId?: string;
   providerSubscriptionId?: string;
+  providerPriceId?: string;
   orgId?: string;
   planId?: PlanId;
   status?: SubscriptionStatus;
 
   /** Seconds since epoch when the current period ends, if present. */
   currentPeriodEnd?: number;
+
+  /** Stripe livemode flag — bound against the configured mode. */
+  livemode: boolean;
+
+  /** Stripe account id (Connect), when present. */
+  stripeAccount?: string;
+
+  /** event.created (seconds) — used to reject out-of-order updates. */
+  eventCreated: number;
 }
 
 export type WebhookVerifyResult =
   | { ok: true; event: NormalizedBillingEvent }
-  | { ok: false; error: string; code: 'NO_SECRET' | 'BAD_SIGNATURE' | 'STALE' | 'MALFORMED' };
+  | {
+      ok: false;
+      error: string;
+      code: 'NO_SECRET' | 'BAD_SIGNATURE' | 'STALE' | 'MALFORMED' | 'MODE_MISMATCH' | 'ACCOUNT_MISMATCH';
+    };
+
+/** The authoritative subscription object retrieved directly from the provider. */
+export interface RetrievedSubscription {
+  id: string;
+  customerId: string;
+  status: SubscriptionStatus;
+  priceId: string | null;
+  livemode: boolean;
+  currentPeriodEnd: number | null;
+  metadata: Record<string, string>;
+}
 
 // ─── Provider contract ──────────────────────────────────────────────────────────
 
@@ -106,4 +131,16 @@ export interface BillingProvider {
     signatureHeader: string | null,
     nowSeconds?: number,
   ): Promise<WebhookVerifyResult>;
+
+  /** The mode the server is configured for (true = live). Bound against events. */
+  expectedLivemode(): boolean;
+
+  /**
+   * Retrieve the CURRENT subscription object directly from the provider (never
+   * trusting webhook metadata alone) for authoritative reconciliation.
+   */
+  retrieveSubscription(subscriptionId: string): Promise<BillingResult<RetrievedSubscription>>;
+
+  /** True when the given recurring price id is one of the server-configured prices. */
+  isConfiguredPrice(priceId: string): boolean;
 }

@@ -103,7 +103,14 @@ export async function upsertSubscription(
 }
 
 export async function upsertBillingCustomer(
-  input: { orgId: string; provider: string; providerCustomerId: string; email: string },
+  input: {
+    orgId: string;
+    provider: string;
+    providerCustomerId: string;
+    email: string;
+    livemode?: boolean;
+    stripeAccount?: string;
+  },
   env: Record<string, string | undefined>,
 ): Promise<void> {
   const sb = admin(env);
@@ -113,48 +120,137 @@ export async function upsertBillingCustomer(
       provider: input.provider,
       provider_customer_id: input.providerCustomerId,
       email: input.email,
+      livemode: input.livemode ?? false,
+      stripe_account: input.stripeAccount ?? null,
       updated_at: new Date().toISOString(),
     },
     { onConflict: 'org_id,provider' },
   );
 }
 
-// ─── Webhook idempotency (replay protection) ────────────────────────────────────
+/** The authoritative org mapped to a provider customer id, or null. */
+export async function getOrgByCustomer(
+  provider: string,
+  providerCustomerId: string,
+  env: Record<string, string | undefined>,
+): Promise<string | null> {
+  const sb = admin(env);
+  const { data } = await sb
+    .from('qhub_billing_customers')
+    .select('org_id')
+    .eq('provider', provider)
+    .eq('provider_customer_id', providerCustomerId)
+    .maybeSingle();
+
+  return (data?.org_id as string) ?? null;
+}
+
+// ─── Webhook inbox (recoverable state machine) ──────────────────────────────────
+
+export type WebhookClaim = 'CLAIMED' | 'DUPLICATE' | 'IN_PROGRESS';
 
 /**
- * Record a webhook event id. Returns true if this id is NEW (first time seen), so
- * the caller processes it exactly once. A duplicate returns false → skip.
+ * Atomically claim a webhook event for processing via the guarded RPC. A NEW event
+ * (or a retryable one) transitions to PROCESSING and returns CLAIMED; an already-
+ * processed/permanently-failed event returns DUPLICATE; an in-flight one returns
+ * IN_PROGRESS. Only a unique-violation on the event id is treated as a duplicate —
+ * transient failures throw and stay retryable.
  */
-export async function recordWebhookEventOnce(
-  input: { provider: string; providerEventId: string; eventType: string },
+export async function claimWebhookEvent(
+  input: {
+    provider: string;
+    providerEventId: string;
+    eventType: string;
+    livemode: boolean;
+    account: string | null;
+    eventCreated: number;
+    payloadHash: string;
+  },
   env: Record<string, string | undefined>,
-): Promise<boolean> {
+): Promise<WebhookClaim> {
   const sb = admin(env);
-  const { error } = await sb.from('qhub_billing_webhook_events').insert({
-    provider: input.provider,
-    provider_event_id: input.providerEventId,
-    event_type: input.eventType,
-    received_at: new Date().toISOString(),
+  const { data, error } = await sb.rpc('qhub_claim_webhook_event', {
+    p_provider: input.provider,
+    p_event_id: input.providerEventId,
+    p_event_type: input.eventType,
+    p_livemode: input.livemode,
+    p_account: input.account,
+    p_event_created: input.eventCreated,
+    p_payload_hash: input.payloadHash,
   });
 
   if (error) {
-    // Unique-violation → already seen → not new (idempotent skip).
-    return false;
+    throw new Error(`[Webhook] claim failed: ${error.message}`);
   }
 
-  return true;
+  return (data as WebhookClaim) ?? 'IN_PROGRESS';
 }
 
-export async function markWebhookProcessed(
-  input: { provider: string; providerEventId: string },
+export async function setWebhookState(
+  input: { provider: string; providerEventId: string; state: string; errorCode?: string },
   env: Record<string, string | undefined>,
 ): Promise<void> {
   const sb = admin(env);
   await sb
     .from('qhub_billing_webhook_events')
-    .update({ processed_at: new Date().toISOString() })
+    .update({
+      state: input.state,
+      last_error_code: input.errorCode ?? null,
+      processed_at: input.state === 'PROCESSED' ? new Date().toISOString() : null,
+    })
     .eq('provider', input.provider)
     .eq('provider_event_id', input.providerEventId);
+}
+
+/**
+ * Apply a reconciled subscription mutation with an out-of-order guard: an event
+ * whose created time is not newer than the last applied one is ignored ('stale'),
+ * so a delayed 'active' event can never resurrect a later 'canceled' state.
+ */
+export async function applySubscriptionEvent(
+  input: UpsertSubscriptionInput & {
+    eventCreated: number;
+    providerPriceId?: string;
+    livemode?: boolean;
+    stripeAccount?: string;
+  },
+  env: Record<string, string | undefined>,
+): Promise<'applied' | 'stale'> {
+  const sb = admin(env);
+  const { data: existing } = await sb
+    .from('qhub_subscriptions')
+    .select('last_event_created')
+    .eq('org_id', input.orgId)
+    .eq('provider', input.provider)
+    .maybeSingle();
+
+  if (
+    existing &&
+    typeof existing.last_event_created === 'number' &&
+    input.eventCreated <= existing.last_event_created
+  ) {
+    return 'stale';
+  }
+
+  await sb.from('qhub_subscriptions').upsert(
+    {
+      org_id: input.orgId,
+      plan_id: input.planId,
+      status: input.status,
+      provider: input.provider,
+      provider_customer_id: input.providerCustomerId ?? null,
+      provider_subscription_id: input.providerSubscriptionId ?? null,
+      provider_price_id: input.providerPriceId ?? null,
+      livemode: input.livemode ?? false,
+      stripe_account: input.stripeAccount ?? null,
+      current_period_end: input.currentPeriodEnd ?? null,
+      last_event_created: input.eventCreated,
+      updated_at: new Date().toISOString(),
+    },
+    { onConflict: 'org_id,provider' },
+  );
+
+  return 'applied';
 }
 
 // ─── Counts (for seat/project limits) ────────────────────────────────────────────
@@ -223,29 +319,31 @@ export async function getOrInitUsage(
 }
 
 /**
- * Consume one build credit atomically via the guarded RPC. Returns the remaining
- * credits, or null when exhausted / not consumable.
+ * Consume one build credit atomically + idempotently via the guarded RPC (single
+ * transaction: lock → validate → decrement → append immutable ledger row). The
+ * idempotency key makes an exact retry return the prior balance without a second
+ * decrement; a materially different request under the same key is rejected by the
+ * RPC. Returns the remaining credits, or null when exhausted / not consumable.
  */
 export async function consumeBuildCredit(
-  orgId: string,
-  monthlyAllotment: number,
+  input: { orgId: string; monthlyAllotment: number; idempotencyKey: string; requestHash: string },
   env: Record<string, string | undefined>,
   now: Date = new Date(),
 ): Promise<number | null> {
-  await getOrInitUsage(orgId, monthlyAllotment, env, now);
+  await getOrInitUsage(input.orgId, input.monthlyAllotment, env, now);
 
   const sb = admin(env);
   const period = currentUsagePeriod(now);
   const { data, error } = await sb.rpc('qhub_consume_build_credit', {
-    p_org_id: orgId,
+    p_org_id: input.orgId,
     p_period_key: period.periodKey,
+    p_idempotency_key: input.idempotencyKey,
+    p_request_hash: input.requestHash,
   });
 
   if (error || data === null || data === undefined) {
     return null;
   }
-
-  await appendUsageLedger({ orgId, eventType: 'BUILD_CREDIT_CONSUMED', creditsDelta: -1 }, env);
 
   return data as number;
 }

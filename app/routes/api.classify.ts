@@ -14,17 +14,22 @@
  */
 
 import { json, type ActionFunctionArgs } from '@remix-run/cloudflare';
-import { getSession } from '~/lib/auth/session';
+import { requireCommercialContext } from '~/lib/qhub/commercial/commercial-context.server';
 import { classifyApplication } from '~/lib/qhub/classifier.server';
+import { tierRank } from '~/lib/qhub/classification';
+import { LAUNCH_MAX_RISK_TIER } from '~/lib/qhub/commercial/plans';
 import { persistProposal } from '~/lib/qhub/qhub-app.server';
 
 export async function action({ request, context }: ActionFunctionArgs) {
   const env = (context.cloudflare?.env as unknown as Record<string, string | undefined>) ?? {};
-  const session = await getSession(request, env);
+  const guard = await requireCommercialContext(request, env, 'APP_BUILD');
 
-  if (!session) {
-    return json({ ok: false, error: 'Unauthenticated' }, { status: 401 });
+  if (!guard.ok) {
+    return guard.response;
   }
+
+  const ctx = guard.ctx;
+  const session = { userId: ctx.userId, orgId: ctx.orgId ?? '', role: ctx.role ?? 'staff' };
 
   let body: { description?: string; conversationId?: string };
 
@@ -44,6 +49,22 @@ export async function action({ request, context }: ActionFunctionArgs) {
 
   try {
     const classification = await classifyApplication(description, env);
+
+    /*
+     * Commercial boundary: a use case that classifies above the launch cap (T2/T3)
+     * is denied for non-staff — the launch tier supports T0/T1 only.
+     */
+    if (!ctx.isStaff && tierRank(classification.risk_tier) > tierRank(LAUNCH_MAX_RISK_TIER)) {
+      return json(
+        {
+          ok: false,
+          error: 'tier_above_launch_cap',
+          risk_tier: classification.risk_tier,
+          message: `This use case classifies as ${classification.risk_tier}. The launch tier supports ${LAUNCH_MAX_RISK_TIER} and below.`,
+        },
+        { status: 403 },
+      );
+    }
 
     /*
      * Gate 03 Phase 0: persist the provisional classification server-side and

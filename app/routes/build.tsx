@@ -11,31 +11,37 @@
 
 import { json, redirect, type LoaderFunctionArgs, type MetaFunction } from '@remix-run/cloudflare';
 import { useLoaderData } from '@remix-run/react';
-import { getSession } from '~/lib/auth/session';
-import {
-  loadOrgEntitlements,
-  decideAppBuild,
-  decideProjectCreation,
-  decideAgentBuild,
-} from '~/lib/qhub/commercial/entitlements.server';
+import { requireCommercialContext } from '~/lib/qhub/commercial/commercial-context.server';
+import { decideAppBuild, decideProjectCreation, decideAgentBuild } from '~/lib/qhub/commercial/entitlements.server';
 import { countProjects } from '~/lib/qhub/commercial/commercial-store.server';
 
 export const meta: MetaFunction = () => [{ title: 'Start Building — QHub' }];
 
 export async function loader({ request, context }: LoaderFunctionArgs) {
   const env = (context?.cloudflare?.env as unknown as Record<string, string | undefined>) ?? {};
-  const session = await getSession(request, env);
 
-  if (!session) {
-    return redirect('/login');
+  // Authoritative context (membership/entitlements from the DB, not user_metadata).
+  const guard = await requireCommercialContext(request, env);
+
+  if (!guard.ok) {
+    /*
+     * Unauthenticated / unconfigured → login; anything else surfaces as-is.
+     * Thrown Responses short-circuit the loader (keeps the success type clean).
+     */
+    if (guard.response.status === 401 || guard.response.status === 503) {
+      throw redirect('/login');
+    }
+
+    throw guard.response;
   }
 
-  const resolved = await loadOrgEntitlements(session.orgId, env);
+  const ctx = guard.ctx;
+  const resolved = ctx.resolved;
 
   let projectCount = 0;
 
   try {
-    projectCount = await countProjects(session.orgId, env);
+    projectCount = ctx.orgId ? await countProjects(ctx.orgId, env) : 0;
   } catch {
     projectCount = 0; // fail closed to "no known projects"; creation still gated below
   }
@@ -44,12 +50,15 @@ export async function loader({ request, context }: LoaderFunctionArgs) {
   const projectDecision = decideProjectCreation(resolved.entitlements, projectCount);
   const agentDecision = decideAgentBuild(resolved.entitlements);
 
-  // Build an App requires BOTH the capability and a free project slot.
-  const canBuildApp = appDecision.allowed && projectDecision.allowed;
+  /*
+   * Build an App requires the capability, a free project slot, and (server-side)
+   * the resolved APP_BUILD capability from the authoritative context.
+   */
+  const canBuildApp = ctx.capabilities.has('APP_BUILD') && appDecision.allowed && projectDecision.allowed;
   const appReason = !appDecision.allowed ? appDecision : !projectDecision.allowed ? projectDecision : null;
 
   return json({
-    email: session.email,
+    email: ctx.email,
     planId: resolved.planId,
     serviceState: resolved.serviceState,
     projectCount,

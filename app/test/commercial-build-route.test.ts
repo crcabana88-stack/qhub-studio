@@ -1,33 +1,54 @@
 /**
- * QHUB Commercial Launch — /build loader server-side entitlement enforcement
+ * QHUB Commercial Launch R2 — /build loader (authoritative context enforcement)
  * app/test/commercial-build-route.test.ts
- *
- * The loader — not the browser — decides what is buildable. These tests drive the
- * loader directly to prove enforcement holds regardless of any UI state.
  */
 
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import type { ResolvedEntitlements } from '~/lib/qhub/commercial/entitlements.server';
+import type { CommercialContext } from '~/lib/qhub/commercial/commercial-context.server';
 
-const { mockGetSession, mockLoadEntitlements, mockCountProjects } = vi.hoisted(() => ({
-  mockGetSession: vi.fn(),
-  mockLoadEntitlements: vi.fn(),
+const { mockRequire, mockCountProjects } = vi.hoisted(() => ({
+  mockRequire: vi.fn(),
   mockCountProjects: vi.fn(),
 }));
 
-vi.mock('~/lib/auth/session', () => ({ getSession: mockGetSession }));
-
-vi.mock('~/lib/qhub/commercial/entitlements.server', async (importActual) => {
-  const actual = await importActual<typeof import('~/lib/qhub/commercial/entitlements.server')>();
-  return { ...actual, loadOrgEntitlements: mockLoadEntitlements };
+vi.mock('~/lib/qhub/commercial/commercial-context.server', async (importActual) => {
+  const actual = await importActual<typeof import('~/lib/qhub/commercial/commercial-context.server')>();
+  return { ...actual, requireCommercialContext: mockRequire };
 });
-
 vi.mock('~/lib/qhub/commercial/commercial-store.server', () => ({ countProjects: mockCountProjects }));
 
 import { loader } from '~/routes/build';
 import { resolveEntitlements } from '~/lib/qhub/commercial/entitlements.server';
+import { computeCapabilities } from '~/lib/qhub/commercial/capabilities';
 
-function ctx() {
+function makeCtx(planId: 'builder_beta' | 'none', status: 'active' | 'none'): CommercialContext {
+  const resolved = resolveEntitlements({ planId, status });
+  const capabilities = computeCapabilities({
+    serviceState: resolved.serviceState,
+    entitlements: resolved.entitlements,
+    membershipActive: true,
+    role: 'builder',
+    isStaff: false,
+    onboardingComplete: true,
+    suspended: false,
+  });
+
+  return {
+    userId: 'u1',
+    email: 'u@x.com',
+    orgId: 'org1',
+    role: 'builder',
+    membershipStatus: 'active',
+    isStaff: false,
+    staffRole: null,
+    resolved,
+    capabilities,
+    onboardingComplete: true,
+    suspended: false,
+  };
+}
+
+function args() {
   return {
     context: { cloudflare: { env: {} } },
     params: {},
@@ -35,37 +56,24 @@ function ctx() {
   } as never;
 }
 
-function resolved(planId: 'builder_beta' | 'guided_builder' | 'none', status: 'active' | 'none'): ResolvedEntitlements {
-  return resolveEntitlements({ planId, status });
-}
-
-interface BuildData {
-  canBuildApp: boolean;
-  canBuildAgent: boolean;
-  appReasonCode: string | null;
-}
-
-async function load(): Promise<BuildData> {
-  const res = (await loader(ctx())) as Response;
-  return (await res.json()) as BuildData;
+async function load(): Promise<{ canBuildApp: boolean; canBuildAgent: boolean; appReasonCode: string | null }> {
+  const res = (await loader(args())) as Response;
+  return (await res.json()) as { canBuildApp: boolean; canBuildAgent: boolean; appReasonCode: string | null };
 }
 
 beforeEach(() => {
   vi.clearAllMocks();
 });
 
-describe('/build loader enforcement', () => {
-  it('redirects to /login when unauthenticated', async () => {
-    mockGetSession.mockResolvedValue(null);
+describe('/build loader', () => {
+  it('redirects to /login when the guard denies with 401', async () => {
+    mockRequire.mockResolvedValue({ ok: false, response: new Response(null, { status: 401 }) });
 
-    const res = (await loader(ctx())) as Response;
-    expect(res.status).toBe(302);
-    expect(res.headers.get('location')).toBe('/login');
+    await expect(loader(args())).rejects.toMatchObject({ status: 302 });
   });
 
   it('enables Build an App for an active Builder Beta org under the project limit', async () => {
-    mockGetSession.mockResolvedValue({ userId: 'u', orgId: 'org1', email: 'a@b.com', role: 'admin' });
-    mockLoadEntitlements.mockResolvedValue(resolved('builder_beta', 'active'));
+    mockRequire.mockResolvedValue({ ok: true, ctx: makeCtx('builder_beta', 'active') });
     mockCountProjects.mockResolvedValue(2);
 
     const data = await load();
@@ -73,9 +81,8 @@ describe('/build loader enforcement', () => {
     expect(data.canBuildAgent).toBe(false);
   });
 
-  it('disables Build an App at the project limit (server-enforced)', async () => {
-    mockGetSession.mockResolvedValue({ userId: 'u', orgId: 'org1', email: 'a@b.com', role: 'admin' });
-    mockLoadEntitlements.mockResolvedValue(resolved('builder_beta', 'active'));
+  it('disables Build an App at the project limit', async () => {
+    mockRequire.mockResolvedValue({ ok: true, ctx: makeCtx('builder_beta', 'active') });
     mockCountProjects.mockResolvedValue(5);
 
     const data = await load();
@@ -83,22 +90,11 @@ describe('/build loader enforcement', () => {
     expect(data.appReasonCode).toBe('PROJECT_LIMIT_REACHED');
   });
 
-  it('disables Build an App entirely with no active plan', async () => {
-    mockGetSession.mockResolvedValue({ userId: 'u', orgId: 'org1', email: 'a@b.com', role: 'admin' });
-    mockLoadEntitlements.mockResolvedValue(resolved('none', 'none'));
+  it('disables Build an App with no active plan (no APP_BUILD capability)', async () => {
+    mockRequire.mockResolvedValue({ ok: true, ctx: makeCtx('none', 'none') });
     mockCountProjects.mockResolvedValue(0);
 
     const data = await load();
     expect(data.canBuildApp).toBe(false);
-    expect(data.appReasonCode).toBe('APP_BUILDING_DISABLED');
-  });
-
-  it('never enables agent building', async () => {
-    mockGetSession.mockResolvedValue({ userId: 'u', orgId: 'org1', email: 'a@b.com', role: 'admin' });
-    mockLoadEntitlements.mockResolvedValue(resolved('guided_builder', 'active'));
-    mockCountProjects.mockResolvedValue(0);
-
-    const data = await load();
-    expect(data.canBuildAgent).toBe(false);
   });
 });

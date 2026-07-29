@@ -20,7 +20,7 @@
  */
 
 import { json, type ActionFunctionArgs } from '@remix-run/cloudflare';
-import { getSession } from '~/lib/auth/session';
+import { requireCommercialContext } from '~/lib/qhub/commercial/commercial-context.server';
 import { generateStableSessionId } from '~/lib/qhub/session-id.server';
 import { buildAgentManifest } from '~/lib/qhub/agent/agent-manifest.server';
 import {
@@ -41,11 +41,24 @@ import { freezeReleaseCandidate } from '~/lib/qhub/attestation.server';
 
 export async function action({ request, context }: ActionFunctionArgs) {
   const env = (context.cloudflare?.env as unknown as Record<string, string | undefined>) ?? {};
-  const session = await getSession(request, env);
 
-  if (!session) {
-    return json({ ok: false, error: 'Unauthenticated' }, { status: 401 });
+  /*
+   * Agent building/running is denied to commercial customers — only authoritative
+   * internal staff hold AGENT_BUILD. Institutional agents are not in the launch tier.
+   */
+  const guard = await requireCommercialContext(request, env, 'AGENT_BUILD');
+
+  if (!guard.ok) {
+    return guard.response;
   }
+
+  const ctx = guard.ctx;
+
+  if (!ctx.orgId) {
+    return json({ ok: false, error: 'no_org_context' }, { status: 403 });
+  }
+
+  const session = { userId: ctx.userId, orgId: ctx.orgId, role: ctx.role ?? 'staff' };
 
   // Fail closed for EVERY agent op if the Agent Framework schema is not ready.
   try {

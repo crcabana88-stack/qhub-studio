@@ -1,5 +1,6 @@
 import { type ActionFunctionArgs } from '@remix-run/cloudflare';
-import { getSession } from '~/lib/auth/session';
+import { requireCommercialContext } from '~/lib/qhub/commercial/commercial-context.server';
+import { consumeBuildCredit } from '~/lib/qhub/commercial/commercial-store.server';
 import { generateStableSessionId } from '~/lib/qhub/session-id.server';
 import { createDataStream, generateId } from 'ai';
 import { MAX_RESPONSE_SEGMENTS, MAX_TOKENS, type FileMap } from '~/lib/.server/llm/constants';
@@ -75,25 +76,60 @@ async function chatAction({ context, request }: ActionFunctionArgs) {
     parseCookies(cookieHeader || '').providers || '{}',
   );
 
-  // QHUB: Extract authenticated session for governance hook propagation.
-  // Session ID is now stable: derived from userId + first message ID,
-  // so the same conversation always maps to the same QHUB chain.
-  // hmacSecret is NOT included here — the GovernanceService reads it
-  // directly from process.env at signing time (server-only, never returned to browser).
+  /*
+   * QHUB: Extract authenticated session for governance hook propagation.
+   * Session ID is now stable: derived from userId + first message ID,
+   * so the same conversation always maps to the same QHUB chain.
+   * hmacSecret is NOT included here — the GovernanceService reads it
+   * directly from process.env at signing time (server-only, never returned to browser).
+   */
   const serverEnv = (context.cloudflare?.env as unknown as Record<string, string | undefined>) ?? {};
-  const qhubRawSession = await getSession(request, serverEnv);
+
+  /*
+   * Authoritative context + capability. Model invocation requires MODEL_INVOKE
+   * (active plan + completed onboarding for commercial customers; staff exempt).
+   */
+  const guard = await requireCommercialContext(request, serverEnv, 'MODEL_INVOKE');
+
+  if (!guard.ok) {
+    return guard.response;
+  }
+
+  const qhubCtx = guard.ctx;
 
   // Use first user message ID as the stable conversation anchor.
-  // Falls back to orgId+timestamp hash only if messages array is empty.
   const firstMessageId = messages.find((m) => m.role === 'user')?.id ?? `init-${Date.now()}`;
 
-  const qhubContext = qhubRawSession
+  /*
+   * Consume a build credit BEFORE expensive model execution (staff exempt). An
+   * exact retry of the same anchor is idempotent (no double-charge).
+   */
+  if (!qhubCtx.isStaff && qhubCtx.orgId) {
+    const remaining = await consumeBuildCredit(
+      {
+        orgId: qhubCtx.orgId,
+        monthlyAllotment: qhubCtx.resolved.entitlements.buildCreditsPerMonth,
+        idempotencyKey: `chat:${qhubCtx.orgId}:${firstMessageId}`,
+        requestHash: `msgs:${messages.length}`,
+      },
+      serverEnv,
+    );
+
+    if (remaining === null) {
+      return new Response(JSON.stringify({ ok: false, error: 'build_credits_exhausted' }), {
+        status: 402,
+        headers: { 'Content-Type': 'application/json' },
+      });
+    }
+  }
+
+  const qhubContext = qhubCtx.orgId
     ? {
-        // Stable: same userId + conversationId → same sessionId across all LLM calls
-        sessionId: generateStableSessionId(qhubRawSession.userId, firstMessageId),
+        sessionId: generateStableSessionId(qhubCtx.userId, firstMessageId),
         conversationId: firstMessageId,
-        userId: qhubRawSession.userId,
-        orgId: qhubRawSession.orgId,
+        userId: qhubCtx.userId,
+        orgId: qhubCtx.orgId,
+
         // hmacSecret is NOT passed here — GovernanceService reads from env directly
         serverEnv,
       }

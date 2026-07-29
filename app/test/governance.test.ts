@@ -10,13 +10,16 @@
 
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 
-// ─── Module mocks ─────────────────────────────────────────────────────────────
-// Hoisted spies so the vi.mock factories (hoisted to top of file) can reference
-// them without a temporal-dead-zone error. These let us exercise GovernanceService
-// without a live Supabase (durable qhub_app_id layer) or a real session.
+/*
+ * ─── Module mocks ─────────────────────────────────────────────────────────────
+ * Hoisted spies so the vi.mock factories (hoisted to top of file) can reference
+ * them without a temporal-dead-zone error. These let us exercise GovernanceService
+ * without a live Supabase (durable qhub_app_id layer) or a real session.
+ */
 
 const {
   mockGetSession,
+  mockGetVerifiedUser,
   mockGetOrCreateQhubApp,
   mockPersistChainId,
   mockGetChainId,
@@ -26,6 +29,7 @@ const {
   mockGetPolicyProfile,
 } = vi.hoisted(() => ({
   mockGetSession: vi.fn(),
+  mockGetVerifiedUser: vi.fn(),
   mockGetOrCreateQhubApp: vi.fn(),
   mockPersistChainId: vi.fn(),
   mockGetChainId: vi.fn(),
@@ -37,12 +41,18 @@ const {
 
 vi.mock('~/lib/auth/session', () => ({
   getSession: mockGetSession,
+
+  // R2: the commercial context resolves identity via getVerifiedUser (id/email only).
+  getVerifiedUser: mockGetVerifiedUser,
+  isDevAuthAllowed: () => false,
   getHmacSecret: vi.fn().mockReturnValue('test-secret-32-chars-minimum-ok!'),
 }));
 
-// Mock the durable identity layer so the service reaches the signing/POST path.
-// GovernanceService imports these via a relative specifier ('./qhub-app.server'),
-// which resolves to the same module id as the '~/lib/qhub/qhub-app.server' alias.
+/*
+ * Mock the durable identity layer so the service reaches the signing/POST path.
+ * GovernanceService imports these via a relative specifier ('./qhub-app.server'),
+ * which resolves to the same module id as the '~/lib/qhub/qhub-app.server' alias.
+ */
 vi.mock('~/lib/qhub/qhub-app.server', () => ({
   getOrCreateQhubApp: mockGetOrCreateQhubApp,
   persistChainId: mockPersistChainId,
@@ -77,8 +87,11 @@ beforeEach(() => {
   mockGetOrCreateQhubApp.mockReset().mockResolvedValue(fakeAppRecord());
   mockPersistChainId.mockReset().mockResolvedValue(undefined);
   mockGetChainId.mockReset().mockResolvedValue(null);
-  // Gate 02: default to a classified tier so gate tests exercise attestation
-  // logic (UNCLASSIFIED would block unconditionally).
+
+  /*
+   * Gate 02: default to a classified tier so gate tests exercise attestation
+   * logic (UNCLASSIFIED would block unconditionally).
+   */
   mockGetPersistedRiskTier.mockReset().mockResolvedValue('T2');
   mockPersistClassification.mockReset().mockResolvedValue(undefined);
   mockGetClassification.mockReset().mockResolvedValue(null);
@@ -92,13 +105,18 @@ describe('TEST 1: Root loader response contains no HMAC secret', () => {
     // Import the session type and verify the interface does not include hmacSecret
     const sessionModule = await import('~/lib/auth/session');
 
-    // getSession should return an object without hmacSecret
-    // We verify by checking the getHmacSecret export exists separately
+    /*
+     * getSession should return an object without hmacSecret
+     * We verify by checking the getHmacSecret export exists separately
+     */
     expect(typeof sessionModule.getSession).toBe('function');
+
     // getHmacSecret was moved to ~/lib/qhub/governance-secrets.server.ts
 
-    // The type-level check: QhubSession fields must not include hmacSecret.
-    // We construct a mock return value and verify the key is absent.
+    /*
+     * The type-level check: QhubSession fields must not include hmacSecret.
+     * We construct a mock return value and verify the key is absent.
+     */
     const mockSession = {
       userId: 'test-user',
       orgId: 'test-org',
@@ -122,8 +140,10 @@ describe('TEST 1: Root loader response contains no HMAC secret', () => {
     expect(source).toContain('email: session.email');
     expect(source).toContain('role: session.role');
 
-    // Check that hmacSecret does NOT appear as a return property key (code key, not comment).
-    // Pattern: 'hmacSecret:' or 'hmacSecret :' in the loader section.
+    /*
+     * Check that hmacSecret does NOT appear as a return property key (code key, not comment).
+     * Pattern: 'hmacSecret:' or 'hmacSecret :' in the loader section.
+     */
     const loaderSection = source.slice(
       source.indexOf('export async function loader'),
       source.indexOf('export const links'),
@@ -159,10 +179,13 @@ describe('TEST 2: GENESIS intent is handled server-side', () => {
 
     expect(result.ok).toBe(true);
 
-    // Verify a POST was made to /events (not /chains).
-    // The durable identity lookup (getOrCreateQhubApp) is mocked, so the only
-    // network call is the CHAIN_GENESIS POST.
+    /*
+     * Verify a POST was made to /events (not /chains).
+     * The durable identity lookup (getOrCreateQhubApp) is mocked, so the only
+     * network call is the CHAIN_GENESIS POST.
+     */
     expect(mockFetch).toHaveBeenCalledOnce();
+
     const [url, opts] = mockFetch.mock.calls[0] as [string, RequestInit];
     expect(url).toContain('/events');
     expect(url).not.toContain('/chains');
@@ -171,10 +194,12 @@ describe('TEST 2: GENESIS intent is handled server-side', () => {
     // Verify the event body contains server-authoritative identity (not browser-supplied)
     const body = JSON.parse(opts.body as string);
     expect(body.event_type).toBe('CHAIN_GENESIS'); // Lambda v2.6 canonical genesis event
-    // Server-authoritative identity lives in actor.id / client_id (v2.6 schema).
-    // The Lambda computes timestamp/seq/hashes — the caller does not send them.
-    expect(body.actor.id).toBe('user-123');    // from server context
-    expect(body.client_id).toBe('org-abc');    // from server context
+    /*
+     * Server-authoritative identity lives in actor.id / client_id (v2.6 schema).
+     * The Lambda computes timestamp/seq/hashes — the caller does not send them.
+     */
+    expect(body.actor.id).toBe('user-123'); // from server context
+    expect(body.client_id).toBe('org-abc'); // from server context
     expect(body.actor.identity_provider).toBe('supabase');
 
     // Verify signature header is present
@@ -273,8 +298,10 @@ describe('TEST 3: AI_BOM hook is server-side only', () => {
     });
 
     expect(mockFetch).toHaveBeenCalledOnce();
+
     const [url, opts] = mockFetch.mock.calls[0] as [string, RequestInit];
     expect(url).toContain('/events');
+
     const body = JSON.parse(opts.body as string);
     expect(body.event_type).toBe('AI_MODEL_INVOKED'); // Lambda v2.6 canonical AI event
 
@@ -364,12 +391,15 @@ describe('TEST 4: Browser-supplied identity claims are ignored', () => {
       env: { QHUB_HMAC_SECRET: 'test-secret-32-chars-minimum-ok!', QHUB_API_BASE: 'https://test.example.com' },
     });
 
-    // Simulate a malicious browser supplying forged identity in the intent
-    // (the intent type doesn't allow userId/orgId fields — but even if coerced...)
+    /*
+     * Simulate a malicious browser supplying forged identity in the intent
+     * (the intent type doesn't allow userId/orgId fields — but even if coerced...)
+     */
     await svc.handleIntent({
       action: 'PROJECT_CREATED',
       conversationId: 'conv-001',
       projectTitle: 'Forged Project',
+
       // TypeScript would prevent userId/orgId in GovernanceIntent, but test runtime coercion:
       userId: 'attacker-user',
       orgId: 'attacker-org',
@@ -378,8 +408,10 @@ describe('TEST 4: Browser-supplied identity claims are ignored', () => {
     const [, opts] = mockFetch.mock.calls[0] as [string, RequestInit];
     const body = JSON.parse(opts.body as string);
 
-    // Server context identity wins — not browser-supplied fields.
-    // Identity is carried in actor.id / client_id (v2.6 schema).
+    /*
+     * Server context identity wins — not browser-supplied fields.
+     * Identity is carried in actor.id / client_id (v2.6 schema).
+     */
     expect(body.actor.id).toBe('real-server-user');
     expect(body.client_id).toBe('real-server-org');
     expect(body.actor.id).not.toBe('attacker-user');
@@ -389,8 +421,9 @@ describe('TEST 4: Browser-supplied identity claims are ignored', () => {
   });
 
   it('api.governance route rejects unauthenticated requests with 401', async () => {
-    // getSession is mocked at module scope; make it return null (no session) here.
+    // The route now resolves identity via requireCommercialContext → getVerifiedUser.
     mockGetSession.mockResolvedValue(null);
+    mockGetVerifiedUser.mockResolvedValue(null);
 
     const { action } = await import('~/routes/api.governance');
 
@@ -418,15 +451,18 @@ describe('TEST 5: Missing session blocks production deployment', () => {
     expect(source).toContain('NO_SESSION');
     expect(source).toContain("'error'");
 
-    // Verify it does NOT silently treat missing session as GATE_PASSED
-    // (The old code: `postGovernanceEvent('GATE_PASSED', { note: 'local-dev' })` without return)
-    // New code must have a `return` after blocking when not in dev mode
+    /*
+     * Verify it does NOT silently treat missing session as GATE_PASSED
+     * (The old code: `postGovernanceEvent('GATE_PASSED', { note: 'local-dev' })` without return)
+     * New code must have a `return` after blocking when not in dev mode
+     */
     expect(source).toContain('return; // BLOCK deployment');
   });
 
   it('GateState type includes all required states', async () => {
     // Verify the type is correctly defined
     type ExpectedStates = 'APPROVED' | 'BLOCKED' | 'UNKNOWN' | 'ERROR';
+
     const states: ExpectedStates[] = ['APPROVED', 'BLOCKED', 'UNKNOWN', 'ERROR'];
     expect(states).toHaveLength(4);
     expect(states).toContain('APPROVED');
@@ -490,8 +526,11 @@ describe('TEST 7: Unattested project returns BLOCKED', () => {
     const mockFetch = vi.fn().mockImplementation((url: string) => {
       if (url.includes('/chains')) {
         // Reader API says: not attested
-        return Promise.resolve(new Response(JSON.stringify({ gate_passed: false, attestation_status: 'PENDING' }), { status: 200 }));
+        return Promise.resolve(
+          new Response(JSON.stringify({ gate_passed: false, attestation_status: 'PENDING' }), { status: 200 }),
+        );
       }
+
       // Ingest POST /events
       return Promise.resolve(new Response('{}', { status: 200 }));
     });
@@ -524,8 +563,11 @@ describe('TEST 8: Attested project returns APPROVED', () => {
 
     const mockFetch = vi.fn().mockImplementation((url: string) => {
       if (url.includes('/chains')) {
-        return Promise.resolve(new Response(JSON.stringify({ gate_passed: true, attestation_status: 'ATTESTED' }), { status: 200 }));
+        return Promise.resolve(
+          new Response(JSON.stringify({ gate_passed: true, attestation_status: 'ATTESTED' }), { status: 200 }),
+        );
       }
+
       return Promise.resolve(new Response('{}', { status: 200 }));
     });
     vi.stubGlobal('fetch', mockFetch);
@@ -604,8 +646,11 @@ describe('TEST 10: No client bundle exposure of HMAC secret', () => {
     const source = fs.readFileSync(workbenchPath, 'utf8');
 
     expect(source).not.toContain('QHUB_HMAC_SECRET');
-    // Check for hmacSecret as a code expression (property key or type field),
-    // not merely as a word in a comment.
+
+    /*
+     * Check for hmacSecret as a code expression (property key or type field),
+     * not merely as a word in a comment.
+     */
     expect(/hmacSecret\s*[?:]/.test(source)).toBe(false);
   });
 
@@ -615,10 +660,15 @@ describe('TEST 10: No client bundle exposure of HMAC secret', () => {
     const rootPath = path.resolve(process.cwd(), 'app/root.tsx');
     const source = fs.readFileSync(rootPath, 'utf8');
 
-    // The loader return block should not include hmacSecret as a returned field.
-    // Match only a code key/type usage (`hmacSecret:`) — a comment mentioning the
-    // word (e.g. "hmacSecret MUST NOT be included") is fine and must not trip this.
-    const loaderSection = source.slice(source.indexOf('export async function loader'), source.indexOf('export const links'));
+    /*
+     * The loader return block should not include hmacSecret as a returned field.
+     * Match only a code key/type usage (`hmacSecret:`) — a comment mentioning the
+     * word (e.g. "hmacSecret MUST NOT be included") is fine and must not trip this.
+     */
+    const loaderSection = source.slice(
+      source.indexOf('export async function loader'),
+      source.indexOf('export const links'),
+    );
     expect(/hmacSecret\s*:/.test(loaderSection)).toBe(false);
   });
 

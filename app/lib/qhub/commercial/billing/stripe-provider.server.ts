@@ -24,6 +24,7 @@ import type {
   PortalSession,
   WebhookVerifyResult,
   BillingEventType,
+  RetrievedSubscription,
 } from '~/lib/qhub/commercial/billing/billing-provider';
 import type { SubscriptionStatus } from '~/lib/qhub/commercial/entitlements.server';
 import type { PlanId } from '~/lib/qhub/commercial/plans';
@@ -200,10 +201,102 @@ export class StripeBillingProvider implements BillingProvider {
       return { ok: false, error: 'Webhook event could not be normalized.', code: 'MALFORMED' };
     }
 
+    // Mode binding: a test-configured server rejects live events and vice versa.
+    if (normalized.livemode !== this.expectedLivemode()) {
+      return { ok: false, error: 'Webhook livemode does not match configured mode.', code: 'MODE_MISMATCH' };
+    }
+
+    // Account binding: when an expected Stripe account is configured, reject others.
+    const expectedAccount = this._env.STRIPE_ACCOUNT_ID ?? process.env.STRIPE_ACCOUNT_ID ?? '';
+
+    if (expectedAccount && normalized.stripeAccount && normalized.stripeAccount !== expectedAccount) {
+      return { ok: false, error: 'Webhook Stripe account mismatch.', code: 'ACCOUNT_MISMATCH' };
+    }
+
     return { ok: true, event: normalized };
   }
 
+  // ─── Mode + reconciliation ──────────────────────────────────────────────────────
+
+  expectedLivemode(): boolean {
+    return this._secret().startsWith('sk_live_');
+  }
+
+  isConfiguredPrice(priceId: string): boolean {
+    if (!priceId) {
+      return false;
+    }
+
+    const envNames = [
+      'STRIPE_PRICE_BUILDER_BETA_MONTHLY',
+      'STRIPE_PRICE_BUILDER_BETA_ANNUAL',
+      'STRIPE_PRICE_GUIDED_BUILDER_MONTHLY',
+      'STRIPE_PRICE_GUIDED_BUILDER_SETUP',
+    ];
+
+    return envNames.some((n) => this._resolvePriceId(n) === priceId);
+  }
+
+  async retrieveSubscription(subscriptionId: string): Promise<BillingResult<RetrievedSubscription>> {
+    if (!this.isConfigured()) {
+      return fail('BILLING_NOT_CONFIGURED', 'Billing is not configured.');
+    }
+
+    const res = await this._get(`/v1/subscriptions/${encodeURIComponent(subscriptionId)}`);
+
+    if (!res.ok) {
+      return fail('STRIPE_ERROR', res.error);
+    }
+
+    const sub = res.body as {
+      id?: string;
+      customer?: string;
+      status?: string;
+      livemode?: boolean;
+      current_period_end?: number;
+      metadata?: Record<string, string>;
+      items?: { data?: Array<{ price?: { id?: string } }> };
+    };
+
+    if (!sub.id || !sub.customer) {
+      return fail('STRIPE_MALFORMED', 'Stripe returned no subscription id/customer.');
+    }
+
+    return {
+      ok: true,
+      value: {
+        id: sub.id,
+        customerId: sub.customer,
+        status: mapStripeStatus(sub.status),
+        priceId: sub.items?.data?.[0]?.price?.id ?? null,
+        livemode: !!sub.livemode,
+        currentPeriodEnd: typeof sub.current_period_end === 'number' ? sub.current_period_end : null,
+        metadata: sub.metadata ?? {},
+      },
+    };
+  }
+
   // ─── HTTP ─────────────────────────────────────────────────────────────────────
+
+  private async _get(path: string): Promise<{ ok: true; body: unknown } | { ok: false; error: string }> {
+    try {
+      const resp = await fetch(`${STRIPE_API}${path}`, {
+        method: 'GET',
+        headers: { Authorization: `Bearer ${this._secret()}` },
+      });
+
+      const body = await resp.json().catch(() => ({}));
+
+      if (!resp.ok) {
+        const msg = (body as { error?: { message?: string } })?.error?.message ?? `Stripe HTTP ${resp.status}`;
+        return { ok: false, error: msg };
+      }
+
+      return { ok: true, body };
+    } catch (err) {
+      return { ok: false, error: err instanceof Error ? err.message : 'Stripe request failed.' };
+    }
+  }
 
   private async _post(
     path: string,
@@ -329,6 +422,9 @@ export function normalizeStripeEvent(event: unknown): NormalizedBillingEvent | n
   const e = event as {
     id?: string;
     type?: string;
+    created?: number;
+    livemode?: boolean;
+    account?: string;
     data?: { object?: Record<string, unknown> };
   };
 
@@ -339,6 +435,11 @@ export function normalizeStripeEvent(event: unknown): NormalizedBillingEvent | n
   const obj = e.data?.object ?? {};
   const metadata = (obj.metadata as Record<string, string> | undefined) ?? {};
   const type = mapEventType(e.type);
+
+  const priceId =
+    (obj.price as { id?: string } | undefined)?.id ??
+    (obj.items as { data?: Array<{ price?: { id?: string } }> } | undefined)?.data?.[0]?.price?.id ??
+    undefined;
 
   const planId = (metadata.plan_id as PlanId | undefined) ?? undefined;
   const orgId = metadata.org_id ?? (obj.client_reference_id as string | undefined) ?? undefined;
@@ -367,11 +468,34 @@ export function normalizeStripeEvent(event: unknown): NormalizedBillingEvent | n
     rawType: e.type,
     providerCustomerId: customerId,
     providerSubscriptionId: subscriptionId,
+    providerPriceId: priceId,
     orgId,
     planId,
     status,
     currentPeriodEnd,
+    livemode: !!e.livemode,
+    stripeAccount: typeof e.account === 'string' ? e.account : undefined,
+    eventCreated: typeof e.created === 'number' ? e.created : 0,
   };
+}
+
+/** Map a configured recurring price id to its internal plan id (server-authoritative). */
+export function planIdForConfiguredPrice(priceId: string, env: Record<string, string | undefined>): PlanId | null {
+  const resolve = (n: string) => env[n] ?? process.env[n] ?? '';
+
+  if (
+    priceId &&
+    (priceId === resolve('STRIPE_PRICE_BUILDER_BETA_MONTHLY') ||
+      priceId === resolve('STRIPE_PRICE_BUILDER_BETA_ANNUAL'))
+  ) {
+    return 'builder_beta';
+  }
+
+  if (priceId && priceId === resolve('STRIPE_PRICE_GUIDED_BUILDER_MONTHLY')) {
+    return 'guided_builder';
+  }
+
+  return null;
 }
 
 /** Factory — the runtime uses this so the provider is swappable. */
