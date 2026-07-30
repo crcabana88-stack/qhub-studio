@@ -323,38 +323,162 @@ function moduleClassificationValue(src: string): string | undefined {
   return m?.[1];
 }
 
-/*
- * The AUTHORITATIVE commercial-protected effect set a PUBLIC_SAFE surface may never reach — the
- * write/side-effect subset of the architecture test's PROTECTED_IO_CATEGORY: DB mutation, a qhub_* RPC
- * (excluding the READ-ONLY verifier), model-provider generation, billing, deployment/publication,
- * connector/MCP mutation, secret EXPORT, and agent/enforcement/approval mutation. Benign reads — env
- * reads, model listing, git info, a read-only service-role verifier client, getSession — are NOT here,
- * so a real PUBLIC_SAFE route (e.g. a health endpoint that reports schema readiness) is not false-flagged.
- * Applied across the TRANSITIVE closure, so a renamed/re-exported protected wrapper is still caught.
- */
-const COMMERCIAL_PROTECTED_IO =
-  /\.(insert|update|upsert|delete)\s*\(|\.rpc\(\s*['"]qhub_(?!verify_commercial_schema)|\bstreamText\b|\bgenerateText\b|invokeCommercialModel|createBillingProvider|stripe-provider\.server|netlify-deploy|vercel-deploy|freezeReleaseCandidate|mcp-update-config|export-api-keys|runAgent|resumeAgentRun|buildAgentManifest|enforceGovernedAction|createGovernanceService|grantApproval/;
-
-/** Strip // line and /* … *​/ block comments so a comment MENTION of a protected symbol is not a match. */
+/** Strip // line and /* … *​/ block comments so a comment MENTION of a protected symbol is not an effect. */
 function stripComments(src: string): string {
   return src.replace(/\/\*[\s\S]*?\*\//g, ' ').replace(/(^|[^:])\/\/[^\n]*/g, '$1');
 }
 
 /*
- * The commercial SERVER boundary — the surface the reproduced blocker is about. Commercial modules
- * (app/lib/qhub/commercial/**) and any *.server / .server/** module. The legacy Studio CLIENT graph
- * (browser stores, *.client.tsx, components) is not the commercial server boundary and is not swept.
+ * R13 §4 — ONE canonical broad protected-effect taxonomy for BOTH fixtures and real code. Comments are
+ * stripped first so an inert mention is not an effect, but string/property/alias/wrapper text is kept so
+ * a renamed/re-exported wrapper still carries its real effect.
  */
-function isCommercialServerModule(path: string): boolean {
+function detectEffectsStripped(src: string): string[] {
+  return detectEffects(stripComments(src));
+}
+
+/*
+ * R13 §6 — sensitive-logging detector. A reachable server module must not log Headers objects,
+ * request/response headers, authorization/x-authorization, cookies, or token/secret/api-key values, nor
+ * dump a raw request-metadata-bearing error. Line-scoped (comments stripped) and covers console.* +
+ * logger.* alias helpers.
+ */
+const SENSITIVE_LOG_CALL = /\b(?:console\.(?:log|info|warn|error|debug|trace)|logger\.\w+|log\.\w+)\s*\(/;
+const SENSITIVE_LOG_PAYLOAD =
+  /request\.headers|response\.headers|\.headers\b|headers\.entries|fromEntries\s*\([^)]*headers|\bauthorization\b|x-authorization|\bset-cookie\b|\bcookie\b|\bx-api-key\b|\bapi[-_]?key\b|\bbearer\b|\bsecret\b|\btoken\b/i;
+
+/** Remove string/template-literal CONTENTS so a benign quoted message ("no secret configured") is not a leak. */
+function stripStringContents(line: string): string {
+  return line
+    .replace(/'(?:[^'\\]|\\.)*'/g, "''")
+    .replace(/"(?:[^"\\]|\\.)*"/g, '""')
+    .replace(/`(?:[^`\\]|\\.)*`/g, '``');
+}
+
+function logsSensitive(src: string): string[] {
+  const hits: string[] = [];
+
+  for (const line of stripComments(src).split('\n')) {
+    /*
+     * A leak logs an EXPRESSION (a headers object, a header/token value), not a quoted message — so test
+     * the payload with string literals stripped out.
+     */
+    if (SENSITIVE_LOG_CALL.test(line) && SENSITIVE_LOG_PAYLOAD.test(stripStringContents(line))) {
+      hits.push(line.trim().slice(0, 120));
+    }
+  }
+
+  return hits;
+}
+
+/*
+ * A genuinely server-executed module: a *.server module, anything under a `.server/` dir, a Cloudflare
+ * Pages Function, a deploy/build script, or the Remix server entry. These carry protected capability and
+ * are the surface R13 §5 requires full effect-authorization over — not the browser CLIENT graph.
+ */
+function isServerModule(path: string): boolean {
   const p = path.replace(/\\/g, '/');
-  return /\/lib\/qhub\/commercial\//.test(p) || /\.server\.tsx?$/.test(p) || /\/\.server\//.test(p);
+  return (
+    /\.server\.tsx?$/.test(p) ||
+    /\/\.server\//.test(p) ||
+    /\/functions\//.test(p) ||
+    /\/scripts\//.test(p) ||
+    /\/app\/entry\.server\.tsx$/.test(p)
+  );
+}
+
+/*
+ * R13 §5 — machine-readable, narrow effect exemptions: server ENTRY points that carry privilege by
+ * position (not by a `__QHUB_MODULE_CLASSIFICATION` literal) get an explicit SERVER_ENTRY classification,
+ * each tied to an exact module pattern + a reason. Every exemption is covered by a positive + negative test.
+ */
+const SERVER_ENTRY_EXEMPTIONS: Array<{ match: RegExp; classification: 'SERVER_ENTRY'; reason: string }> = [
+  {
+    match: /\/functions\//,
+    classification: 'SERVER_ENTRY',
+    reason: 'Cloudflare Pages Function request entry (server-privileged)',
+  },
+  {
+    match: /\/scripts\//,
+    classification: 'SERVER_ENTRY',
+    reason: 'deploy/build/preflight script (server-privileged, not browser-reachable)',
+  },
+  {
+    match: /\/app\/entry\.server\.tsx$/,
+    classification: 'SERVER_ENTRY',
+    reason: 'Remix server render entry (server-privileged)',
+  },
+];
+
+/*
+ * R13 §5 — narrow, machine-readable PUBLIC-boundary exemptions: an exact imported SERVER module + an
+ * exact effect a PUBLIC_SAFE route is allowed to reach, each with a reason. Covered by positive +
+ * negative tests. (A PUBLIC_SAFE route's OWN-source protected I/O is governed by commercial-architecture
+ * .test.ts's PROTECTED_IO_CATEGORY, R8-reviewed; the import graph governs the transitive-import evasion.)
+ */
+const SCHEMA_VERIFIER = /\/app\/lib\/qhub\/schema-check\.server\.ts$/;
+const PUBLIC_IMPORT_EFFECT_EXEMPTIONS: Array<{ module: RegExp; effect: string; reason: string }> = [
+  {
+    module: SCHEMA_VERIFIER,
+    effect: 'service-role / DB mutation',
+    reason:
+      'read-only schema verifier: reads the service-role key ONLY to run qhub_verify_commercial_schema() (a READ-only RPC); performs no insert/update/delete',
+  },
+  {
+    module: SCHEMA_VERIFIER,
+    effect: 'generic external HTTP',
+    reason:
+      'read-only schema verifier: the only outbound call is the fixed Supabase REST endpoint for the READ-only verifier RPC; the /api/health route reports readiness from it',
+  },
+];
+
+function isPublicExempt(moduleRel: string, effect: string): boolean {
+  return PUBLIC_IMPORT_EFFECT_EXEMPTIONS.some((e) => e.module.test(`/${moduleRel}`) && e.effect === effect);
+}
+
+/** Classes permitted to perform ANY protected effect (they carry their own runtime authorization). */
+const SERVER_AUTHORIZED_CLASSES = new Set([
+  'INTERNAL_SERVER_ONLY',
+  'COMMERCIAL_READY',
+  'STAFF_ONLY',
+  'SIGNATURE_AUTH',
+  'REQUIRES_COMMERCIAL_READY_TOKEN',
+  'REQUIRES_STAFF_CONTEXT',
+  'MIXED_EXPLICIT_EXPORT_CLASSIFICATION',
+  'SERVER_ENTRY',
+]);
+
+// Every other class (PUBLIC_SAFE, PURE_NO_IO, unclassified, ambiguous) may perform NO protected effect.
+
+/** Resolve the classification of a visited file (route marker, module literal, or server-entry exemption). */
+function classifyFile(rel: string, src: string): string | undefined {
+  if (rel.startsWith('app/routes/')) {
+    return routeClassification(src);
+  }
+
+  const mod = moduleClassificationValue(src);
+
+  if (mod) {
+    return mod;
+  }
+
+  return SERVER_ENTRY_EXEMPTIONS.find((e) => e.match.test(`/${rel}`))?.classification;
+}
+
+/** Effects a classification does NOT authorize (fail-closed: unknown/undefined class authorizes nothing). */
+function unauthorizedEffects(classification: string | undefined, effectLabels: string[]): string[] {
+  if (classification && SERVER_AUTHORIZED_CLASSES.has(classification)) {
+    return [];
+  }
+
+  // PUBLIC_SAFE / PURE_NO_IO / unclassified / ambiguous → every protected effect is unauthorized.
+  return effectLabels;
 }
 
 /** The set of modules reachable from a single entry file (its transitive import closure, incl. itself). */
 function reachableFrom(entry: string): string[] {
   const seen = new Set<string>();
-  const canonEntry = entry.replace(/\\/g, '/');
-  const queue = [canonEntry];
+  const queue = [entry.replace(/\\/g, '/')];
 
   while (queue.length) {
     const file = queue.pop() as string;
@@ -365,9 +489,7 @@ function reachableFrom(entry: string): string[] {
 
     seen.add(file);
 
-    const src = readFileSync(file, 'utf8');
-
-    for (const spec of importSpecifiers(src)) {
+    for (const spec of importSpecifiers(readFileSync(file, 'utf8'))) {
       const r = resolveSpec(file, spec);
 
       if (r.path) {
@@ -380,26 +502,9 @@ function reachableFrom(entry: string): string[] {
 }
 
 /**
- * R12 §5/§6 — authorize the protected effects (broad EFFECT_CATEGORIES) a module performs against a
- * classification. A PUBLIC_SAFE / SIGNATURE-less surface may perform NONE; an unknown protected effect
- * fails closed. Server-authorized classes (COMMERCIAL_READY/STAFF_ONLY/INTERNAL_SERVER_ONLY and the
- * *_TOKEN/*_CONTEXT service classes) carry their own runtime guards and may perform them.
- */
-const PUBLIC_LIKE = new Set(['PUBLIC_SAFE']);
-
-function unauthorizedEffects(classification: string | undefined, effectLabels: string[]): string[] {
-  // No/ambiguous classification with a protected effect → fail closed.
-  if (!classification || classification === 'AMBIGUOUS') {
-    return effectLabels;
-  }
-
-  return PUBLIC_LIKE.has(classification) ? effectLabels : [];
-}
-
-/**
- * Authorize a fixture import graph: seed → traverse a virtual module map, union every reachable module's
- * effects, and return the effects unauthorized for the seed's classification. Proves renamed/re-exported/
- * barrel wrappers propagate their effects to the boundary.
+ * Authorize a repository-shaped fixture graph with the SAME broad taxonomy + fail-closed rule used for
+ * real code: traverse the module map, union every reachable module's effects (propagating through
+ * aliases/wrappers/barrels/re-exports), and return the effects unauthorized for the seed's classification.
  */
 function authorizeFixtureGraph(
   entryClass: string | undefined,
@@ -421,11 +526,10 @@ function authorizeFixtureGraph(
 
     const src = modules[key];
 
-    for (const e of detectEffects(src)) {
+    for (const e of detectEffectsStripped(src)) {
       union.add(e);
     }
 
-    // Follow every local relative specifier within the fixture map (aliases/barrels/re-exports).
     for (const spec of importSpecifiers(src)) {
       if (spec in modules) {
         queue.push(spec);
@@ -436,38 +540,91 @@ function authorizeFixtureGraph(
   return unauthorizedEffects(entryClass, [...union]);
 }
 
-// Real-code sweep: every PUBLIC_SAFE route's transitive closure must reach NO commercial-protected I/O.
-interface EffectAuthResult {
+/*
+ * R13 §5 — COMPLETE-GRAPH effect authorization over every visited module. Each module gets an
+ * authorization RESULT; every server module + server entry point is ENFORCED (unauthorized effect or
+ * sensitive logging → violation). A PUBLIC_SAFE route may reach no protected effect through the server
+ * modules in its closure (renamed/re-exported wrappers included).
+ */
+interface EffectAuthReport {
+  results: Map<string, { classification?: string; effects: string[]; enforced: boolean }>;
+  serverModulesEnforced: number;
+  serverViolations: string[];
   publicRoutes: number;
   publicBoundaryViolations: string[];
 }
 
-function enforcePublicBoundary(): EffectAuthResult {
+function runEffectAuthorization(): EffectAuthReport {
+  const results = new Map<string, { classification?: string; effects: string[]; enforced: boolean }>();
+  const serverViolations: string[] = [];
   const publicBoundaryViolations: string[] = [];
+  let serverModulesEnforced = 0;
   let publicRoutes = 0;
 
+  // 1. Every visited module receives an authorization result; every server module is enforced.
+  for (const file of graph.visited) {
+    const rel = file.slice(REPO.length);
+    const src = readFileSync(file, 'utf8');
+    const effects = detectEffectsStripped(src);
+    const classification = classifyFile(rel, src);
+    const enforced = isServerModule(file);
+    results.set(rel, { classification, effects, enforced });
+
+    if (!enforced) {
+      continue;
+    }
+
+    serverModulesEnforced += 1;
+
+    const unauth = unauthorizedEffects(classification, effects);
+
+    if (unauth.length) {
+      serverViolations.push(`${rel} [${classification ?? 'UNCLASSIFIED'}] unauthorized: ${unauth.join(', ')}`);
+    }
+
+    const sens = logsSensitive(src);
+
+    if (sens.length) {
+      serverViolations.push(`${rel} logs sensitive value: ${sens[0]}`);
+    }
+  }
+
+  // 2. PUBLIC_SAFE route boundary: no protected effect through its transitively-reachable SERVER modules.
   for (const entry of routeEntries) {
     const rel = entry.replace(/\\/g, '/').slice(REPO.length);
-    const cls = routeClassification(readFileSync(entry, 'utf8'));
 
-    if (cls !== 'PUBLIC_SAFE') {
+    if (routeClassification(readFileSync(entry, 'utf8')) !== 'PUBLIC_SAFE') {
       continue;
     }
 
     publicRoutes += 1;
 
+    const canonEntry = entry.replace(/\\/g, '/');
+
     for (const mod of reachableFrom(entry)) {
-      // Only the commercial SERVER boundary is swept; comments are stripped so a mere mention doesn't match.
-      if (isCommercialServerModule(mod) && COMMERCIAL_PROTECTED_IO.test(stripComments(readFileSync(mod, 'utf8')))) {
-        publicBoundaryViolations.push(`${rel} → ${mod.slice(REPO.length)}`);
+      /*
+       * Own-source protected I/O is the architecture test's domain (R8). The import graph enforces the
+       * TRANSITIVE-IMPORT evasion: an imported SERVER module (a renamed/re-exported wrapper) that carries
+       * a protected effect the route's PUBLIC classification does not authorize.
+       */
+      if (mod === canonEntry || !isServerModule(mod)) {
+        continue;
+      }
+
+      const modRel = mod.slice(REPO.length);
+
+      for (const effect of detectEffectsStripped(readFileSync(mod, 'utf8'))) {
+        if (!isPublicExempt(modRel, effect)) {
+          publicBoundaryViolations.push(`${rel} → ${modRel} :: ${effect}`);
+        }
       }
     }
   }
 
-  return { publicRoutes, publicBoundaryViolations };
+  return { results, serverModulesEnforced, serverViolations, publicRoutes, publicBoundaryViolations };
 }
 
-const effectAuth = enforcePublicBoundary();
+const effectAuth = runEffectAuthorization();
 
 describe('import-graph server-module discovery (R9 §8/§9, R11 §7/§8)', () => {
   it('reaches a meaningful slice of the app/lib server layer from the entry points', () => {
@@ -535,36 +692,181 @@ describe('import-graph server-module discovery (R9 §8/§9, R11 §7/§8)', () =>
   });
 });
 
-describe('R12 §5/§7 — effect authorization is ENFORCED on the real code (not just detected)', () => {
-  it('there IS a meaningful population of PUBLIC_SAFE routes under enforcement', () => {
+describe('R13 §5 — broad effect authorization is ENFORCED over the complete server graph', () => {
+  it('every visited module receives an authorization result (test 34, none skipped)', () => {
+    expect(effectAuth.results.size).toBe(graph.visited.size);
+
+    for (const file of graph.visited) {
+      expect(effectAuth.results.has(file.slice(REPO.length)), file).toBe(true);
+    }
+  });
+
+  it('enforces a meaningful population of server modules + PUBLIC_SAFE routes', () => {
+    expect(effectAuth.serverModulesEnforced).toBeGreaterThan(20);
     expect(effectAuth.publicRoutes).toBeGreaterThan(10);
   });
 
-  it('NO PUBLIC_SAFE route transitively reaches commercial-protected I/O (renamed/re-exported wrappers included)', () => {
-    expect(effectAuth.publicBoundaryViolations, effectAuth.publicBoundaryViolations.slice(0, 20).join('\n')).toEqual(
+  it('NO server module performs an unauthorized effect or logs sensitive values (fail closed)', () => {
+    expect(effectAuth.serverViolations, effectAuth.serverViolations.slice(0, 30).join('\n')).toEqual([]);
+  });
+
+  it('NO PUBLIC_SAFE route reaches a protected effect through its server closure (broad taxonomy)', () => {
+    expect(effectAuth.publicBoundaryViolations, effectAuth.publicBoundaryViolations.slice(0, 30).join('\n')).toEqual(
       [],
     );
   });
 
-  it('every visited module received an effect-authorization decision (none skipped)', () => {
-    /*
-     * Effect analysis (graph.effects) covers every visited module; authorization is a pure function of
-     * (classification, effects), so a decision exists for each — assert coverage is total.
-     */
-    expect(graph.effects.size).toBe(graph.visited.size);
+  it('the hardened git-proxy is enforced as a server module with an authorized class and NO sensitive logging', () => {
+    const proxy = effectAuth.results.get('app/lib/qhub/git-proxy.server.ts');
+    expect(proxy, 'git-proxy.server.ts not visited').toBeTruthy();
+    expect(proxy?.enforced).toBe(true);
 
-    for (const [rel, eff] of graph.effects) {
-      const cls = rel.startsWith('app/routes/')
-        ? routeClassification(readFileSync(`${REPO}${rel}`, 'utf8'))
-        : moduleClassificationValue(readFileSync(`${REPO}${rel}`, 'utf8'));
+    // Reclassified from the legacy PUBLIC_SAFE open proxy to an authenticated server-only relay.
+    expect(proxy?.classification).toBe('INTERNAL_SERVER_ONLY');
+    expect(unauthorizedEffects(proxy?.classification, proxy?.effects ?? [])).toEqual([]);
 
-      // The decision is well-defined for every module (array, possibly empty).
-      expect(Array.isArray(unauthorizedEffects(cls, eff))).toBe(true);
+    // The redesigned relay logs NOTHING sensitive (the legacy proxy logged request/response headers).
+    expect(logsSensitive(readFileSync(`${REPO}app/lib/qhub/git-proxy.server.ts`, 'utf8'))).toEqual([]);
+  });
+
+  it('PUBLIC-import exemptions are narrow (exact module + exact effect + reason) with pos/neg coverage', () => {
+    // Positive: the exact read-only schema verifier module + its two exact effects are exempt.
+    expect(isPublicExempt('app/lib/qhub/schema-check.server.ts', 'service-role / DB mutation')).toBe(true);
+    expect(isPublicExempt('app/lib/qhub/schema-check.server.ts', 'generic external HTTP')).toBe(true);
+
+    // Negative: a DIFFERENT module, or a DIFFERENT effect on the exempt module, is NOT exempt (fail closed).
+    expect(isPublicExempt('app/lib/qhub/schema-check.server.ts', 'deployment/publication')).toBe(false);
+    expect(isPublicExempt('app/lib/qhub/commercial/commercial-store.server.ts', 'service-role / DB mutation')).toBe(
+      false,
+    );
+
+    for (const e of PUBLIC_IMPORT_EFFECT_EXEMPTIONS) {
+      expect(e.reason.length).toBeGreaterThan(20);
+    }
+  });
+
+  it('server-entry exemptions are narrow, machine-readable, and cover an exact module + reason', () => {
+    // Positive: a functions/scripts/entry.server module resolves to SERVER_ENTRY.
+    expect(classifyFile('functions/[[path]].ts', 'export const onRequest = () => {}')).toBe('SERVER_ENTRY');
+    expect(classifyFile('scripts/build-with-identity.mjs', 'const x = 1;')).toBe('SERVER_ENTRY');
+    expect(classifyFile('app/entry.server.tsx', 'export default 1;')).toBe('SERVER_ENTRY');
+
+    // Negative: an ordinary unclassified server-path module is NOT auto-exempted → undefined → fail closed.
+    expect(classifyFile('app/lib/qhub/random-helper.ts', 'export const f = () => fetch(1);')).toBeUndefined();
+    expect(unauthorizedEffects(undefined, ['generic external HTTP'])).toEqual(['generic external HTTP']);
+
+    // Every exemption carries a reason.
+    for (const e of SERVER_ENTRY_EXEMPTIONS) {
+      expect(e.reason.length).toBeGreaterThan(10);
     }
   });
 });
 
-describe('R12 §6 — wrapper / re-export effect propagation fails closed under an insufficient class', () => {
+describe('R13 §8 — real-graph adversarial effect tests (repository-shaped)', () => {
+  /*
+   * Repository-shaped: a PUBLIC_SAFE route file + imported wrapper/barrel modules run through the REAL
+   * engine (authorizeFixtureGraph = same broad taxonomy + fail-closed rule as the live sweep).
+   */
+  const PUBLIC = '/** @qhub-route: PUBLIC_SAFE */\n';
+
+  it('test 19 — PUBLIC_SAFE route with DIRECT fetch fails', () => {
+    const modules = { route: `${PUBLIC}export const loader = () => fetch('https://x');` };
+    expect(authorizeFixtureGraph('PUBLIC_SAFE', modules, 'route')).toContain('generic external HTTP');
+  });
+
+  it('test 20 — PUBLIC_SAFE route with a RENAMED fetch wrapper fails', () => {
+    const modules = {
+      route: `${PUBLIC}import { get } from './w';\nexport const loader = () => get('x');`,
+      './w': `export const get = (u) => fetch(u);`,
+    };
+    expect(authorizeFixtureGraph('PUBLIC_SAFE', modules, 'route')).toContain('generic external HTTP');
+  });
+
+  it('test 21 — PUBLIC_SAFE route with a BARREL-re-exported fetch fails', () => {
+    const modules = {
+      route: `${PUBLIC}import { get } from './barrel';\nexport const loader = () => get('x');`,
+      './barrel': `export * from './w';`,
+      './w': `export const get = (u) => fetch(u);`,
+    };
+    expect(authorizeFixtureGraph('PUBLIC_SAFE', modules, 'route')).toContain('generic external HTTP');
+  });
+
+  const effectProbes: Array<[string, string, string]> = [
+    ['test 22 — secret-reader wrapper', 'dynamic secret read', `export const s = (k) => process.env[k];`],
+    ['test 23 — provider client', 'model/provider client', `export const g = (p) => generateText(p);`],
+    ['test 24 — deployment wrapper', 'deployment/publication', `export const d = () => freezeReleaseCandidate();`],
+    [
+      'test 25 — connector wrapper',
+      'MCP/connector mutation',
+      `export const c = () => new MCPService().connectorMutate();`,
+    ],
+    [
+      'test 26 — filesystem write',
+      'filesystem write',
+      `import { writeFile } from 'node:fs'; export const w = () => writeFile('a','b',()=>{});`,
+    ],
+    [
+      'test 27 — child_process',
+      'child process',
+      `import { spawn } from 'node:child_process'; export const r = () => spawn('x');`,
+    ],
+    ['test 28 — queue publish', 'queue/event publish', `export const q = (j) => producer.send(j);`],
+  ];
+
+  for (const [label, effect, wrapperSrc] of effectProbes) {
+    it(`${label} reached from PUBLIC_SAFE fails; allowed under a server class`, () => {
+      const modules = {
+        route: `${PUBLIC}import { x } from './w';\nexport const loader = () => x();`,
+        './w': wrapperSrc,
+      };
+      expect(authorizeFixtureGraph('PUBLIC_SAFE', modules, 'route')).toContain(effect);
+      expect(authorizeFixtureGraph('INTERNAL_SERVER_ONLY', modules, 'route')).toEqual([]);
+    });
+  }
+
+  it('test 29 — a public route logging authorization / header objects fails the sensitive-log detector', () => {
+    expect(
+      logsSensitive(`export const loader = () => console.log('h', Object.fromEntries(request.headers.entries()));`),
+    ).not.toEqual([]);
+    expect(
+      logsSensitive(`export const loader = () => console.log('auth', req.headers.get('authorization'));`),
+    ).not.toEqual([]);
+
+    // A benign log is NOT flagged.
+    expect(logsSensitive(`export const loader = () => console.log('status', res.status);`)).toEqual([]);
+  });
+
+  it('test 30/31 — functions/** + worker/job entry with an unauthorized effect fails under PUBLIC_SAFE', () => {
+    const fn = {
+      'functions/[[path]].ts': `import { h } from './h';\nexport const onRequest = () => h();`,
+      './h': `export const h = () => freezeReleaseCandidate();`,
+    };
+    expect(authorizeFixtureGraph('SERVER_ENTRY', fn, 'functions/[[path]].ts')).toEqual([]);
+    expect(authorizeFixtureGraph('PUBLIC_SAFE', fn, 'functions/[[path]].ts')).toContain('deployment/publication');
+  });
+
+  it('test 32 — a deployment/CLI entry receives an explicit classification decision', () => {
+    expect(classifyFile('scripts/build-with-identity.mjs', 'const x = 1;')).toBe('SERVER_ENTRY');
+    expect(unauthorizedEffects('SERVER_ENTRY', ['child process', 'filesystem write'])).toEqual([]);
+  });
+
+  it('test 33 — an approved server-only module with a declared effect passes', () => {
+    const modules = {
+      svc: `export const __QHUB_MODULE_CLASSIFICATION = 'INTERNAL_SERVER_ONLY';\nexport const put = (t) => sb.from(t).insert({});`,
+    };
+    expect(authorizeFixtureGraph('INTERNAL_SERVER_ONLY', modules, 'svc')).toEqual([]);
+  });
+
+  it('test 35 — unresolved import / parser error / non-literal dynamic import fail closed (real graph)', () => {
+    expect(graph.unresolved).toEqual([]); // an unresolved app import is a hard failure
+    expect(graph.parseFailures).toEqual([]); // a parse error is a hard failure
+    expect(graph.nonLiteralDynamic).toEqual([]); // a non-literal dynamic import is a hard failure
+    // The detector itself flags a non-literal dynamic import.
+    expect(hasNonLiteralDynamicImport(`await import(userPath)`)).toBe(true);
+  });
+});
+
+describe('R13 §6 — wrapper / re-export effect propagation fails closed under an insufficient class', () => {
   /*
    * Each probe: a protected effect reached from a PUBLIC_SAFE seed through a renamed wrapper, a barrel
    * re-export, or an alias. Enforcement must reject it; the same effect under a server-authorized class
