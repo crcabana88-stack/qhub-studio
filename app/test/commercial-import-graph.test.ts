@@ -449,8 +449,13 @@ const ROUTE_OWN_EFFECT_EXEMPTIONS: Array<{ route: RegExp; effect: string; reason
   { route: /api\.github-branches\.ts$/, effect: 'generic external HTTP', reason: FIXED_PROVIDER_HTTP },
   { route: /api\.github-stats\.ts$/, effect: 'generic external HTTP', reason: FIXED_PROVIDER_HTTP },
   { route: /api\.github-template\.ts$/, effect: 'generic external HTTP', reason: FIXED_PROVIDER_HTTP },
-  { route: /api\.gitlab-branches\.ts$/, effect: 'generic external HTTP', reason: FIXED_PROVIDER_HTTP },
-  { route: /api\.gitlab-projects\.ts$/, effect: 'generic external HTTP', reason: FIXED_PROVIDER_HTTP },
+
+  /*
+   * R15: the api.gitlab-branches / api.gitlab-projects exemptions are REMOVED. They falsely claimed a
+   * fixed origin while the production code built the destination from a caller-supplied `gitlabUrl` and
+   * forwarded a browser token to it. Both routes are now disabled (a constant feature-disabled response
+   * with zero effects), so they need no exemption at all — the gate evaluates them on their real source.
+   */
   { route: /api\.supabase-user\.ts$/, effect: 'generic external HTTP', reason: FIXED_PROVIDER_HTTP },
   { route: /api\.supabase\.ts$/, effect: 'generic external HTTP', reason: FIXED_PROVIDER_HTTP },
   { route: /api\.supabase\.variables\.ts$/, effect: 'generic external HTTP', reason: FIXED_PROVIDER_HTTP },
@@ -891,6 +896,32 @@ describe('R13 §5 + R14 §4/§6 — effect authorization ENFORCED over the compl
 
     for (const e of ROUTE_OWN_EFFECT_EXEMPTIONS) {
       expect(e.reason.length).toBeGreaterThan(20);
+    }
+  });
+
+  it('R15 test 18/19/20 — the GitLab fixed-origin exemptions are gone; the gate judges both routes on real source', () => {
+    // 18: no exemption may claim these routes are fixed-origin any more.
+    for (const effect of ['generic external HTTP', 'dynamic secret read']) {
+      expect(isRouteExempt('app/routes/api.gitlab-projects.ts', effect)).toBe(false);
+      expect(isRouteExempt('app/routes/api.gitlab-branches.ts', effect)).toBe(false);
+    }
+
+    // 19: the OLD vulnerable shape (PUBLIC_SAFE + caller-host fetch + bearer token) is REJECTED.
+    const vulnerable = `/** @qhub-route: PUBLIC_SAFE */
+      export const action = async ({ request }) => {
+        const { token, gitlabUrl } = await request.json();
+        return fetch(\`\${gitlabUrl}/api/v4/projects\`, { headers: { Authorization: \`Bearer \${token}\` } });
+      };`;
+    expect(authorizeFixtureGraph('PUBLIC_SAFE', { route: vulnerable }, 'route')).toContain('generic external HTTP');
+
+    // 20: the CORRECTED shape (the real disabled routes) is ACCEPTED — zero effects, no exemption needed.
+    for (const rel of ['app/routes/api.gitlab-projects.ts', 'app/routes/api.gitlab-branches.ts']) {
+      const verdict = effectAuth.routeVerdicts.get(rel);
+      expect(verdict, `no verdict for ${rel}`).toBeTruthy();
+      expect(verdict?.classification).toBe('PUBLIC_SAFE');
+      expect(verdict?.direct, `${rel} still carries a direct effect`).toEqual([]);
+      expect(verdict?.unauthorized).toEqual([]);
+      expect(verdict?.sensitiveLog).toBe(false);
     }
   });
 

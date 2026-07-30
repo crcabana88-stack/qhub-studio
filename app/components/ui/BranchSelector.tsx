@@ -32,7 +32,11 @@ export function BranchSelector({
   repoName,
   projectId,
   token,
-  gitlabUrl,
+
+  /*
+   * `gitlabUrl` is intentionally not read: R15 disabled GitLab branch discovery (it was the
+   * caller-controlled host the browser token was forwarded to). The prop stays for caller compatibility.
+   */
   defaultBranch,
   onBranchSelect,
   onClose,
@@ -52,34 +56,28 @@ export function BranchSelector({
     setError(null);
 
     try {
-      let response: Response;
+      /*
+       * R15: GitLab branch discovery is DISABLED for the beta — its endpoint forwarded a
+       * browser-supplied token to a caller-selected host. No request is made for the GitLab provider
+       * and no token leaves the browser. GitHub branch discovery (fixed api.github.com) is unaffected.
+       */
+      if (provider !== 'github') {
+        setBranches([]);
+        setError('GitLab branch discovery is unavailable during the beta.');
+        setIsLoading(false);
 
-      if (provider === 'github') {
-        response = await fetch('/api/github-branches', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            owner: repoOwner,
-            repo: repoName,
-            token,
-          }),
-        });
-      } else {
-        // GitLab
-        if (!projectId) {
-          throw new Error('Project ID is required for GitLab repositories');
-        }
-
-        response = await fetch('/api/gitlab-branches', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            token,
-            gitlabUrl: gitlabUrl || 'https://gitlab.com',
-            projectId,
-          }),
-        });
+        return;
       }
+
+      const response = await fetch('/api/github-branches', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          owner: repoOwner,
+          repo: repoName,
+          token,
+        }),
+      });
 
       if (!response.ok) {
         const errorData: any = await response.json().catch(() => ({ error: 'Failed to fetch branches' }));

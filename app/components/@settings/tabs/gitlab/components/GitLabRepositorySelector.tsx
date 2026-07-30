@@ -31,44 +31,16 @@ export function GitLabRepositorySelector({ onClone, className }: GitLabRepositor
 
   const REPOS_PER_PAGE = 12;
 
-  // Fetch repositories
+  /*
+   * R15: GitLab repository discovery is DISABLED for the beta. The endpoint it used forwarded a
+   * browser-supplied token to a caller-selected host, so both the route and this call site are off.
+   * No request is made and no token leaves the browser. Private/self-hosted GitLab is post-beta.
+   */
   const fetchRepositories = async (refresh = false) => {
-    if (!isConnected || !connection?.token) {
-      return;
-    }
-
     const loadingState = refresh ? setIsRefreshing : setIsLoading;
-    loadingState(true);
-    setError(null);
-
-    try {
-      const response = await fetch('/api/gitlab-projects', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({
-          token: connection.token,
-          gitlabUrl: connection.gitlabUrl || 'https://gitlab.com',
-        }),
-      });
-
-      if (!response.ok) {
-        const errorData: any = await response.json().catch(() => ({ error: 'Failed to fetch repositories' }));
-        throw new Error(errorData.error || 'Failed to fetch repositories');
-      }
-
-      const data: any = await response.json();
-      setRepositories(data.projects || []);
-    } catch (err) {
-      console.error('Failed to fetch GitLab repositories:', err);
-      setError(err instanceof Error ? err.message : 'Failed to fetch repositories');
-
-      // Fallback to empty array on error
-      setRepositories([]);
-    } finally {
-      loadingState(false);
-    }
+    loadingState(false);
+    setRepositories([]);
+    setError('GitLab repository discovery is unavailable during the beta.');
   };
 
   // Filter and search repositories
