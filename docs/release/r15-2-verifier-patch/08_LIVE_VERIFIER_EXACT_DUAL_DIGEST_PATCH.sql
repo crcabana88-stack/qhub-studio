@@ -634,7 +634,59 @@ BEGIN
 END;
 $$;
 
-REVOKE ALL ON FUNCTION public.qhub_verify_commercial_schema() FROM PUBLIC, anon, authenticated;
+-- ---------------------------------------------------------------------------
+-- R15.2B — EXACT AUTHORITY RESET.
+--
+-- CREATE OR REPLACE preserves whatever owner and ACL already exist, so a drifted
+-- owner or a stale grant would otherwise survive this patch. In particular a
+-- pre-existing `GRANT EXECUTE ... TO service_role WITH GRANT OPTION` is NOT removed
+-- by a plain re-GRANT. The blocks below restore the exact reviewed authority state.
+-- ---------------------------------------------------------------------------
+
+-- 1. Owner: derived from the live contract (the owner of the migration-created
+--    authority tables), never guessed. Fails closed if it cannot be resolved.
+DO $reset_owner$
+DECLARE
+  v_owner name;
+BEGIN
+  SELECT pg_get_userbyid(c.relowner) INTO v_owner
+    FROM pg_class c
+   WHERE c.oid = to_regclass('public.qhub_manual_review_requests');
+
+  IF v_owner IS NULL THEN
+    RAISE EXCEPTION 'R15.2B: cannot resolve the intended verifier owner from public.qhub_manual_review_requests';
+  END IF;
+
+  EXECUTE format('ALTER FUNCTION public.qhub_verify_commercial_schema() OWNER TO %I', v_owner);
+END;
+$reset_owner$;
+
+-- 2. Clear EXECUTE from every grantee that is neither the owner nor service_role,
+--    so an unexpected direct grantee cannot survive the patch.
+DO $reset_unexpected$
+DECLARE
+  r record;
+BEGIN
+  FOR r IN
+    SELECT DISTINCT pg_get_userbyid(ae.grantee) AS role_name
+      FROM pg_proc p, aclexplode(p.proacl) ae
+     WHERE p.oid = to_regprocedure('public.qhub_verify_commercial_schema()')
+       AND ae.grantee <> 0
+       AND ae.grantee <> p.proowner
+       AND pg_get_userbyid(ae.grantee) <> 'service_role'
+  LOOP
+    EXECUTE format(
+      'REVOKE ALL PRIVILEGES ON FUNCTION public.qhub_verify_commercial_schema() FROM %I', r.role_name);
+  END LOOP;
+END;
+$reset_unexpected$;
+
+-- 3. Clear the known roles outright — this also strips any WITH GRANT OPTION — then
+--    re-grant EXECUTE to service_role WITHOUT grant option.
+REVOKE ALL PRIVILEGES ON FUNCTION public.qhub_verify_commercial_schema() FROM PUBLIC;
+REVOKE ALL PRIVILEGES ON FUNCTION public.qhub_verify_commercial_schema() FROM anon;
+REVOKE ALL PRIVILEGES ON FUNCTION public.qhub_verify_commercial_schema() FROM authenticated;
+REVOKE ALL PRIVILEGES ON FUNCTION public.qhub_verify_commercial_schema() FROM service_role;
 GRANT EXECUTE ON FUNCTION public.qhub_verify_commercial_schema() TO service_role;
 
 COMMIT;

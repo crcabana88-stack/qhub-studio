@@ -60,22 +60,30 @@ Require, in order:
 
 **STOP** on any mismatch. Do not "fix" a file to make a hash match.
 
+> **Run each file IN FULL, as one unit.** Do not run selected fragments. Each file opens and closes its
+> own transaction. If any file raises a SQL error, **STOP** — do not retry pieces of it.
+
 ## Step 2 — Pre-patch check (read-only)
 
-Open the SQL Editor for project `jsjsanmaahvmynblmzkq` → **New query** → paste
+Open the SQL Editor for project `jsjsanmaahvmynblmzkq` → **New query** → paste the whole of
 `07_PRE_PATCH_EXACT_DIGEST_VERIFY.sql` → Run.
 
-Read **QUERY 2 `verdict`**:
+The **last result** is the verdict:
 
 | Verdict | Action |
 |---|---|
 | `SAFE_TO_APPLY_EXACT_DUAL_DIGEST_PATCH` | Continue to Step 3. |
-| `UNEXPECTED_FUNCTION_BODY_STOP` | **STOP.** A protected function is missing, renamed, wrong-signature, overloaded, or carries an unapproved body. Capture QUERY 1 and escalate. |
+| `UNEXPECTED_FUNCTION_BODY_STOP` | **STOP.** A protected function is missing, renamed, wrong-signature, overloaded, or carries an unapproved body. Capture the per-function result and escalate. |
 
-The verdict binds **exact signature and exact raw digest together**. QUERY 3 (line-ending counts) is
-non-authorizing diagnostics and must not be used to justify proceeding. Record QUERY 1 and QUERY 4 for
-evidence; on the current live database expect `matches_crlf = true`, `matches_lf = false`,
-`signature_matches = true`, `overload_count = 1` for all five.
+The verdict binds **exact signature and exact raw digest together**. The line-ending counts are
+non-authorizing diagnostics and must not be used to justify proceeding.
+
+07 reads `pg_catalog` only — it **never invokes a function**, so running the whole file is safe in any
+state, including one where a protected function or the verifier is missing. It cannot raise 42883.
+(The earlier optional "current verifier output" query was removed for exactly that reason.)
+
+On the current live database expect `matches_crlf = true`, `matches_lf = false`, `signature_matches =
+true`, `overload_count = 1` and `authorized = true` for all five.
 
 ## Step 3 — Apply the patch (one transaction, once)
 
@@ -87,22 +95,35 @@ Do not split it, edit it, or re-run fragments on error. It is one transaction, s
 cleanly. The patch is idempotent. Line endings do not matter for the patch itself — the verifier's own
 body is accepted in either reviewed encoding.
 
+**08 resets the exact authority state**, because `CREATE OR REPLACE` preserves whatever owner and ACL
+already exist. It restores the owner (derived from the owner of the migration-created authority tables,
+never guessed), revokes EXECUTE from every grantee that is neither the owner nor `service_role`, revokes
+outright from PUBLIC / `anon` / `authenticated` / `service_role` — which is what strips a stale
+**`WITH GRANT OPTION`** — and then re-grants `EXECUTE` to `service_role` **without** grant option.
+
 Record start/finish timestamp, the success or full error text, and the query name.
 **On any error: STOP**, preserve the error, do not repair manually.
 
 ## Step 4 — Post-patch verification (read-only)
 
-SQL Editor → **New query** → paste `09_POST_PATCH_VERIFY.sql` → Run the queries **in order** and stop at
-the first that reports `R15_2_VERIFIER_NOT_READY` — that value is the final status.
+SQL Editor → **New query** → paste the whole of `09_POST_PATCH_VERIFY.sql` → Run it in full.
 
-| Query | Meaning |
-|---|---|
-| **QUERY 1** existence gate | Pure catalog, cannot raise. `verifier_present = false` ⇒ `R15_2_VERIFIER_NOT_READY`; **STOP** and do not run QUERY 2/3 (referencing a missing function raises PostgreSQL 42883). |
-| **QUERY 2** catalog authority gate | Pure catalog, cannot raise. Checks owner, security mode, fixed `search_path`, ACL, body identity and overload **before** the verifier is invoked, because a drifted owner makes a SECURITY DEFINER function raise "permission denied" rather than return. `authority_status = R15_2_VERIFIER_NOT_READY` ⇒ **STOP**. |
-| **QUERY 3** final status | Invokes the verifier and re-applies every catalog check. Require `final_status = R15_2_VERIFIER_READY`. |
+09 runs in **one read-only REPEATABLE READ transaction** and produces **one authoritative statement**.
+Catalog authority and the verifier result come from the **same snapshot**, so there is no
+inter-statement window in which the verifier could drift after being authorized and before being
+invoked.
 
-Every column displayed in QUERY 2 and QUERY 3 is an input to its verdict — nothing shown there is
-merely informational.
+The verifier is invoked **only when `authority_ok` is true**, through a guarded dynamic call. Two
+consequences to rely on:
+- an unreviewed or unauthorized body is **never executed** — when authority fails, `product_ready`,
+  `product_version` and `product_failed_count` come back `NULL`, not as values and not as an error;
+- a **missing** verifier is named only inside a string literal, so it is not resolved at parse time and
+  cannot raise PostgreSQL 42883 — it simply fails authority.
+
+Require **`final_status = R15_2_VERIFIER_READY`**. Every column in the result — identity, owner,
+security mode, search_path, each ACL condition (including `service_role_no_grant_option` and
+`no_unexpected_grant_option`), body identity, and the three product-verifier values — is an input to
+that verdict. Nothing displayed is merely informational.
 
 | Status | Action |
 |---|---|
@@ -136,9 +157,8 @@ confirmation of the founder UUID, email, org ID and roles before any seed.
 - HEAD does not equal the commit in the final review report
 - Migration SHA-256 is not `b5f0a466f293212812a8ea3d71d6c650ca7af30255275ef248cb420910a0d1cf`
 - Pre-patch verdict is `UNEXPECTED_FUNCTION_BODY_STOP`
-- Any error while applying the patch
-- QUERY 1 reports the verifier missing, QUERY 2 reports `R15_2_VERIFIER_NOT_READY`, or QUERY 3 is not
-  `R15_2_VERIFIER_READY`
+- **Any SQL error while running any of the three files** — do not retry fragments
+- `final_status` from 09 is not exactly `R15_2_VERIFIER_READY`
 - Any prompt for `--include-all`, reset, force, or replay of prior migrations
 
 ## Out of scope

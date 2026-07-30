@@ -16,7 +16,14 @@
 -- so a missing or renamed function fails closed rather than erroring.
 --
 -- QUERY 3 (line-ending counts) is NON-AUTHORIZING diagnostics only.
+--
+-- R15.2B: this file reads pg_catalog ONLY. It never invokes a function, so running
+-- it in full is safe in any state — including one where a protected function or the
+-- verifier is missing — and it cannot raise PostgreSQL 42883.
 -- ============================================================================
+
+BEGIN;
+SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY;
 
 -- ---------------------------------------------------------------------------
 -- QUERY 1 — Per-function exact identity and raw digest.
@@ -82,6 +89,23 @@ LEFT JOIN pg_proc p ON p.oid = r.resolved_regproc
 ORDER BY r.proname;
 
 -- ---------------------------------------------------------------------------
+-- ---------------------------------------------------------------------------
+-- QUERY 3 — NON-AUTHORIZING DIAGNOSTICS ONLY.
+-- Informational line-ending counts. These MUST NOT be used to authorize the
+-- patch; QUERY 2 is the sole authority.
+-- ---------------------------------------------------------------------------
+SELECT
+  p.proname,
+  octet_length(p.prosrc)                                       AS prosrc_octet_length,
+  (length(p.prosrc) - length(replace(p.prosrc, chr(13), '')))  AS cr_count,
+  (length(p.prosrc) - length(replace(p.prosrc, chr(10), '')))  AS lf_count
+FROM pg_proc p
+JOIN pg_namespace n ON n.oid = p.pronamespace
+WHERE n.nspname = 'public'
+  AND p.proname IN ('qhub_decide_review','qhub_create_review_request',
+                    'qhub_record_acknowledgment','qhub_canon_cells','qhub_row_immutable')
+ORDER BY p.proname;
+
 -- QUERY 2 — VERDICT. Act on this value alone.
 --
 --   SAFE_TO_APPLY_EXACT_DUAL_DIGEST_PATCH
@@ -144,32 +168,14 @@ SELECT
   END                                                                               AS verdict
 FROM evaluated;
 
--- ---------------------------------------------------------------------------
--- QUERY 3 — NON-AUTHORIZING DIAGNOSTICS ONLY.
--- Informational line-ending counts. These MUST NOT be used to authorize the
--- patch; QUERY 2 is the sole authority.
--- ---------------------------------------------------------------------------
-SELECT
-  p.proname,
-  octet_length(p.prosrc)                                       AS prosrc_octet_length,
-  (length(p.prosrc) - length(replace(p.prosrc, chr(13), '')))  AS cr_count,
-  (length(p.prosrc) - length(replace(p.prosrc, chr(10), '')))  AS lf_count
-FROM pg_proc p
-JOIN pg_namespace n ON n.oid = p.pronamespace
-WHERE n.nspname = 'public'
-  AND p.proname IN ('qhub_decide_review','qhub_create_review_request',
-                    'qhub_record_acknowledgment','qhub_canon_cells','qhub_row_immutable')
-ORDER BY p.proname;
+COMMIT;
 
 -- ---------------------------------------------------------------------------
--- QUERY 4 — Current verifier output (evidence record).
--- Run ONLY if public.qhub_verify_commercial_schema() exists; otherwise skip it
--- (referencing a missing function raises 42883).
+-- R15.2B — the previous optional "current verifier output" query was REMOVED.
+-- It invoked public.qhub_verify_commercial_schema() unconditionally, so running
+-- this file in full against a database whose verifier is missing raised
+-- PostgreSQL 42883 *after* the STOP verdict had already been produced. This file
+-- now touches pg_catalog only: it is safe to paste and run in full, in any state,
+-- and it never invokes a function. The verifier's own output is reported by
+-- 09_POST_PATCH_VERIFY.sql, which gates the call on catalog authority.
 -- ---------------------------------------------------------------------------
-SELECT (to_regprocedure('public.qhub_verify_commercial_schema()') IS NOT NULL) AS verifier_present;
-
-SELECT
-  v ->> 'expected_version' AS expected_version,
-  (v ->> 'ready')::boolean AS ready,
-  v -> 'failed'            AS failed_checks
-FROM public.qhub_verify_commercial_schema() AS v;
