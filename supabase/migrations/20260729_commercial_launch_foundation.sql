@@ -1,8 +1,10 @@
 -- ============================================================================
 -- QHUB Commercial Launch Foundation — R12 FINAL TWO-BLOCKER CLOSURE
 --   (persisted + revalidated classification authority on review requests)
---   + R15.1 verifier line-ending portability (CR-normalized body pins only;
---     no protected function body, signature, ACL, RLS or digest constant changed)
+--   + R15.2 verifier exact dual-digest body pins (raw md5(prosrc) accepting exactly
+--     the reviewed LF and reviewed CRLF encodings; NO normalization — supersedes the
+--     withdrawn R15.1 CR-stripping, which allowed a false READY. No protected function
+--     body, signature, owner, security mode, search_path, ACL or RLS setting changed.)
 -- Migration: 20260729_commercial_launch_foundation  (replaces the rejected
 --            4b42555a… contents IN PLACE — one authoritative commercial migration)
 -- Schema version: 2026-07-30.commercial-launch-r8
@@ -1964,19 +1966,31 @@ BEGIN
    * (any change to the body text changes the digest). prosrc is stored verbatim, so the digest is
    * stable across PG versions.
    *
-   * R15.1 — APPLICATION-CHANNEL PORTABILITY. Only carriage returns (chr(13)) are stripped before
-   * hashing. Some application channels (a Windows clipboard paste into the SQL Editor) rewrite the
-   * migration's LF line endings to CRLF, which is stored verbatim in prosrc and changed all five
-   * digests uniformly even though the bodies were semantically identical (proved textually — the
-   * CR-stripped live body equals the reviewed LF body exactly — and behaviourally). Normalizing CR
-   * makes an LF-applied and a CRLF-applied database verify identically while leaving every other
-   * character significant: spaces, tabs, LF, comments, dollar quotes and all executable tokens still
-   * change the digest, so real body drift is still detected.
+   * R15.2 — EXACT DUAL-DIGEST ACCEPTANCE (supersedes the withdrawn R15.1 normalization).
+   *
+   * Some application channels (a Windows clipboard paste into the SQL Editor) rewrite the migration's
+   * LF line endings to CRLF; PostgreSQL stores that verbatim in prosrc, so the same reviewed body has
+   * two possible raw encodings. R15.1 tried to absorb this with md5(replace(prosrc, chr(13), '')) —
+   * that was UNSAFE and is withdrawn: deleting every CR also deletes a CR injected INSIDE executable
+   * text, so a body containing e.g. 'staff'||chr(13)||'_required' hashed identically to the reviewed
+   * body and produced a FALSE READY (independently reproduced).
+   *
+   * The pins therefore hash RAW prosrc — no replace/regexp_replace/translate/trim, no normalization of
+   * any kind — and accept exactly TWO separately reviewed encodings of the same reviewed body: the LF
+   * digest and the CRLF digest, each computed from the reviewed migration and verified. Any third byte
+   * sequence, including a single injected or removed CR or LF, a mixed-ending body, or any executable
+   * token change, yields a digest outside the two-value allowlist and is reported as drift.
+   *
+   * coalesce(..., FALSE) keeps the check fail-closed: a missing or renamed function makes the scalar
+   * subquery NULL, `NULL IN (...)` is NULL, and the check reports drift rather than silently passing.
    */
-  IF (SELECT md5(replace(p.prosrc, chr(13), '')) FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace
-        WHERE n.nspname='public' AND p.proname='qhub_decide_review'
-          AND pg_get_function_identity_arguments(p.oid) = 'p_request_id uuid, p_actor text, p_is_staff boolean, p_decision text, p_reason text, p_policy_version text')
-     IS DISTINCT FROM '7e678f1e4bba0c540507cfe3743fbe54' THEN
+  IF NOT coalesce(
+       (SELECT md5(p.prosrc) FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace
+          WHERE n.nspname='public' AND p.proname='qhub_decide_review'
+            AND pg_get_function_identity_arguments(p.oid) = 'p_request_id uuid, p_actor text, p_is_staff boolean, p_decision text, p_reason text, p_policy_version text')
+       IN ('7e678f1e4bba0c540507cfe3743fbe54',   -- reviewed body, LF encoding
+           'dac8abcd56d7fc804baac660059c14bf'),  -- reviewed body, CRLF encoding
+     FALSE) THEN
     v_failed := v_failed || 'decide_review_body_drift'::text;
   END IF;
 
@@ -1998,10 +2012,13 @@ BEGIN
     WHERE n.nspname='public' AND p.proname='qhub_create_review_request'
       AND p.proowner = (SELECT relowner FROM pg_class WHERE oid='public.qhub_manual_review_requests'::regclass);
   IF NOT FOUND THEN v_failed := v_failed || 'r7_create_review_owner_drift'::text; END IF;
-  IF (SELECT md5(replace(p.prosrc, chr(13), '')) FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace
-        WHERE n.nspname='public' AND p.proname='qhub_create_review_request'
-          AND pg_get_function_identity_arguments(p.oid) = 'p_org_id text, p_project_id uuid, p_requester text, p_reason text, p_idempotency_key text')
-     IS DISTINCT FROM '6b46c3d75636fd0c8b628b34a86f4084' THEN
+  IF NOT coalesce(
+       (SELECT md5(p.prosrc) FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace
+          WHERE n.nspname='public' AND p.proname='qhub_create_review_request'
+            AND pg_get_function_identity_arguments(p.oid) = 'p_org_id text, p_project_id uuid, p_requester text, p_reason text, p_idempotency_key text')
+       IN ('6b46c3d75636fd0c8b628b34a86f4084',   -- reviewed body, LF encoding
+           '349b59554232ab7f3b9e4aa3a8cc2331'),  -- reviewed body, CRLF encoding
+     FALSE) THEN
     v_failed := v_failed || 'r7_create_review_body_drift'::text;
   END IF;
 
@@ -2022,9 +2039,12 @@ BEGIN
     WHERE n.nspname='public' AND p.proname='qhub_record_acknowledgment'
       AND p.proowner = (SELECT relowner FROM pg_class WHERE oid='public.qhub_acknowledgments'::regclass);
   IF NOT FOUND THEN v_failed := v_failed || 'r7_record_ack_owner_drift'::text; END IF;
-  IF (SELECT md5(replace(p.prosrc, chr(13), '')) FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace
-        WHERE n.nspname='public' AND p.proname='qhub_record_acknowledgment')
-     IS DISTINCT FROM 'b6035e9a35f5ecc49369b68000c7b2a6' THEN
+  IF NOT coalesce(
+       (SELECT md5(p.prosrc) FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace
+          WHERE n.nspname='public' AND p.proname='qhub_record_acknowledgment')
+       IN ('b6035e9a35f5ecc49369b68000c7b2a6',   -- reviewed body, LF encoding
+           '09e053d93afb7aca96064b758d76213a'),  -- reviewed body, CRLF encoding
+     FALSE) THEN
     v_failed := v_failed || 'r7_record_ack_body_drift'::text;
   END IF;
 
@@ -2041,9 +2061,12 @@ BEGIN
       AND p.proowner = (SELECT relowner FROM pg_class WHERE oid='public.qhub_acknowledgments'::regclass)
       AND p.provolatile = 'i';
   IF NOT FOUND THEN v_failed := v_failed || 'r7_canon_cells_owner_or_volatility'::text; END IF;
-  IF (SELECT md5(replace(p.prosrc, chr(13), '')) FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace
-        WHERE n.nspname='public' AND p.proname='qhub_canon_cells')
-     IS DISTINCT FROM '6151a5d4794e56fbc26fc891f8fefdb4' THEN
+  IF NOT coalesce(
+       (SELECT md5(p.prosrc) FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace
+          WHERE n.nspname='public' AND p.proname='qhub_canon_cells')
+       IN ('6151a5d4794e56fbc26fc891f8fefdb4',   -- reviewed body, LF encoding
+           '2d569f42d1e95f2ffd38dc82e14d727c'),  -- reviewed body, CRLF encoding
+     FALSE) THEN
     v_failed := v_failed || 'r7_canon_cells_body_drift'::text;
   END IF;
 
@@ -2065,9 +2088,12 @@ BEGIN
   ) THEN
     v_failed := v_failed || 'r7_ack_immutable_trigger'::text;
   END IF;
-  IF (SELECT md5(replace(p.prosrc, chr(13), '')) FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace
-        WHERE n.nspname='public' AND p.proname='qhub_row_immutable')
-     IS DISTINCT FROM '41ae59dde9a471b580d28e2cb45984f5' THEN
+  IF NOT coalesce(
+       (SELECT md5(p.prosrc) FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace
+          WHERE n.nspname='public' AND p.proname='qhub_row_immutable')
+       IN ('41ae59dde9a471b580d28e2cb45984f5',   -- reviewed body, LF encoding
+           '4936e3f58627dde5abc10d2b0ecf5b4f'),  -- reviewed body, CRLF encoding
+     FALSE) THEN
     v_failed := v_failed || 'r7_ack_immutable_body_drift'::text;
   END IF;
 

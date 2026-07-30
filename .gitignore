@@ -45,6 +45,11 @@ changelogUI.md
 docs/instructions/Roadmap.md
 .cursorrules
 *.md
+
+# Reviewed release/runbook documentation must be committed and reviewable.
+# NOTE: the credential patterns below are intentionally listed AFTER this negation,
+# so *-CREDENTIALS.md / *-SECRETS.md stay ignored even under docs/release/.
+!docs/release/**/*.md
 .qodo
 
 # QHUB security — NEVER commit these
