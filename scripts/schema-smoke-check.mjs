@@ -45,7 +45,7 @@ const AGENT_SCHEMA_VERIFIER_RPC = 'qhub_verify_agent_schema';
  * (a compact failed-check-name array, not per-check {identifier,category,...}).
  * KEEP IN SYNC with app/lib/qhub/commercial/commercial-schema-check.server.ts.
  */
-const EXPECTED_COMMERCIAL_SCHEMA_VERSION = '2026-07-30.commercial-launch-r5';
+const EXPECTED_COMMERCIAL_SCHEMA_VERSION = '2026-07-30.commercial-launch-r6';
 const COMMERCIAL_SCHEMA_VERIFIER_RPC = 'qhub_verify_commercial_schema';
 
 /** @type {{table:string,column:string,migration:string}[]} */

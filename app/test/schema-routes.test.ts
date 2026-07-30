@@ -64,8 +64,8 @@ vi.mock('~/lib/qhub/agent/agent-schema-check.server', () => ({
 vi.mock('~/lib/qhub/commercial/commercial-schema-check.server', () => ({
   getCommercialSchemaReadiness: vi.fn().mockResolvedValue({
     state: 'READY',
-    expected: '2026-07-30.commercial-launch-r5',
-    version: '2026-07-30.commercial-launch-r5',
+    expected: '2026-07-30.commercial-launch-r6',
+    version: '2026-07-30.commercial-launch-r6',
     failed: [],
     checkedAt: 0,
   }),

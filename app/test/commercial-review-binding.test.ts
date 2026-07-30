@@ -19,6 +19,7 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 import {
   buildDeclarationIdentityString,
   currentRequiredAcknowledgmentVersion,
+  currentReviewPolicyVersion,
 } from '~/lib/qhub/commercial/governance-essentials';
 import { testReadyToken } from '~/test/helpers/commercial-ready-token';
 
@@ -80,10 +81,17 @@ const H = vi.hoisted(() => ({
   gov: null as Record<string, unknown> | null,
   ack: null as Record<string, unknown> | null,
   approvedReview: null as Record<string, unknown> | null,
+  rpcCalls: [] as Array<{ name: string; args: Record<string, unknown> }>,
+  rpcResult: null as Record<string, unknown> | null,
 }));
 
 vi.mock('@supabase/supabase-js', () => ({
   createClient: () => ({
+    rpc: async (name: string, args: Record<string, unknown>) => {
+      H.rpcCalls.push({ name, args });
+
+      return { data: H.rpcResult, error: null };
+    },
     from(table: string) {
       const b: Record<string, unknown> = {};
       let cols = '';
@@ -159,6 +167,8 @@ beforeEach(() => {
   H.gov = null;
   H.ack = null;
   H.approvedReview = null;
+  H.rpcCalls = [];
+  H.rpcResult = null;
 });
 
 describe('upsertDeclaration persists identity but does NOT auto-open a review (R9 §1)', () => {
@@ -188,45 +198,9 @@ describe('upsertDeclaration persists identity but does NOT auto-open a review (R
   });
 });
 
-describe('submitCustomerReview binds the full authoritative identity (R9 §1)', () => {
-  const govManualReview = {
-    id: 'gov-1',
-    project_id: 'p1',
-    org_id: 'o1',
-    disposition: 'manual_review',
-    declaration_complete: true,
-    acknowledged: true,
-    review_state: 'requested',
-    risk_tier: 'T1',
-    review_policy_version: null,
-    policy_card_version: '2026-07-30.policy-card.v1',
-    acknowledgment_version: currentRequiredAcknowledgmentVersion(),
-    record_version: 4,
-    declaration_identity_hash: HASH,
-    data_classes: ['personal'],
-    acknowledgment_record_id: 'ack-rec-1',
-  };
-
-  const ackRow = {
-    id: 'ack-rec-1',
-    org_id: 'o1',
-    user_id: 'u1',
-    ack_version: currentRequiredAcknowledgmentVersion(),
-  };
-
-  it('persists governance + acknowledgment bindings derived entirely server-side', async () => {
-    H.gov = govManualReview;
-    H.ack = {
-      acknowledged: true,
-      acknowledgment_version: currentRequiredAcknowledgmentVersion(),
-      acknowledgment_record_id: 'ack-rec-1',
-    };
-
-    /*
-     * resolveCurrentAcknowledgment reads the ack ROW after the gov ack-state row; both come from
-     * the same table stubs, so seed H.ack for the ack-row read path via the id lookup.
-     */
-    H.ack = ackRow;
+describe('submitCustomerReview delegates to the atomic qhub_create_review_request RPC (R10 §3)', () => {
+  it('calls the RPC with ONLY server-derived arguments (browser cannot inject identity fields)', async () => {
+    H.rpcResult = { ok: true, idempotent: false, request_id: 'rid-1' };
 
     const r = await submitCustomerReview(
       CTX,
@@ -235,36 +209,39 @@ describe('submitCustomerReview binds the full authoritative identity (R9 §1)', 
       ENV,
     );
 
-    expect(r.ok).toBe(true);
-    expect(H.reviewInserts).toHaveLength(1);
+    expect(r).toEqual({ ok: true, requestId: 'rid-1', idempotent: false });
+    expect(H.rpcCalls).toHaveLength(1);
 
-    const review = H.reviewInserts[0];
-    expect(review.governance_record_id).toBe('gov-1');
-    expect(review.governance_record_version).toBe(4);
-    expect(review.declaration_identity_hash).toBe(HASH);
-    expect(review.acknowledgment_record_id).toBe('ack-rec-1');
-    expect(review.acknowledgment_version).toBe(currentRequiredAcknowledgmentVersion());
-    expect(review.required_acknowledgment_version).toBe(currentRequiredAcknowledgmentVersion());
-    expect(review.requester_user_id).toBe('u1');
-    expect(review.category).toBe('personal'); // derived from the declared data class, not the browser
-    expect(review.status).toBe('pending');
+    const call = H.rpcCalls[0];
+    expect(call.name).toBe('qhub_create_review_request');
+
+    /*
+     * The browser supplies only project/reason/idempotency-key; policy + required-ack versions are
+     * SERVER-derived; and NO authoritative identity field is accepted from the caller.
+     */
+    expect(call.args).toEqual({
+      p_org_id: 'o1',
+      p_project_id: 'p1',
+      p_requester: 'u1',
+      p_reason: 'sensitive data',
+      p_idempotency_key: 'k1',
+      p_policy_version: currentReviewPolicyVersion(),
+      p_required_ack_version: currentRequiredAcknowledgmentVersion(),
+    });
   });
 
-  it('rejects when the project is not in a REVIEW_REQUIRED (manual_review) state', async () => {
-    H.gov = { ...govManualReview, disposition: 'proceed' };
+  it('maps an idempotent RPC result through', async () => {
+    H.rpcResult = { ok: true, idempotent: true, request_id: 'rid-1' };
+
+    const r = await submitCustomerReview(CTX, { projectId: 'p1', reason: 'x' }, testReadyToken(ENV), ENV);
+    expect(r).toEqual({ ok: true, requestId: 'rid-1', idempotent: true });
+  });
+
+  it('surfaces the RPC failure reason (e.g. not REVIEW_REQUIRED) without a review write', async () => {
+    H.rpcResult = { ok: false, reason: 'review_not_required' };
 
     const r = await submitCustomerReview(CTX, { projectId: 'p1', reason: 'x' }, testReadyToken(ENV), ENV);
     expect(r).toEqual({ ok: false, error: 'review_not_required' });
-    expect(H.reviewInserts).toHaveLength(0);
-  });
-
-  it('rejects when there is no authoritative acknowledgment at the current required version', async () => {
-    H.gov = { ...govManualReview, acknowledged: false, acknowledgment_record_id: null };
-    H.ack = null;
-
-    const r = await submitCustomerReview(CTX, { projectId: 'p1', reason: 'x' }, testReadyToken(ENV), ENV);
-    expect(r.ok).toBe(false);
-    expect(H.reviewInserts).toHaveLength(0);
   });
 });
 
@@ -290,7 +267,8 @@ const HASH_B = 'b'.repeat(64);
 async function seedBoundReview(db: PGlite, ids: { pid: string; gid: string; aid: string; rid: string }) {
   await db.exec(`
     insert into public.qhub_project_entitlements (project_id, org_id, plan_id, active) values ('${ids.pid}','o1','builder_beta', true);
-    insert into public.qhub_acknowledgments (id, org_id, user_id, ack_type, ack_version) values ('${ids.aid}','o1','u1','acceptable_use','ack1');
+    insert into public.qhub_acknowledgments (id, org_id, user_id, ack_type, ack_version, project_id, required_version, status)
+      values ('${ids.aid}','o1','u1','acceptable_use','ack1','${ids.pid}','ack1','ACTIVE');
     insert into public.qhub_governance_essentials
       (id, project_id, org_id, disposition, review_state, record_version, declaration_identity_hash, acknowledged, acknowledgment_version, acknowledgment_record_id)
       values ('${ids.gid}','${ids.pid}','o1','manual_review','requested', 4, '${HASH}', true, 'ack1', '${ids.aid}');

@@ -23,7 +23,6 @@ import {
   type DataClass,
   type Disposition,
 } from '~/lib/qhub/commercial/governance-essentials';
-import { createReviewRequest } from '~/lib/qhub/commercial/review.server';
 
 async function sha256Hex(s: string): Promise<string> {
   const buf = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(s));
@@ -277,7 +276,7 @@ export async function acknowledgeProject(
   const sb = mutator(token, env);
   const { data: rec } = await sb
     .from('qhub_governance_essentials')
-    .select('declaration_complete,disposition')
+    .select('id,record_version,declaration_complete,disposition')
     .eq('project_id', input.projectId)
     .eq('org_id', ctx.orgId)
     .maybeSingle();
@@ -297,6 +296,20 @@ export async function acknowledgeProject(
   // SERVER-derived required version — never taken from the browser.
   const ackVersion = currentRequiredAcknowledgmentVersion();
 
+  /*
+   * R10 §2: SUPERSEDE any prior ACTIVE acknowledgment for this scope (a controlled ACTIVE→SUPERSEDED
+   * lifecycle transition), then insert ONE new ACTIVE acknowledgment carrying the full project +
+   * Governance scope. The partial unique index guarantees at most one ACTIVE per scope.
+   */
+  await sb
+    .from('qhub_acknowledgments')
+    .update({ status: 'SUPERSEDED', superseded_at: new Date().toISOString(), updated_at: new Date().toISOString() })
+    .eq('org_id', ctx.orgId)
+    .eq('user_id', ctx.userId)
+    .eq('ack_type', 'acceptable_use')
+    .eq('project_id', input.projectId)
+    .eq('status', 'ACTIVE');
+
   const { data: ack } = await sb
     .from('qhub_acknowledgments')
     .insert({
@@ -304,6 +317,12 @@ export async function acknowledgeProject(
       user_id: ctx.userId,
       ack_type: 'acceptable_use',
       ack_version: ackVersion,
+      project_id: input.projectId,
+      governance_record_id: rec.id as string,
+      governance_record_version: rec.record_version as number,
+      required_version: ackVersion,
+      policy_version: currentReviewPolicyVersion(),
+      status: 'ACTIVE',
     })
     .select('id')
     .maybeSingle();
@@ -324,23 +343,33 @@ export async function acknowledgeProject(
   return { ok: true };
 }
 
+/** R10 §2: the resolved authoritative acknowledgment identity + lifecycle state. */
+export interface AuthoritativeAcknowledgment {
+  recordId: string;
+  version: string;
+  requiredVersion: string;
+  status: string;
+  ackType: string;
+}
+
 /**
  * @qhub-service: INTERNAL_SERVER_ONLY
- * R9 §4: the ONE authoritative resolver of a user's CURRENT acknowledgment for a project. It never
- * trusts a browser-supplied version — it loads the persisted acknowledgment row and the project's
- * Governance acknowledgment state and proves currency + ownership (org/user/project). Used by review
- * submission and by the current-review authorization / decision paths.
+ * R10 §2: the ONE authoritative resolver of a user's CURRENT acknowledgment for a project. It never
+ * trusts any browser-supplied version/id/status/scope — it loads the persisted acknowledgment row +
+ * the project's Governance acknowledgment binding and proves ownership (org/user/project), type,
+ * ACTIVE status (revoked/superseded never authorize), and version currency. Used by review creation,
+ * review decision, and every build/model/publication/export authorization.
  */
-export async function resolveCurrentAcknowledgment(
+export async function resolveCurrentAuthoritativeAcknowledgment(
   orgId: string,
   projectId: string,
   userId: string,
   env: Record<string, string | undefined>,
-): Promise<{ ok: true; recordId: string; version: string; requiredVersion: string } | { ok: false; reason: string }> {
+): Promise<{ ok: true; ack: AuthoritativeAcknowledgment } | { ok: false; reason: string }> {
   const requiredVersion = currentRequiredAcknowledgmentVersion();
   const sb = admin(env);
 
-  // The project's Governance acknowledgment state must be current.
+  // The project's Governance acknowledgment binding must be current.
   const { data: g } = await sb
     .from('qhub_governance_essentials')
     .select('acknowledged,acknowledgment_version,acknowledgment_record_id')
@@ -360,10 +389,10 @@ export async function resolveCurrentAcknowledgment(
     return { ok: false, reason: 'acknowledgment_stale' };
   }
 
-  // The requester's OWN acknowledgment row must exist for the current required version.
+  // The bound acknowledgment ROW must be ACTIVE + owned by this org/user/project + the right type/version.
   const { data: a } = await sb
     .from('qhub_acknowledgments')
-    .select('id,org_id,user_id,ack_version')
+    .select('id,org_id,user_id,project_id,ack_type,ack_version,required_version,status')
     .eq('id', g.acknowledgment_record_id as string)
     .maybeSingle();
 
@@ -371,15 +400,33 @@ export async function resolveCurrentAcknowledgment(
     return { ok: false, reason: 'acknowledgment_not_found' };
   }
 
-  if (a.org_id !== orgId || a.user_id !== userId) {
-    return { ok: false, reason: 'acknowledgment_owner_mismatch' };
+  // A legacy row (no status/scope) can never satisfy the R10 authoritative contract.
+  if (!a.status) {
+    return { ok: false, reason: 'non_authorizing_legacy_acknowledgment' };
   }
 
-  if (a.ack_version !== requiredVersion) {
+  if (a.status !== 'ACTIVE') {
+    return { ok: false, reason: 'acknowledgment_not_active' };
+  }
+
+  if (a.org_id !== orgId || a.user_id !== userId || a.project_id !== projectId || a.ack_type !== 'acceptable_use') {
+    return { ok: false, reason: 'acknowledgment_scope_mismatch' };
+  }
+
+  if (a.ack_version !== requiredVersion || a.required_version !== requiredVersion) {
     return { ok: false, reason: 'acknowledgment_stale' };
   }
 
-  return { ok: true, recordId: a.id as string, version: a.ack_version as string, requiredVersion };
+  return {
+    ok: true,
+    ack: {
+      recordId: a.id as string,
+      version: a.ack_version as string,
+      requiredVersion,
+      status: a.status as string,
+      ackType: a.ack_type as string,
+    },
+  };
 }
 
 /** @qhub-service: INTERNAL_SERVER_ONLY */
@@ -437,12 +484,28 @@ export async function getGovernanceRecord(
     }
   }
 
+  /*
+   * R10 §2: fold the bound acknowledgment's LIFECYCLE STATUS into `acknowledged`. A revoked or
+   * superseded acknowledgment (or a legacy row with no status) never authorizes — the pure
+   * authorization then blocks on 'acknowledgment_required'. Only a status='ACTIVE' bound ack counts.
+   */
+  let ackActive = !!data.acknowledged;
+
+  if (ackActive && data.acknowledgment_record_id) {
+    const { data: ackRow } = await sb
+      .from('qhub_acknowledgments')
+      .select('status')
+      .eq('id', data.acknowledgment_record_id as string)
+      .maybeSingle();
+    ackActive = ackRow?.status === 'ACTIVE';
+  }
+
   return {
     projectId: data.project_id as string,
     orgId: data.org_id as string,
     disposition: data.disposition as Disposition,
     declarationComplete: !!data.declaration_complete,
-    acknowledged: !!data.acknowledged,
+    acknowledged: ackActive,
     reviewState: (data.review_state as GovernanceRecord['reviewState']) ?? 'none',
     riskTier: (data.risk_tier as RiskTier) ?? 'UNCLASSIFIED',
     reviewPolicyVersion: (data.review_policy_version as string) ?? null,
@@ -564,12 +627,12 @@ export function assertBoundReviewAuthorization(rec: GovernanceRecord | null): { 
 
 /**
  * @qhub-service: REQUIRES_COMMERCIAL_READY_TOKEN
- * R9 §1: the AUTHORITATIVE customer review-submission path. The browser supplies ONLY the project,
- * a bounded reason, and an idempotency key. EVERYTHING that binds authorization is derived
- * server-side: the project must be REVIEW_REQUIRED (disposition manual_review), the requester's
- * authoritative acknowledgment must already exist at the current required version, the category is
- * derived from the declared sensitive data class, and the full Governance + acknowledgment identity
- * is bound into the request. No NULL binding fields can result.
+ * R10 §3: the AUTHORITATIVE customer review-submission path. The browser supplies ONLY the project,
+ * a bounded reason, and an idempotency key. Submission delegates to the ATOMIC server RPC
+ * qhub_create_review_request, which — under row locks — validates membership + REVIEW_REQUIRED
+ * Governance + the ACTIVE acknowledgment, derives every binding + the category, computes the
+ * canonical request identity in the database, and inserts ONE fully-bound review. The policy and
+ * required-acknowledgment versions are SERVER-derived here (never from the browser).
  */
 export async function submitCustomerReview(
   ctx: CommercialContext,
@@ -577,59 +640,34 @@ export async function submitCustomerReview(
   token: CommercialReadyToken,
   env: Record<string, string | undefined>,
 ): Promise<{ ok: true; requestId: string; idempotent: boolean } | { ok: false; error: string }> {
-  // Fail closed on readiness before any read or the delegated (token-guarded) review write.
-  assertReadyToken(token, env);
+  // Fail closed on readiness before the token-guarded atomic RPC.
+  const sb = mutator(token, env);
 
   if (!ctx.orgId) {
     return { ok: false, error: 'no_org_context' };
   }
 
-  const rec = await getGovernanceRecord(ctx.orgId, input.projectId, env);
+  const { data, error } = await sb.rpc('qhub_create_review_request', {
+    p_org_id: ctx.orgId,
+    p_project_id: input.projectId,
+    p_requester: ctx.userId,
+    p_reason: input.reason,
+    p_idempotency_key: input.idempotencyKey ?? null,
+    p_policy_version: currentReviewPolicyVersion(),
+    p_required_ack_version: currentRequiredAcknowledgmentVersion(),
+  });
 
-  if (!rec) {
-    return { ok: false, error: 'no_governance_record' };
+  if (error || !data) {
+    return { ok: false, error: 'review_create_failed' };
   }
 
-  if (!rec.declarationComplete) {
-    return { ok: false, error: 'declaration_incomplete' };
+  const result = data as { ok: boolean; reason?: string; idempotent?: boolean; request_id?: string };
+
+  if (!result.ok || !result.request_id) {
+    return { ok: false, error: result.reason ?? 'review_create_failed' };
   }
 
-  // The project must be in the REVIEW_REQUIRED state (a clean proceed disposition needs no review).
-  if (rec.disposition !== 'manual_review') {
-    return { ok: false, error: 'review_not_required' };
-  }
-
-  if (!rec.governanceRecordId || rec.recordVersion == null || !rec.declarationIdentityHash) {
-    return { ok: false, error: 'governance_binding_incomplete' };
-  }
-
-  // The requester's authoritative acknowledgment must already exist at the current required version.
-  const ack = await resolveCurrentAcknowledgment(ctx.orgId, input.projectId, ctx.userId, env);
-
-  if (!ack.ok) {
-    return { ok: false, error: ack.reason };
-  }
-
-  // The review category is DERIVED from the declared sensitive data class (never browser-supplied).
-  const category = (rec.dataClasses ?? []).find((c) => ['personal', 'financial', 'restricted'].includes(c));
-
-  if (!category) {
-    return { ok: false, error: 'no_review_eligible_category' };
-  }
-
-  return createReviewRequest(
-    ctx,
-    { projectId: input.projectId, category, reason: input.reason, idempotencyKey: input.idempotencyKey },
-    token,
-    env,
-    {
-      governanceRecordId: rec.governanceRecordId,
-      governanceRecordVersion: rec.recordVersion,
-      declarationIdentityHash: rec.declarationIdentityHash,
-      acknowledgmentRecordId: ack.recordId,
-      acknowledgmentVersion: ack.version,
-    },
-  );
+  return { ok: true, requestId: result.request_id, idempotent: !!result.idempotent };
 }
 
 /**

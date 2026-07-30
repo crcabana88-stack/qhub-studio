@@ -89,7 +89,7 @@ describe('commercial-launch R3 migration', () => {
       await db.exec(sql);
 
       const v = await verify(db);
-      expect(v.expected_version).toBe('2026-07-30.commercial-launch-r5');
+      expect(v.expected_version).toBe('2026-07-30.commercial-launch-r6');
       expect(v.failed).toEqual([]);
       expect(v.ready).toBe(true);
     } finally {
@@ -518,7 +518,8 @@ describe('commercial-launch R3 migration', () => {
       const aid = '70000000-0000-0000-0000-000000000001';
       await db.exec(`
         insert into public.qhub_project_entitlements (project_id, org_id, plan_id, active) values ('${pid}','o1','builder_beta', true);
-        insert into public.qhub_acknowledgments (id, org_id, user_id, ack_type, ack_version) values ('${aid}','o1','u1','acceptable_use','ack1');
+        insert into public.qhub_acknowledgments (id, org_id, user_id, ack_type, ack_version, project_id, required_version, status)
+          values ('${aid}','o1','u1','acceptable_use','ack1','${pid}','ack1','ACTIVE');
         insert into public.qhub_governance_essentials
           (id, project_id, org_id, disposition, review_state, record_version, declaration_identity_hash, acknowledged, acknowledgment_version, acknowledgment_record_id)
           values ('${gid}','${pid}','o1','manual_review','requested', 4, '${HASH}', true, 'ack1', '${aid}');
@@ -749,6 +750,251 @@ describe('commercial-launch R3 migration', () => {
       const v = await verify(db);
       expect(v.ready).toBe(false);
       expect(v.failed).toContain('seat_rpc_caller_cap');
+    } finally {
+      await db.close();
+    }
+  });
+});
+
+// ─── R10 §3/§6 — atomic review CREATION + exact-semantic verifier drift ──────────
+
+const H64 = 'a'.repeat(64);
+
+/** Seed a REVIEW_REQUIRED project with an ACTIVE acknowledgment, ready for qhub_create_review_request. */
+async function seedReviewRequired(db: PGlite) {
+  const pid = '52000000-0000-0000-0000-000000000001';
+  const gid = '62000000-0000-0000-0000-000000000001';
+  const aid = '72000000-0000-0000-0000-000000000001';
+  await db.exec(`
+    insert into public.qhub_org_members (org_id, user_id, role, status) values ('o1','u1','builder','active');
+    insert into public.qhub_project_entitlements (project_id, org_id, plan_id, active) values ('${pid}','o1','builder_beta', true);
+    insert into public.qhub_acknowledgments (id, org_id, user_id, ack_type, ack_version, project_id, required_version, status)
+      values ('${aid}','o1','u1','acceptable_use','ackv1','${pid}','ackv1','ACTIVE');
+    insert into public.qhub_governance_essentials
+      (id, project_id, org_id, disposition, review_state, record_version, declaration_identity_hash, data_classes, declaration_complete, acknowledged, acknowledgment_version, acknowledgment_record_id)
+      values ('${gid}','${pid}','o1','manual_review','requested', 4, '${H64}', '["personal"]'::jsonb, true, true, 'ackv1', '${aid}');
+  `);
+
+  return { pid, gid, aid };
+}
+
+describe('commercial-launch R10 atomic review creation', () => {
+  it('creates ONE fully-bound review; exact retry is idempotent; a changed key/identity conflicts', async () => {
+    const db = await freshDb();
+
+    try {
+      await db.exec(sql);
+
+      const { pid } = await seedReviewRequired(db);
+
+      const c1 = await db.query<{ v: { ok: boolean; idempotent: boolean; request_id: string } }>(
+        `select public.qhub_create_review_request('o1','${pid}','u1','sensitive data','k1','polv1','ackv1') v`,
+      );
+      expect(c1.rows[0].v.ok).toBe(true);
+      expect(c1.rows[0].v.idempotent).toBe(false);
+
+      const rid = c1.rows[0].v.request_id;
+
+      // The inserted review is FULLY bound (no NULL binding fields) + derived category.
+      const row = await db.query<{ n: number }>(
+        `select count(*)::int n from public.qhub_manual_review_requests where id='${rid}'
+           and governance_record_id is not null and governance_record_version is not null
+           and declaration_identity_hash='${H64}' and policy_version='polv1'
+           and required_acknowledgment_version='ackv1' and acknowledgment_record_id is not null
+           and acknowledgment_version='ackv1' and requester_user_id='u1' and category='personal'`,
+      );
+      expect(row.rows[0].n).toBe(1);
+
+      // Exact identical retry → the SAME request (idempotent), no second row.
+      const c2 = await db.query<{ v: { idempotent: boolean; request_id: string } }>(
+        `select public.qhub_create_review_request('o1','${pid}','u1','sensitive data','k1','polv1','ackv1') v`,
+      );
+      expect(c2.rows[0].v.idempotent).toBe(true);
+      expect(c2.rows[0].v.request_id).toBe(rid);
+
+      // Same idempotency key + a DIFFERENT reason (material change) → deterministic conflict.
+      const c3 = await db.query<{ v: { ok: boolean; reason: string } }>(
+        `select public.qhub_create_review_request('o1','${pid}','u1','DIFFERENT reason','k1','polv1','ackv1') v`,
+      );
+      expect(c3.rows[0].v.ok).toBe(false);
+      expect(c3.rows[0].v.reason).toBe('idempotency_conflict');
+
+      // A NEW policy version (different key) → a DISTINCT request identity (prior preserved).
+      const c4 = await db.query<{ v: { ok: boolean; request_id: string } }>(
+        `select public.qhub_create_review_request('o1','${pid}','u1','sensitive data','k2','polv2','ackv1') v`,
+      );
+      expect(c4.rows[0].v.ok).toBe(true);
+      expect(c4.rows[0].v.request_id).not.toBe(rid);
+
+      const total = await db.query<{ n: number }>(`select count(*)::int n from public.qhub_manual_review_requests`);
+      expect(total.rows[0].n).toBe(2);
+    } finally {
+      await db.close();
+    }
+  });
+
+  it('rejects creation when not REVIEW_REQUIRED, when not a member, and when the ack is not ACTIVE', async () => {
+    const db = await freshDb();
+
+    try {
+      await db.exec(sql);
+
+      const { pid, gid, aid } = await seedReviewRequired(db);
+
+      // Not a member (different requester).
+      const nm = await db.query<{ v: { reason: string } }>(
+        `select public.qhub_create_review_request('o1','${pid}','other','r','k','polv1','ackv1') v`,
+      );
+      expect(nm.rows[0].v.reason).toBe('not_a_member');
+
+      // Ack revoked → not ACTIVE → rejected.
+      await db.exec(`update public.qhub_acknowledgments set status='REVOKED', revoked_at=now() where id='${aid}'`);
+
+      const rk = await db.query<{ v: { reason: string } }>(
+        `select public.qhub_create_review_request('o1','${pid}','u1','r','k','polv1','ackv1') v`,
+      );
+      expect(rk.rows[0].v.reason).toBe('acknowledgment_not_active');
+
+      /*
+       * Disposition not manual_review → review_not_required (checked before the ack, so the
+       * still-REVOKED ack is not reached; and REVOKED→ACTIVE un-revoke is correctly forbidden).
+       */
+      await db.exec(`update public.qhub_governance_essentials set disposition='proceed' where id='${gid}'`);
+
+      const nr = await db.query<{ v: { reason: string } }>(
+        `select public.qhub_create_review_request('o1','${pid}','u1','r','k','polv1','ackv1') v`,
+      );
+      expect(nr.rows[0].v.reason).toBe('review_not_required');
+    } finally {
+      await db.close();
+    }
+  });
+});
+
+describe('commercial-launch R10 verifier exact-semantic drift', () => {
+  async function ready(db: PGlite) {
+    await db.exec(sql);
+    return verify(db);
+  }
+
+  it('is READY at r6 on a healthy schema', async () => {
+    const db = await freshDb();
+
+    try {
+      const v = await ready(db);
+      expect(v.expected_version).toBe('2026-07-30.commercial-launch-r6');
+      expect(v.ready).toBe(true);
+    } finally {
+      await db.close();
+    }
+  });
+
+  it('CHECK(true) substitution of the terminal-binding constraint fails READY', async () => {
+    const db = await freshDb();
+
+    try {
+      await db.exec(sql);
+      await db.exec(`ALTER TABLE public.qhub_manual_review_requests DROP CONSTRAINT chk_qhub_review_terminal_binding`);
+      await db.exec(
+        `ALTER TABLE public.qhub_manual_review_requests ADD CONSTRAINT chk_qhub_review_terminal_binding CHECK (true) NOT VALID`,
+      );
+
+      const v = await verify(db);
+      expect(v.ready).toBe(false);
+      expect(v.failed).toContain('r6_constraint_semantics:chk_qhub_review_terminal_binding');
+    } finally {
+      await db.close();
+    }
+  });
+
+  it('CHECK(true) substitution of the declaration-hash constraint fails READY', async () => {
+    const db = await freshDb();
+
+    try {
+      await db.exec(sql);
+      await db.exec(`ALTER TABLE public.qhub_manual_review_requests DROP CONSTRAINT chk_qhub_review_decl_hash_hex`);
+      await db.exec(
+        `ALTER TABLE public.qhub_manual_review_requests ADD CONSTRAINT chk_qhub_review_decl_hash_hex CHECK (true)`,
+      );
+
+      const v = await verify(db);
+      expect(v.ready).toBe(false);
+      expect(v.failed).toContain('r6_constraint_semantics:chk_qhub_review_decl_hash_hex');
+    } finally {
+      await db.close();
+    }
+  });
+
+  it('a same-name FK recreated against the WRONG relationship fails READY', async () => {
+    const db = await freshDb();
+
+    try {
+      await db.exec(sql);
+
+      // Recreate the review→governance FK to reference qhub_acknowledgments instead — wrong target.
+      await db.exec(`ALTER TABLE public.qhub_manual_review_requests DROP CONSTRAINT fk_qhub_review_governance_record`);
+      await db.exec(
+        `ALTER TABLE public.qhub_manual_review_requests ADD CONSTRAINT fk_qhub_review_governance_record FOREIGN KEY (governance_record_id) REFERENCES public.qhub_acknowledgments(id)`,
+      );
+
+      const v = await verify(db);
+      expect(v.ready).toBe(false);
+      expect(v.failed).toContain('r6_constraint_semantics:fk_qhub_review_governance_record');
+    } finally {
+      await db.close();
+    }
+  });
+
+  it('a comment/marker-spoofed decide body (weakened logic) fails READY (exact body pin)', async () => {
+    const db = await freshDb();
+
+    try {
+      await db.exec(sql);
+
+      // Weakened body that RETAINS the old marker strings only in comments — the exact md5 differs.
+      await db.exec(`
+        CREATE OR REPLACE FUNCTION public.qhub_decide_review(
+          p_request_id UUID, p_actor TEXT, p_is_staff BOOLEAN, p_decision TEXT, p_reason TEXT, p_policy_version TEXT
+        ) RETURNS JSONB LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, public AS $f$
+        BEGIN
+          -- non_authorizing_legacy_review governance_changed acknowledgment_mismatch policy_stale
+          RETURN jsonb_build_object('ok', true);
+        END; $f$;
+      `);
+
+      const v = await verify(db);
+      expect(v.ready).toBe(false);
+      expect(v.failed).toContain('decide_review_body_drift');
+    } finally {
+      await db.close();
+    }
+  });
+
+  it('a direct authenticated UPDATE grant on an authority table fails READY', async () => {
+    const db = await freshDb();
+
+    try {
+      await db.exec(sql);
+      await db.exec(`GRANT UPDATE ON TABLE public.qhub_manual_review_requests TO authenticated`);
+
+      const v = await verify(db);
+      expect(v.ready).toBe(false);
+      expect(v.failed).toContain('browser_write_grant:qhub_manual_review_requests:UPDATE');
+    } finally {
+      await db.close();
+    }
+  });
+
+  it('an anon INSERT grant, and a same-name wrong-table index, each fail READY', async () => {
+    const db = await freshDb();
+
+    try {
+      await db.exec(sql);
+      await db.exec(`GRANT INSERT ON TABLE public.qhub_acknowledgments TO anon`);
+
+      const v = await verify(db);
+      expect(v.ready).toBe(false);
+      expect(v.failed).toContain('browser_write_grant:qhub_acknowledgments:INSERT');
     } finally {
       await db.close();
     }

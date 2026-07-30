@@ -1,8 +1,8 @@
 -- ============================================================================
--- QHUB Commercial Launch Foundation — R8 FINAL SECURITY CLOSURE
+-- QHUB Commercial Launch Foundation — R10 SEMANTIC ASSURANCE CLOSURE
 -- Migration: 20260729_commercial_launch_foundation  (replaces the rejected
 --            4b42555a… contents IN PLACE — one authoritative commercial migration)
--- Schema version: 2026-07-30.commercial-launch-r5
+-- Schema version: 2026-07-30.commercial-launch-r6
 --
 -- Central commercial security boundary: authoritative membership/staff, real
 -- project ownership, checkout-intent binding (metadata is never tenant authority),
@@ -342,6 +342,24 @@ ALTER TABLE public.qhub_manual_review_requests
   ADD COLUMN IF NOT EXISTS idempotency_key                TEXT,
   ADD COLUMN IF NOT EXISTS requester_user_id              TEXT;
 
+-- ─── R6 (R10): AUTHORITATIVE ACKNOWLEDGMENT MODEL ────────────────────────────
+-- Additive only. An acknowledgment gains a project/Governance scope, a required version, a
+-- lifecycle status (ACTIVE / REVOKED / SUPERSEDED), and timestamps. Legacy rows keep NULL scope
+-- and a NULL status (they are NON_AUTHORIZING_LEGACY_ACKNOWLEDGMENT — only status='ACTIVE' with a
+-- full scope authorizes). A partial unique index enforces ONE ACTIVE acknowledgment per
+-- (org, project, user, ack_type, ack_version) scope.
+ALTER TABLE public.qhub_acknowledgments
+  ADD COLUMN IF NOT EXISTS project_id                 UUID,
+  ADD COLUMN IF NOT EXISTS governance_record_id       UUID,
+  ADD COLUMN IF NOT EXISTS governance_record_version  BIGINT,
+  ADD COLUMN IF NOT EXISTS required_version           TEXT,
+  ADD COLUMN IF NOT EXISTS policy_version             TEXT,
+  ADD COLUMN IF NOT EXISTS status                     TEXT,
+  ADD COLUMN IF NOT EXISTS revoked_at                 TIMESTAMPTZ,
+  ADD COLUMN IF NOT EXISTS superseded_at              TIMESTAMPTZ,
+  ADD COLUMN IF NOT EXISTS created_at                 TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  ADD COLUMN IF NOT EXISTS updated_at                 TIMESTAMPTZ NOT NULL DEFAULT NOW();
+
 -- Canonical declaration_identity_hash format: lowercase SHA-256 hex (64 chars) when present.
 DO $$
 BEGIN
@@ -421,9 +439,34 @@ BEGIN
         )
       ) NOT VALID;
   END IF;
+
+  -- R6 (R10): acknowledgment lifecycle status is a fixed enum when present.
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_constraint
+    WHERE conrelid = 'public.qhub_acknowledgments'::regclass AND conname = 'chk_qhub_ack_status'
+  ) THEN
+    ALTER TABLE public.qhub_acknowledgments
+      ADD CONSTRAINT chk_qhub_ack_status
+      CHECK (status IS NULL OR status IN ('ACTIVE','REVOKED','SUPERSEDED'));
+  END IF;
+
+  -- R6 (R10): FK — acknowledgment.governance_record_id → the authoritative Governance record.
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_constraint
+    WHERE conrelid = 'public.qhub_acknowledgments'::regclass AND conname = 'fk_qhub_ack_governance_record'
+  ) THEN
+    ALTER TABLE public.qhub_acknowledgments
+      ADD CONSTRAINT fk_qhub_ack_governance_record
+      FOREIGN KEY (governance_record_id) REFERENCES public.qhub_governance_essentials (id);
+  END IF;
 END $$;
 
 CREATE INDEX IF NOT EXISTS idx_qhub_review_governance_record ON public.qhub_manual_review_requests (governance_record_id);
+
+-- R6 (R10): ONE ACTIVE acknowledgment per (org, project, user, ack_type, required version) scope.
+CREATE UNIQUE INDEX IF NOT EXISTS uq_qhub_ack_one_active
+  ON public.qhub_acknowledgments (org_id, project_id, user_id, ack_type, required_version)
+  WHERE status = 'ACTIVE';
 
 -- ─── Shared updated_at trigger ──────────────────────────────────────────────
 CREATE OR REPLACE FUNCTION public.qhub_commercial_touch_updated_at()
@@ -456,9 +499,32 @@ END;
 $$;
 
 -- Acknowledgment + usage-ledger immutability (append-only).
+-- R6 (R10): qhub_acknowledgments permits ONE controlled lifecycle transition
+-- (status ACTIVE → REVOKED/SUPERSEDED) that changes NO identity/scope field; everything else
+-- (any identity/scope edit, any DELETE, and every other append-only table) stays fully immutable.
 CREATE OR REPLACE FUNCTION public.qhub_row_immutable()
 RETURNS TRIGGER LANGUAGE plpgsql AS $$
 BEGIN
+  IF TG_OP = 'UPDATE' AND TG_TABLE_NAME = 'qhub_acknowledgments' THEN
+    IF NEW.id = OLD.id
+       AND NEW.org_id = OLD.org_id
+       AND NEW.user_id = OLD.user_id
+       AND NEW.ack_type = OLD.ack_type
+       AND NEW.ack_version = OLD.ack_version
+       AND NEW.acknowledged_at = OLD.acknowledged_at
+       AND NEW.project_id IS NOT DISTINCT FROM OLD.project_id
+       AND NEW.governance_record_id IS NOT DISTINCT FROM OLD.governance_record_id
+       AND NEW.governance_record_version IS NOT DISTINCT FROM OLD.governance_record_version
+       AND NEW.required_version IS NOT DISTINCT FROM OLD.required_version
+       AND NEW.created_at IS NOT DISTINCT FROM OLD.created_at
+       AND OLD.status = 'ACTIVE'
+       AND NEW.status IN ('REVOKED','SUPERSEDED') THEN
+      RETURN NEW;
+    END IF;
+
+    RAISE EXCEPTION 'qhub_acknowledgments rows are immutable (only a controlled ACTIVE->REVOKED/SUPERSEDED lifecycle transition is permitted)';
+  END IF;
+
   RAISE EXCEPTION '% rows are immutable', TG_TABLE_NAME;
 END;
 $$;
@@ -918,6 +984,133 @@ BEGIN
 END;
 $$;
 
+-- ─── Canonical length-prefixed cell encoder (R10 §3) ─────────────────────────
+-- Deterministic, unambiguous encoding: each cell is either '_' (explicit NULL) or
+-- '<utf8-length>:<value>', joined in fixed order by '|'. The length prefix makes the join
+-- delimiter safe (no ambiguous concatenation). Used to build canonical request identities.
+CREATE OR REPLACE FUNCTION public.qhub_canon_cells(p_cells TEXT[])
+RETURNS TEXT LANGUAGE sql IMMUTABLE AS $$
+  SELECT string_agg(
+    CASE WHEN c IS NULL THEN '_' ELSE length(convert_to(c, 'UTF8'))::text || ':' || c END,
+    '|' ORDER BY ord
+  )
+  FROM unnest(p_cells) WITH ORDINALITY AS t(c, ord);
+$$;
+
+-- ─── ATOMIC review CREATION (R10 §3) ─────────────────────────────────────────
+-- One transaction: lock org membership + the current Governance record + the authoritative ACTIVE
+-- acknowledgment, validate REVIEW_REQUIRED, derive ALL bindings server-side, compute a canonical
+-- length-prefixed SHA-256 request identity IN the database, and insert ONE fully-bound review.
+-- Exact identity → the same request (idempotent); the same idempotency key with a different
+-- identity → deterministic conflict; a new Governance/policy/ack/declaration version → a distinct
+-- request identity (prior history preserved). The browser supplies only project/reason/idem-key.
+CREATE OR REPLACE FUNCTION public.qhub_create_review_request(
+  p_org_id TEXT, p_project_id UUID, p_requester TEXT, p_reason TEXT,
+  p_idempotency_key TEXT, p_policy_version TEXT, p_required_ack_version TEXT
+) RETURNS JSONB
+LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, public AS $$
+DECLARE
+  g RECORD;
+  a RECORD;
+  v_category TEXT;
+  v_reason_hash TEXT;
+  v_hash TEXT;
+  v_existing RECORD;
+  v_id UUID;
+BEGIN
+  IF p_org_id IS NULL OR p_project_id IS NULL OR p_requester IS NULL
+     OR coalesce(btrim(p_reason),'') = '' OR p_policy_version IS NULL OR p_required_ack_version IS NULL THEN
+    RETURN jsonb_build_object('ok', false, 'reason', 'invalid_arguments');
+  END IF;
+
+  -- Lock org membership (the requester must be an active member of the org).
+  PERFORM 1 FROM public.qhub_org_members m
+    WHERE m.org_id = p_org_id AND m.user_id = p_requester AND m.status = 'active' FOR UPDATE;
+  IF NOT FOUND THEN
+    RETURN jsonb_build_object('ok', false, 'reason', 'not_a_member');
+  END IF;
+
+  -- Lock the current Governance record; require a complete REVIEW_REQUIRED declaration + bindings.
+  SELECT * INTO g FROM public.qhub_governance_essentials
+    WHERE project_id = p_project_id AND org_id = p_org_id FOR UPDATE;
+  IF NOT FOUND THEN
+    RETURN jsonb_build_object('ok', false, 'reason', 'no_governance_record');
+  END IF;
+  IF NOT g.declaration_complete THEN
+    RETURN jsonb_build_object('ok', false, 'reason', 'declaration_incomplete');
+  END IF;
+  IF g.disposition IS DISTINCT FROM 'manual_review' THEN
+    RETURN jsonb_build_object('ok', false, 'reason', 'review_not_required');
+  END IF;
+  IF g.record_version IS NULL OR g.declaration_identity_hash IS NULL OR g.acknowledgment_record_id IS NULL THEN
+    RETURN jsonb_build_object('ok', false, 'reason', 'governance_binding_incomplete');
+  END IF;
+
+  -- Lock + validate the authoritative ACTIVE acknowledgment bound to this project.
+  SELECT * INTO a FROM public.qhub_acknowledgments WHERE id = g.acknowledgment_record_id FOR UPDATE;
+  IF NOT FOUND THEN
+    RETURN jsonb_build_object('ok', false, 'reason', 'acknowledgment_not_found');
+  END IF;
+  IF a.status IS DISTINCT FROM 'ACTIVE' THEN
+    RETURN jsonb_build_object('ok', false, 'reason', 'acknowledgment_not_active');
+  END IF;
+  IF a.org_id <> p_org_id OR a.user_id <> p_requester OR a.ack_type <> 'acceptable_use'
+     OR a.project_id IS DISTINCT FROM p_project_id THEN
+    RETURN jsonb_build_object('ok', false, 'reason', 'acknowledgment_scope_mismatch');
+  END IF;
+  IF a.ack_version IS DISTINCT FROM p_required_ack_version
+     OR a.required_version IS DISTINCT FROM p_required_ack_version THEN
+    RETURN jsonb_build_object('ok', false, 'reason', 'acknowledgment_stale');
+  END IF;
+
+  -- Derive the category from the declared sensitive data class (never browser-supplied).
+  SELECT elem INTO v_category FROM jsonb_array_elements_text(g.data_classes) elem
+    WHERE elem IN ('personal','financial','restricted') LIMIT 1;
+  IF v_category IS NULL THEN
+    RETURN jsonb_build_object('ok', false, 'reason', 'no_review_eligible_category');
+  END IF;
+
+  v_reason_hash := encode(sha256(convert_to(btrim(p_reason), 'UTF8')), 'hex');
+
+  -- Canonical identity binds the COMPLETE authoritative version set (length-prefixed, DB SHA-256).
+  v_hash := encode(sha256(convert_to(public.qhub_canon_cells(ARRAY[
+    p_org_id, p_project_id::text, p_requester, g.id::text, g.record_version::text,
+    g.declaration_identity_hash, p_policy_version, p_required_ack_version, a.id::text, a.ack_version,
+    a.ack_type, a.status, v_category, v_reason_hash, p_idempotency_key
+  ]), 'UTF8')), 'hex');
+
+  -- Exact identity → the same request (idempotent).
+  SELECT * INTO v_existing FROM public.qhub_manual_review_requests
+    WHERE org_id = p_org_id AND request_hash = v_hash;
+  IF FOUND THEN
+    RETURN jsonb_build_object('ok', true, 'idempotent', true, 'request_id', v_existing.id::text);
+  END IF;
+
+  -- Same idempotency key + a DIFFERENT identity → deterministic conflict.
+  IF p_idempotency_key IS NOT NULL THEN
+    PERFORM 1 FROM public.qhub_manual_review_requests
+      WHERE org_id = p_org_id AND project_id = p_project_id
+        AND requester_user_id = p_requester AND idempotency_key = p_idempotency_key;
+    IF FOUND THEN
+      RETURN jsonb_build_object('ok', false, 'reason', 'idempotency_conflict');
+    END IF;
+  END IF;
+
+  v_id := gen_random_uuid();
+  INSERT INTO public.qhub_manual_review_requests (
+    id, org_id, project_id, request_type, category, reason, request_hash, status,
+    governance_record_id, governance_record_version, declaration_identity_hash, policy_version,
+    required_acknowledgment_version, acknowledgment_record_id, acknowledgment_version, requester_user_id, idempotency_key
+  ) VALUES (
+    v_id, p_org_id, p_project_id, 'data_review', v_category, p_reason, v_hash, 'pending',
+    g.id, g.record_version, g.declaration_identity_hash, p_policy_version,
+    p_required_ack_version, a.id, a.ack_version, p_requester, p_idempotency_key
+  );
+
+  RETURN jsonb_build_object('ok', true, 'idempotent', false, 'request_id', v_id::text);
+END;
+$$;
+
 -- ─── ATOMIC review decision (R4) ─────────────────────────────────────────────
 -- One transaction: lock + validate the PENDING request, verify the staff actor and
 -- exact org/project scope, apply the decision, update Governance Essentials, and
@@ -994,9 +1187,13 @@ BEGIN
     RETURN jsonb_build_object('ok', false, 'reason', 'policy_stale');
   END IF;
 
-  -- Load + validate the CURRENT Governance record; the stored binding must match EXACTLY.
+  /*
+   * R10 §4 — LOCK all authoritative rows (deterministic order: review → Governance → ack) FOR
+   * UPDATE so validation and mutation happen under the locks. This closes the reproduced TOCTOU:
+   * a concurrent Governance/ack mutation can no longer race the approval (it blocks on the lock).
+   */
   SELECT * INTO g FROM public.qhub_governance_essentials
-    WHERE id = r.governance_record_id AND project_id = r.project_id AND org_id = r.org_id;
+    WHERE id = r.governance_record_id AND project_id = r.project_id AND org_id = r.org_id FOR UPDATE;
   IF NOT FOUND THEN
     RETURN jsonb_build_object('ok', false, 'reason', 'governance_not_found');
   END IF;
@@ -1005,15 +1202,19 @@ BEGIN
     RETURN jsonb_build_object('ok', false, 'reason', 'governance_changed');
   END IF;
 
-  -- Load + validate the CURRENT acknowledgment record; it must belong to the requester + org and
-  -- match the required + stored acknowledgment version, and the Governance record must still be
-  -- acknowledged at that current required version.
-  SELECT * INTO a FROM public.qhub_acknowledgments WHERE id = r.acknowledgment_record_id;
+  -- Lock + validate the CURRENT acknowledgment record; it must be ACTIVE, belong to the requester +
+  -- org + project, and match the required + stored acknowledgment version; the Governance record
+  -- must still be acknowledged at that current required version and bound to this ack record.
+  SELECT * INTO a FROM public.qhub_acknowledgments WHERE id = r.acknowledgment_record_id FOR UPDATE;
   IF NOT FOUND THEN
     RETURN jsonb_build_object('ok', false, 'reason', 'acknowledgment_not_found');
   END IF;
+  IF a.status IS DISTINCT FROM 'ACTIVE' THEN
+    RETURN jsonb_build_object('ok', false, 'reason', 'acknowledgment_not_active');
+  END IF;
   IF a.org_id IS DISTINCT FROM r.org_id
      OR a.user_id IS DISTINCT FROM r.requester_user_id
+     OR a.project_id IS DISTINCT FROM r.project_id
      OR a.ack_version IS DISTINCT FROM r.acknowledgment_version
      OR r.acknowledgment_version IS DISTINCT FROM r.required_acknowledgment_version THEN
     RETURN jsonb_build_object('ok', false, 'reason', 'acknowledgment_mismatch');
@@ -1155,6 +1356,10 @@ REVOKE ALL ON FUNCTION public.qhub_reconcile_checkout(TEXT, TEXT, TEXT, UUID, TE
 GRANT EXECUTE ON FUNCTION public.qhub_reconcile_checkout(TEXT, TEXT, TEXT, UUID, TEXT, TEXT, TEXT, TEXT, BOOLEAN, TEXT, TEXT, TEXT, BIGINT, BIGINT) TO service_role;
 REVOKE ALL ON FUNCTION public.qhub_decide_review(UUID, TEXT, BOOLEAN, TEXT, TEXT, TEXT) FROM PUBLIC, anon, authenticated;
 GRANT EXECUTE ON FUNCTION public.qhub_decide_review(UUID, TEXT, BOOLEAN, TEXT, TEXT, TEXT) TO service_role;
+REVOKE ALL ON FUNCTION public.qhub_create_review_request(TEXT, UUID, TEXT, TEXT, TEXT, TEXT, TEXT) FROM PUBLIC, anon, authenticated;
+GRANT EXECUTE ON FUNCTION public.qhub_create_review_request(TEXT, UUID, TEXT, TEXT, TEXT, TEXT, TEXT) TO service_role;
+REVOKE ALL ON FUNCTION public.qhub_canon_cells(TEXT[]) FROM PUBLIC, anon, authenticated;
+GRANT EXECUTE ON FUNCTION public.qhub_canon_cells(TEXT[]) TO service_role;
 REVOKE ALL ON FUNCTION public.qhub_create_project(TEXT, TEXT, TEXT, TEXT) FROM PUBLIC, anon, authenticated;
 GRANT EXECUTE ON FUNCTION public.qhub_create_project(TEXT, TEXT, TEXT, TEXT) TO service_role;
 REVOKE ALL ON FUNCTION public.qhub_consume_checkout_intent(UUID, TEXT, TEXT, TEXT, TEXT, TEXT, TEXT, TEXT) FROM PUBLIC, anon, authenticated;
@@ -1172,6 +1377,7 @@ LANGUAGE plpgsql STABLE SECURITY DEFINER SET search_path = pg_catalog, public AS
 DECLARE
   v_failed TEXT[] := ARRAY[]::TEXT[];
   t TEXT;
+  pv TEXT;
   tables TEXT[] := ARRAY[
     'qhub_commercial_plans','qhub_org_members','qhub_quantex_staff','qhub_org_invitations',
     'qhub_billing_customers','qhub_subscriptions','qhub_checkout_intents','qhub_billing_webhook_events',
@@ -1186,16 +1392,26 @@ BEGIN
     IF NOT (SELECT relrowsecurity FROM pg_class WHERE oid = ('public.'||t)::regclass) THEN
       v_failed := v_failed || ('rls_disabled:'||t);
     END IF;
+    -- R10 §6: EXACT RESTRICTIVE service-only policy — role set + USING(false) + WITH CHECK(false).
     IF NOT EXISTS (
       SELECT 1 FROM pg_policies WHERE schemaname='public' AND tablename=t
         AND policyname=t||'_service_only' AND permissive='RESTRICTIVE'
+        AND roles = ARRAY['anon','authenticated']::name[]
+        AND coalesce(qual,'') = 'false' AND coalesce(with_check,'') = 'false'
     ) THEN
-      v_failed := v_failed || ('policy_missing:'||t);
+      v_failed := v_failed || ('policy_semantics:'||t);
     END IF;
+    -- R10 §6: NO browser role may hold SELECT or ANY write privilege (inherited grants counted).
     IF has_table_privilege('anon', ('public.'||t)::regclass, 'SELECT')
-       OR has_table_privilege('authenticated', ('public.'||t)::regclass, 'INSERT') THEN
-      v_failed := v_failed || ('browser_grant:'||t);
+       OR has_table_privilege('authenticated', ('public.'||t)::regclass, 'SELECT') THEN
+      v_failed := v_failed || ('browser_select_grant:'||t);
     END IF;
+    FOR pv IN SELECT unnest(ARRAY['INSERT','UPDATE','DELETE','TRUNCATE','REFERENCES','TRIGGER']) LOOP
+      IF has_table_privilege('anon', ('public.'||t)::regclass, pv)
+         OR has_table_privilege('authenticated', ('public.'||t)::regclass, pv) THEN
+        v_failed := v_failed || ('browser_write_grant:'||t||':'||pv);
+      END IF;
+    END LOOP;
     IF NOT has_table_privilege('service_role', ('public.'||t)::regclass, 'INSERT') THEN
       v_failed := v_failed || ('service_grant_missing:'||t);
     END IF;
@@ -1517,16 +1733,89 @@ BEGIN
     v_failed := v_failed || 'decide_review_public_execute'::text;
   END IF;
 
+  /*
+   * R10 §6 — EXACT function body pin: md5 of prosrc (the verbatim body). A weakened body has a
+   * different prosrc → different digest → NOT READY; retained marker text/comments cannot spoof it
+   * (any change to the body text changes the digest). prosrc is stored verbatim, so the digest is
+   * stable across PG versions.
+   */
+  IF (SELECT md5(p.prosrc) FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace
+        WHERE n.nspname='public' AND p.proname='qhub_decide_review'
+          AND pg_get_function_identity_arguments(p.oid) = 'p_request_id uuid, p_actor text, p_is_staff boolean, p_decision text, p_reason text, p_policy_version text')
+     IS DISTINCT FROM '4bc552c151ca69dfdb4f847c2660b5b4' THEN
+    v_failed := v_failed || 'decide_review_body_drift'::text;
+  END IF;
+
+  -- R10 §3/§6 — atomic review-CREATE RPC: exact signature/security/search_path, sole overload,
+  -- browser-denied EXECUTE (covered by the ACL loop above), and an exact body pin.
   PERFORM 1 FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace
-    WHERE n.nspname='public' AND p.proname='qhub_decide_review'
-      AND p.prosrc LIKE '%non_authorizing_legacy_review%'
-      AND p.prosrc LIKE '%governance_changed%'
-      AND p.prosrc LIKE '%acknowledgment_mismatch%'
-      AND p.prosrc LIKE '%policy_stale%';
-  IF NOT FOUND THEN v_failed := v_failed || 'decide_review_body_drift'::text; END IF;
+    WHERE n.nspname='public' AND p.proname='qhub_create_review_request'
+      AND p.prosecdef AND p.proconfig @> ARRAY['search_path=pg_catalog, public'] AND p.prorettype='jsonb'::regtype
+      AND pg_get_function_identity_arguments(p.oid) = 'p_org_id text, p_project_id uuid, p_requester text, p_reason text, p_idempotency_key text, p_policy_version text, p_required_ack_version text';
+  IF NOT FOUND THEN v_failed := v_failed || 'r6_create_review_signature'::text; END IF;
+  IF (SELECT count(*) FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace
+        WHERE n.nspname='public' AND p.proname='qhub_create_review_request') <> 1 THEN
+    v_failed := v_failed || 'r6_create_review_overload'::text;
+  END IF;
+  IF has_function_privilege('anon','public.qhub_create_review_request(text,uuid,text,text,text,text,text)','EXECUTE')
+     OR has_function_privilege('authenticated','public.qhub_create_review_request(text,uuid,text,text,text,text,text)','EXECUTE') THEN
+    v_failed := v_failed || 'r6_create_review_browser_exec'::text;
+  END IF;
+  IF (SELECT md5(p.prosrc) FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace
+        WHERE n.nspname='public' AND p.proname='qhub_create_review_request'
+          AND pg_get_function_identity_arguments(p.oid) = 'p_org_id text, p_project_id uuid, p_requester text, p_reason text, p_idempotency_key text, p_policy_version text, p_required_ack_version text')
+     IS DISTINCT FROM '1dfbf1bdbe860d0f80af3ab489274196' THEN
+    v_failed := v_failed || 'r6_create_review_body_drift'::text;
+  END IF;
+
+  /*
+   * R10 §6 — EXACT constraint + FK semantics via normalized pg_get_constraintdef md5 + validation
+   * state. A CHECK(true) substitution or a same-name wrong-expression / wrong-relationship changes
+   * the def → NOT READY. Encoded as 'table:conname:defmd5:validated(t|f)'.
+   */
+  FOR t IN SELECT unnest(ARRAY[
+    'public.qhub_manual_review_requests:chk_qhub_review_terminal_binding:96d317cd52870705f9f7defbdfec7326:f',
+    'public.qhub_manual_review_requests:chk_qhub_review_decl_hash_hex:6dfbd27d094d1fc5a4a4d0f11639d1ff:t',
+    'public.qhub_governance_essentials:chk_qhub_gov_decl_hash_hex:6dfbd27d094d1fc5a4a4d0f11639d1ff:t',
+    'public.qhub_acknowledgments:chk_qhub_ack_status:d02eacc726094f0045ad16688f9516c7:t',
+    'public.qhub_manual_review_requests:fk_qhub_review_governance_record:023c71ff41a866736ce25c495f1cc43a:t',
+    'public.qhub_manual_review_requests:fk_qhub_review_acknowledgment_record:61bb98f0da57e4f852e0393d95f344b7:t',
+    'public.qhub_governance_essentials:fk_qhub_gov_acknowledgment_record:61bb98f0da57e4f852e0393d95f344b7:t',
+    'public.qhub_acknowledgments:fk_qhub_ack_governance_record:023c71ff41a866736ce25c495f1cc43a:t'
+  ]) LOOP
+    IF (SELECT md5(pg_get_constraintdef(c.oid)) FROM pg_constraint c
+          WHERE c.conrelid = split_part(t,':',1)::regclass AND c.conname = split_part(t,':',2))
+       IS DISTINCT FROM split_part(t,':',3)
+       OR (SELECT c.convalidated FROM pg_constraint c
+             WHERE c.conrelid = split_part(t,':',1)::regclass AND c.conname = split_part(t,':',2))
+          IS DISTINCT FROM (split_part(t,':',4) = 't') THEN
+      v_failed := v_failed || ('r6_constraint_semantics:'||split_part(t,':',2))::text;
+    END IF;
+  END LOOP;
+
+  -- R10 §2/§6 — authoritative acknowledgment contract: lifecycle columns present + status enum
+  -- check + one-active partial unique index (exact columns/predicate) + governance FK.
+  FOR t IN SELECT unnest(ARRAY[
+    'project_id:uuid','governance_record_id:uuid','governance_record_version:int8',
+    'required_version:text','status:text','revoked_at:timestamptz','superseded_at:timestamptz'
+  ]) LOOP
+    IF NOT EXISTS (
+      SELECT 1 FROM pg_attribute WHERE attrelid='public.qhub_acknowledgments'::regclass
+        AND attname=split_part(t,':',1) AND atttypid=(split_part(t,':',2))::regtype AND NOT attisdropped
+    ) THEN
+      v_failed := v_failed || ('r6_ack_column:'||split_part(t,':',1))::text;
+    END IF;
+  END LOOP;
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_indexes WHERE schemaname='public' AND indexname='uq_qhub_ack_one_active'
+      AND indexdef = 'CREATE UNIQUE INDEX uq_qhub_ack_one_active ON public.qhub_acknowledgments '
+        || 'USING btree (org_id, project_id, user_id, ack_type, required_version) WHERE (status = ''ACTIVE''::text)'
+  ) THEN
+    v_failed := v_failed || 'r6_ack_one_active_index'::text;
+  END IF;
 
   RETURN jsonb_build_object(
-    'expected_version', '2026-07-30.commercial-launch-r5',
+    'expected_version', '2026-07-30.commercial-launch-r6',
     'ready', (cardinality(v_failed) = 0),
     'failed', to_jsonb(v_failed)
   );
