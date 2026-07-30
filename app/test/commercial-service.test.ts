@@ -43,7 +43,11 @@ import {
   exportCommercialProject,
   requestCommercialPublication,
 } from '~/lib/qhub/commercial/commercial-service.server';
-import { currentReviewPolicyVersion } from '~/lib/qhub/commercial/governance-essentials';
+import {
+  currentReviewPolicyVersion,
+  currentGovernancePolicyCardVersion,
+  currentRequiredAcknowledgmentVersion,
+} from '~/lib/qhub/commercial/governance-essentials';
 
 function execCtx(caps: string[] = ['MODEL_INVOKE', 'CODE_EXPORT']): CommercialExecutionContext {
   return {
@@ -77,6 +81,8 @@ const goodGov: GovernanceRecord = {
   reviewState: 'none',
   riskTier: 'T1',
   reviewPolicyVersion: null,
+  policyCardVersion: currentGovernancePolicyCardVersion(),
+  acknowledgmentVersion: currentRequiredAcknowledgmentVersion(),
 };
 
 const req = {
@@ -199,7 +205,9 @@ describe('R6 current-policy authorization blocks stale reviews BEFORE side effec
     acknowledged: true,
     reviewState: 'approved',
     riskTier: 'T1',
-    reviewPolicyVersion: '2020-01-01.old-policy',
+    reviewPolicyVersion: '2020-01-01.old-policy', // stale policy version
+    policyCardVersion: currentGovernancePolicyCardVersion(),
+    acknowledgmentVersion: currentRequiredAcknowledgmentVersion(),
   };
   const currentApproval: GovernanceRecord = { ...staleApproval, reviewPolicyVersion: currentReviewPolicyVersion() };
 

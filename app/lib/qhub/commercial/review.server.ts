@@ -19,6 +19,8 @@ import { createClient, type SupabaseClient } from '@supabase/supabase-js';
 import type { CommercialContext } from '~/lib/qhub/commercial/commercial-context.server';
 import { assertReadyToken, type CommercialReadyToken } from '~/lib/qhub/commercial/commercial-schema-check.server';
 import {
+  currentGovernancePolicyCardVersion,
+  currentRequiredAcknowledgmentVersion,
   currentReviewPolicyVersion,
   REVIEW_DATA_CLASSES,
   type DataClass,
@@ -75,7 +77,7 @@ export type ReviewResult = { ok: true; requestId: string; idempotent: boolean } 
  */
 export async function createReviewRequest(
   ctx: CommercialContext,
-  input: { projectId?: string; category: string; reason: string; requestType?: string },
+  input: { projectId?: string; category: string; reason: string; requestType?: string; idempotencyKey?: string },
   token: CommercialReadyToken,
   env: Record<string, string | undefined>,
 ): Promise<ReviewResult> {
@@ -93,17 +95,32 @@ export async function createReviewRequest(
 
   const requestType = input.requestType ?? 'data_review';
 
-  // SERVER-derived evaluated-under policy version (never from the browser).
+  // SERVER-derived version set (never from the browser).
   const policyVersion = currentReviewPolicyVersion();
+  const ackVersion = currentRequiredAcknowledgmentVersion();
+  const governanceVersion = currentGovernancePolicyCardVersion();
 
   /*
-   * Server-derived request identity BINDS the current policy version (and the requester),
-   * so a new applicable policy version yields a DISTINCT request — a legitimate re-review
-   * after a policy change — while the prior request + audit remain immutable. An exact
-   * repeat under the SAME policy is idempotent (the unique(org_id, request_hash) constraint).
+   * Server-derived request identity BINDS the COMPLETE current version set — org, project,
+   * requester, use-case/data classification (requestType + category + reason), the current
+   * policy version, the required acknowledgment version, the Governance policy-card version,
+   * and an optional client idempotency key. A change to ANY version yields a DISTINCT request
+   * (a legitimate re-review) while the prior request + audit remain immutable; an exact repeat
+   * under the SAME complete version set is idempotent (the unique(org_id, request_hash)).
    */
   const requestHash = await sha256Hex(
-    `${ctx.orgId}|${input.projectId ?? ''}|${requestType}|${input.category}|${input.reason}|${policyVersion}|${ctx.userId}`,
+    [
+      ctx.orgId,
+      input.projectId ?? '',
+      ctx.userId,
+      requestType,
+      input.category,
+      input.reason,
+      policyVersion,
+      ackVersion,
+      governanceVersion,
+      input.idempotencyKey ?? '',
+    ].join('|'),
   );
 
   const sb = mutator(token, env);

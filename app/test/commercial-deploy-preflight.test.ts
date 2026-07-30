@@ -14,9 +14,10 @@ import { execFileSync } from 'node:child_process';
 import { readFileSync, readdirSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { describe, it, expect } from 'vitest';
+import { parseDeployEnv as parseRuntime, ALLOWED_DEPLOY_ENVS as ALLOWED_RUNTIME } from '~/lib/qhub/deploy-env';
 
 /*
- * The shared deploy-env parser lives under scripts/ (used by the .mjs deploy tooling too),
+ * The .mjs copy of the parser lives under scripts/ (imported by the node deploy tooling),
  * so it is imported by relative path rather than the app `~/` alias.
  */
 // eslint-disable-next-line no-restricted-imports
@@ -44,9 +45,55 @@ describe('deploy-env parser is a fail-closed enum', () => {
     expect(parseDeployEnv('test').kind).toBe('LOCAL');
   });
 
-  it('missing/empty/unknown/misspelled/mixed-case is INVALID (never falls back to local)', () => {
-    for (const bad of [undefined, '', 'unknown', 'stagng', 'Staging', 'PRODUCTION', 'prod', 'preview', ' local']) {
+  it('missing/empty/unknown/misspelled/mixed-case/padded is INVALID (never falls back to local)', () => {
+    for (const bad of [
+      undefined,
+      '',
+      'unknown',
+      'stagng',
+      'Staging',
+      'PRODUCTION',
+      'prod',
+      'preview',
+      ' local',
+      'local ',
+      'local\n',
+    ]) {
       expect(parseDeployEnv(bad as never).kind, `${String(bad)}`).toBe('INVALID');
+    }
+  });
+
+  it('the RUNTIME parser and the SCRIPT parser are byte-for-byte behaviourally identical', () => {
+    expect([...ALLOWED_RUNTIME]).toEqual([...ALLOWED_DEPLOY_ENVS]);
+
+    const inputs = [
+      undefined,
+      '',
+      'local',
+      'test',
+      'staging',
+      'production',
+      'unknown',
+      'stagng',
+      'Staging',
+      'PRODUCTION',
+      'prod',
+      'preview',
+      ' local',
+      'local ',
+      'LOCAL',
+      '  ',
+      'staging\t',
+    ];
+
+    for (const inp of inputs) {
+      const a = parseDeployEnv(inp as never);
+      const b = parseRuntime(inp as never);
+      expect({ kind: b.kind, env: b.env, ok: b.ok }, `runtime≠script for ${String(inp)}`).toEqual({
+        kind: a.kind,
+        env: a.env,
+        ok: a.ok,
+      });
     }
   });
 });
@@ -117,6 +164,24 @@ describe('every repository deploy/preview path runs schema verification', () => 
   it('a new deploy workflow WITHOUT preflight is detected (fixture)', () => {
     const badWorkflow = `jobs:\n  deploy:\n    steps:\n      - uses: cloudflare/pages-action@v1\n`;
     expect(DEPLOY_ACTION.test(badWorkflow) && !/schema-smoke-check\.mjs/.test(badWorkflow)).toBe(true);
+  });
+
+  /*
+   * Universal package-script inventory: EVERY npm script that PUBLISHES/DEPLOYS must chain a
+   * preflight. Local dev/serve scripts (wrangler pages dev, remix vite:dev) are exempt; the
+   * deployed serving path (dockerstart) runs the preflight from the Docker CMD, not the script.
+   */
+  const PKG_DEPLOY = /wrangler\s+(pages\s+)?deploy|pages\s+deploy|fly(ctl)?\s+deploy/;
+  const PKG_PREFLIGHT = /schema:check|schema-smoke-check|startup-preflight/;
+
+  it('every publishing/deploying package script chains a schema preflight', () => {
+    const offenders = Object.entries(pkg.scripts).filter(([, cmd]) => PKG_DEPLOY.test(cmd) && !PKG_PREFLIGHT.test(cmd));
+    expect(offenders.map(([n]) => n)).toEqual([]);
+  });
+
+  it('a new publishing package script WITHOUT preflight is detected (fixture)', () => {
+    const bad = 'wrangler pages deploy build/client';
+    expect(PKG_DEPLOY.test(bad) && !PKG_PREFLIGHT.test(bad)).toBe(true);
   });
 });
 

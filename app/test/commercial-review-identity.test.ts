@@ -12,12 +12,12 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { testReadyToken } from '~/test/helpers/commercial-ready-token';
 
-const H = vi.hoisted(() => ({ policy: vi.fn(), inserts: [] as Array<Record<string, unknown>> }));
+const H = vi.hoisted(() => ({ policy: vi.fn(), ack: vi.fn(), inserts: [] as Array<Record<string, unknown>> }));
 
-// Control the server-derived policy version.
+// Control the server-derived version set.
 vi.mock('~/lib/qhub/commercial/governance-essentials', async (orig) => {
   const actual = await orig<typeof import('~/lib/qhub/commercial/governance-essentials')>();
-  return { ...actual, currentReviewPolicyVersion: H.policy };
+  return { ...actual, currentReviewPolicyVersion: H.policy, currentRequiredAcknowledgmentVersion: H.ack };
 });
 
 // Capture the inserted review-request row (its request_hash).
@@ -49,6 +49,7 @@ const INPUT = { projectId: 'p1', category: 'personal', reason: 'sensitive custom
 beforeEach(() => {
   H.inserts = [];
   H.policy.mockReturnValue('2026-07-30.governance-essentials.v1');
+  H.ack.mockReturnValue('2026-07-30.acceptable-use.v1');
 });
 
 describe('review request identity binds the server-derived policy version', () => {
@@ -76,6 +77,22 @@ describe('review request identity binds the server-derived policy version', () =
   it('a different requester produces a distinct request identity', async () => {
     await createReviewRequest(CTX, INPUT, testReadyToken(ENV), ENV);
     await createReviewRequest({ ...(CTX as object), userId: 'u2' } as never, INPUT, testReadyToken(ENV), ENV);
+
+    expect(H.inserts[0].request_hash).not.toBe(H.inserts[1].request_hash);
+  });
+
+  it('R7: a NEW required-acknowledgment version produces a DISTINCT request identity', async () => {
+    await createReviewRequest(CTX, INPUT, testReadyToken(ENV), ENV);
+
+    H.ack.mockReturnValue('2027-06-01.acceptable-use.v2'); // acceptable-use terms changed
+    await createReviewRequest(CTX, INPUT, testReadyToken(ENV), ENV);
+
+    expect(H.inserts[0].request_hash).not.toBe(H.inserts[1].request_hash);
+  });
+
+  it('R7: a NEW client idempotency key produces a DISTINCT request identity', async () => {
+    await createReviewRequest(CTX, { ...INPUT, idempotencyKey: 'k1' }, testReadyToken(ENV), ENV);
+    await createReviewRequest(CTX, { ...INPUT, idempotencyKey: 'k2' }, testReadyToken(ENV), ENV);
 
     expect(H.inserts[0].request_hash).not.toBe(H.inserts[1].request_hash);
   });

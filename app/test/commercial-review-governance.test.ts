@@ -12,7 +12,11 @@ import {
   buildEvidenceExport,
   type GovernanceRecord,
 } from '~/lib/qhub/commercial/governance-essentials.server';
-import { currentReviewPolicyVersion } from '~/lib/qhub/commercial/governance-essentials';
+import {
+  currentReviewPolicyVersion,
+  currentGovernancePolicyCardVersion,
+  currentRequiredAcknowledgmentVersion,
+} from '~/lib/qhub/commercial/governance-essentials';
 import { testReadyToken } from '~/test/helpers/commercial-ready-token';
 
 /*
@@ -79,6 +83,8 @@ describe('governance gates', () => {
     reviewState: 'none',
     riskTier: 'T1',
     reviewPolicyVersion: currentReviewPolicyVersion(),
+    policyCardVersion: currentGovernancePolicyCardVersion(),
+    acknowledgmentVersion: currentRequiredAcknowledgmentVersion(),
   };
 
   it('allows model invocation only when complete + acknowledged + proceed', () => {
@@ -102,6 +108,18 @@ describe('governance gates', () => {
         reviewPolicyVersion: '2020-01-01.old-policy',
       }),
     ).toBe(false);
+  });
+
+  it('R7: a stale acknowledgment version blocks authorization (build + publication)', () => {
+    expect(isModelInvocationAllowed({ ...base, acknowledgmentVersion: '2020-01-01.old-ack' })).toBe(false);
+    expect(isPublicationAllowed({ ...base, acknowledgmentVersion: '2020-01-01.old-ack' })).toBe(false);
+    expect(isModelInvocationAllowed({ ...base, acknowledgmentVersion: null })).toBe(false);
+  });
+
+  it('R7: a stale Governance policy-card version blocks authorization (build + publication)', () => {
+    expect(isModelInvocationAllowed({ ...base, policyCardVersion: '2020-01-01.old-card' })).toBe(false);
+    expect(isPublicationAllowed({ ...base, policyCardVersion: '2020-01-01.old-card' })).toBe(false);
+    expect(isModelInvocationAllowed({ ...base, policyCardVersion: null })).toBe(false);
   });
 
   it('gates publication on approval / clean proceed', () => {

@@ -15,6 +15,8 @@ import type { CommercialContext } from '~/lib/qhub/commercial/commercial-context
 import type { RiskTier } from '~/lib/qhub/classification';
 import { assertReadyToken, type CommercialReadyToken } from '~/lib/qhub/commercial/commercial-schema-check.server';
 import {
+  currentGovernancePolicyCardVersion,
+  currentRequiredAcknowledgmentVersion,
   currentReviewPolicyVersion,
   evaluateGovernanceEssentials,
   type DataClass,
@@ -69,6 +71,12 @@ export interface GovernanceRecord {
 
   /** The SERVER policy version the current approval was decided under (R6 currency check). */
   reviewPolicyVersion: string | null;
+
+  /** The Governance policy-card version the project was evaluated under (R7 currency check). */
+  policyCardVersion: string | null;
+
+  /** The acknowledgment version the human accepted (R7 currency check). */
+  acknowledgmentVersion: string | null;
 }
 
 /**
@@ -119,9 +127,14 @@ export async function upsertDeclaration(
       disposition: evalResult.disposition,
       declaration_complete: declarationComplete,
 
-      // A new declaration invalidates a prior acknowledgment.
+      // Bind the CURRENT Governance policy-card version to this declaration (R7 currency).
+      policy_card_version: currentGovernancePolicyCardVersion(),
+
+      // A new declaration invalidates a prior acknowledgment AND any prior review approval.
       acknowledged: false,
+      acknowledgment_version: null,
       review_state: reviewState,
+      review_policy_version: null,
       updated_at: new Date().toISOString(),
     },
     { onConflict: 'project_id' },
@@ -152,6 +165,8 @@ export async function upsertDeclaration(
 
     // A fresh declaration has no decided review yet (any prior approval was invalidated).
     reviewPolicyVersion: null,
+    policyCardVersion: currentGovernancePolicyCardVersion(),
+    acknowledgmentVersion: null,
   };
 }
 
@@ -219,7 +234,7 @@ export async function getGovernanceRecord(
   const { data } = await sb
     .from('qhub_governance_essentials')
     .select(
-      'project_id,org_id,disposition,declaration_complete,acknowledged,review_state,risk_tier,review_policy_version',
+      'project_id,org_id,disposition,declaration_complete,acknowledged,review_state,risk_tier,review_policy_version,policy_card_version,acknowledgment_version',
     )
     .eq('project_id', projectId)
     .eq('org_id', orgId)
@@ -238,17 +253,20 @@ export async function getGovernanceRecord(
     reviewState: (data.review_state as GovernanceRecord['reviewState']) ?? 'none',
     riskTier: (data.risk_tier as RiskTier) ?? 'UNCLASSIFIED',
     reviewPolicyVersion: (data.review_policy_version as string) ?? null,
+    policyCardVersion: (data.policy_card_version as string) ?? null,
+    acknowledgmentVersion: (data.acknowledgment_version as string) ?? null,
   };
 }
 
 /**
  * @qhub-service: PURE_NO_IO
- * R6: the SINGLE current-policy authorization check every protected reviewed operation
- * (model/build, publication, evidence export) must call. It requires a complete +
- * acknowledged declaration and — crucially — that any review approval was decided under
- * the EXACT current server policy version. An approval made under an older policy is STALE
- * and cannot authorize; a clean 'proceed' disposition needs no review. The browser can
- * never influence the policy version (it is server-derived).
+ * R7: the SINGLE current-authorization check every protected reviewed operation (model/build,
+ * publication, evidence export) must call. It requires the FULL current version set to match
+ * exactly — a stale policy, Governance policy-card, OR human-acknowledgment version blocks the
+ * operation BEFORE any credit/model/publication/export/audit side effect. All versions are
+ * server-derived; the browser has no authority over any of them. A clean 'proceed' disposition
+ * still requires a current acknowledgment; a 'manual_review' disposition additionally requires
+ * an APPROVED review whose policy version is current.
  */
 export function assertCurrentReviewAuthorization(rec: GovernanceRecord | null): { ok: boolean; reason: string } {
   if (!rec) {
@@ -263,11 +281,21 @@ export function assertCurrentReviewAuthorization(rec: GovernanceRecord | null): 
     return { ok: false, reason: 'acknowledgment_required' };
   }
 
+  // The human acknowledgment must be for the CURRENT required version (stale ack → re-ack).
+  if (rec.acknowledgmentVersion !== currentRequiredAcknowledgmentVersion()) {
+    return { ok: false, reason: 'acknowledgment_stale_version' };
+  }
+
+  // The Governance record must be for the CURRENT policy-card (stale Governance → re-declare).
+  if (rec.policyCardVersion !== currentGovernancePolicyCardVersion()) {
+    return { ok: false, reason: 'governance_stale_version' };
+  }
+
   if (rec.disposition === 'prohibited' || rec.disposition === 'blocked') {
     return { ok: false, reason: 'disposition_blocked' };
   }
 
-  // A clean proceed disposition needs no manual review.
+  // A clean proceed disposition needs no manual review (ack + Governance currency already met).
   if (rec.disposition === 'proceed') {
     return { ok: true, reason: 'proceed' };
   }

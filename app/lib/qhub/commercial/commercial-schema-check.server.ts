@@ -20,6 +20,7 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { json } from '@remix-run/cloudflare';
 import { createClient } from '@supabase/supabase-js';
+import { parseDeployEnv } from '~/lib/qhub/deploy-env';
 
 export const EXPECTED_COMMERCIAL_SCHEMA_VERSION = '2026-07-30.commercial-launch-r4';
 
@@ -131,8 +132,17 @@ function normalizedSupabaseHost(env: Record<string, string | undefined>): string
   }
 }
 
+/**
+ * The EXACT deployment environment string bound into the target digest + token. Uses the
+ * strict shared parser: no lowercasing, no trimming, no default of unknown → local. An
+ * invalid value binds as the sentinel 'invalid:<raw>' so a misspelled/mixed-case/padded env
+ * can never share a digest with a valid one (and can never masquerade as staging/prod).
+ */
 function deploymentEnv(env: Record<string, string | undefined>): string {
-  return (env.QHUB_DEPLOY_ENV ?? process.env.QHUB_DEPLOY_ENV ?? 'unknown').toLowerCase();
+  const raw = env.QHUB_DEPLOY_ENV ?? process.env.QHUB_DEPLOY_ENV ?? '';
+  const parsed = parseDeployEnv(raw);
+
+  return parsed.ok ? (parsed.env as string) : `invalid:${raw}`;
 }
 
 /** Deterministic canonical descriptor of the target (never exposed raw). */

@@ -209,9 +209,34 @@ export const GOVERNANCE_ESSENTIALS_FLOW: FlowStep[] = [
  */
 export const REVIEW_POLICY_VERSION = '2026-07-30.governance-essentials.v1';
 
+/**
+ * The current REQUIRED human-acknowledgment version. A review approval (and a model/build/
+ * publication/export authorization) is valid only when the project's stored acknowledgment
+ * version matches this. Bump when the acceptable-use terms materially change (forces a fresh
+ * acknowledgment + a new review).
+ */
+export const REQUIRED_ACKNOWLEDGMENT_VERSION = '2026-07-30.acceptable-use.v1';
+
+/**
+ * The current Governance Essentials POLICY-CARD version (the baseline policy card's identity).
+ * A stored policy_card_version other than this means the project was evaluated under an older
+ * Governance record and must be re-declared + re-reviewed.
+ */
+export const GOVERNANCE_POLICY_CARD_VERSION = '2026-07-30.policy-card.v1';
+
 /** The current applicable review policy version (server-derived, project-scoped). */
 export function currentReviewPolicyVersion(): string {
   return REVIEW_POLICY_VERSION;
+}
+
+/** The current required acknowledgment version (server-derived). */
+export function currentRequiredAcknowledgmentVersion(): string {
+  return REQUIRED_ACKNOWLEDGMENT_VERSION;
+}
+
+/** The current Governance Essentials policy-card version (server-derived). */
+export function currentGovernancePolicyCardVersion(): string {
+  return GOVERNANCE_POLICY_CARD_VERSION;
 }
 
 export interface PolicyCard {

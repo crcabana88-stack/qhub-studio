@@ -1,5 +1,5 @@
 /*
- * @qhub-route: INTERNAL_SERVER_ONLY
+ * @qhub-route: PUBLIC_SAFE
  * @qhub-boundary: PUBLIC_SAFE — proxies the caller's OWN connection using their own cookie/header token; no server secret, self-scoped.
  */
 import { json } from '@remix-run/cloudflare';

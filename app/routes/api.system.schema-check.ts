@@ -23,6 +23,7 @@
 
 import { json, type LoaderFunctionArgs } from '@remix-run/cloudflare';
 import { requireStaff } from '~/lib/qhub/commercial/commercial-context.server';
+import { parseDeployEnv } from '~/lib/qhub/deploy-env';
 import { getSchemaReadiness } from '~/lib/qhub/schema-check.server';
 import { getAgentSchemaReadiness } from '~/lib/qhub/agent/agent-schema-check.server';
 import {
@@ -57,7 +58,7 @@ export const loader = async ({ request, context }: LoaderFunctionArgs) => {
       expectedSchemaVersion: report.expectedSchemaVersion,
 
       // Non-sensitive deployment context (no project ref / host / URL / connection data).
-      deploymentEnvironment: (env.QHUB_DEPLOY_ENV ?? 'unknown').toLowerCase(),
+      deploymentEnvironment: parseDeployEnv(env.QHUB_DEPLOY_ENV).env ?? 'invalid',
       checkedAt: report.checkedAt,
       objects: report.objects.map((o) => ({
         identifier: o.identifier ?? `${o.table}.${o.column}`,

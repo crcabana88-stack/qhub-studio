@@ -47,9 +47,26 @@ const ANY_DB_OP = /\.(from|rpc|insert|update|upsert|delete)\s*\(/;
 const TOKEN_TYPE = 'CommercialReadyToken';
 const COMMERCIAL_GUARDS = /requireCommercialContext|requireCommercialProject|requireCommercialReady|requireStaff/;
 
-/** Protected I/O a PUBLIC_SAFE route may never contain (matches the classifier signals). */
-const SENSITIVE_ROUTE_IO =
-  /\.(insert|update|upsert|delete)\s*\(|\.rpc\s*\(|streamText|generateText|LLMManager|createClient|SERVICE_ROLE|getApiKeysFromCookie|requireStaff|requireCommercial|getSession|getVerifiedUser|Deploy|netlify|vercel|MCPService/;
+/** Authoritative auth guards — an INTERNAL_SERVER_ONLY route must gate the handler on one. */
+const AUTH_GUARDS =
+  /requireStaff|requireCommercialContext|requireCommercialProject|requireCommercialReady|getSession|getVerifiedUser|requireInternalService/;
+
+/**
+ * R7 PROTECTED-I/O DATAFLOW — detect protected COMMERCIAL behaviour by I/O CATEGORY / import,
+ * NOT by a fixed function-name list, so a renamed protected wrapper is still caught (the
+ * underlying DB mutation, model-generation call, Stripe/billing import, deploy action, secret
+ * VALUE export, or agent/enforcement/approval call remains). These are the categories a
+ * genuinely PUBLIC_SAFE route may never touch. (Benign reads — env-var reads, model listing,
+ * git info, a supabase read client, getSession — are NOT commercial-protected and do not
+ * disqualify a public route.)
+ */
+const PROTECTED_IO_CATEGORY =
+  /\.(insert|update|upsert|delete)\s*\(|\.rpc\(\s*['"]qhub_(?!verify_commercial_schema)|SERVICE_ROLE_KEY\b|\bstreamText\b|\bgenerateText\b|invokeCommercialModel|createBillingProvider|stripe-provider\.server|netlify-deploy|vercel-deploy|freezeReleaseCandidate|mcp-update-config|export-api-keys|runAgent|resumeAgentRun|buildAgentManifest|enforceGovernedAction|createGovernanceService|grantApproval/;
+
+/** A route classified PUBLIC_SAFE may contain none of the above (commercial-protected) I/O. */
+function routeHasProtectedIO(src: string): boolean {
+  return PROTECTED_IO_CATEGORY.test(src);
+}
 
 /** A Supabase DB MUTATION (not the read-only verifier; `.update(` needs a `.from(` nearby). */
 function mutates(text: string): boolean {
@@ -98,20 +115,23 @@ interface ExportedCallable {
   comment: string;
 }
 
+/**
+ * Every EXPORTED callable, across ALL export forms: function declarations, arrow /
+ * function-expression consts, default exports (function/arrow), and exported class methods
+ * (instance + static) + constructors. Each is returned with its params, body, and leading
+ * comment so the classifier can enforce authority regardless of the export syntax.
+ */
 function exportedCallables(sf: ts.SourceFile): ExportedCallable[] {
   const out: ExportedCallable[] = [];
+  const isExport = (n: ts.Node) =>
+    ts.canHaveModifiers(n) && ts.getModifiers(n)?.some((m) => m.kind === ts.SyntaxKind.ExportKeyword);
+
+  const pushFn = (name: string, params: readonly ts.ParameterDeclaration[], body: string, comment: string) =>
+    out.push({ name, params, body, comment });
 
   for (const stmt of sf.statements) {
-    const isExport = (n: ts.Node) =>
-      ts.canHaveModifiers(n) && ts.getModifiers(n)?.some((m) => m.kind === ts.SyntaxKind.ExportKeyword);
-
-    if (ts.isFunctionDeclaration(stmt) && stmt.name && isExport(stmt)) {
-      out.push({
-        name: stmt.name.text,
-        params: stmt.parameters,
-        body: stmt.body?.getText(sf) ?? '',
-        comment: leadingComment(sf, stmt),
-      });
+    if (ts.isFunctionDeclaration(stmt) && isExport(stmt)) {
+      pushFn(stmt.name?.text ?? 'default', stmt.parameters, stmt.body?.getText(sf) ?? '', leadingComment(sf, stmt));
     }
 
     if (ts.isVariableStatement(stmt) && isExport(stmt)) {
@@ -121,12 +141,33 @@ function exportedCallables(sf: ts.SourceFile): ExportedCallable[] {
           d.initializer &&
           (ts.isArrowFunction(d.initializer) || ts.isFunctionExpression(d.initializer))
         ) {
-          out.push({
-            name: d.name.text,
-            params: d.initializer.parameters,
-            body: (d.initializer.body?.getText(sf) ?? '') || '',
-            comment: leadingComment(sf, stmt),
-          });
+          pushFn(
+            d.name.text,
+            d.initializer.parameters,
+            d.initializer.body?.getText(sf) ?? '',
+            leadingComment(sf, stmt),
+          );
+        }
+      }
+    }
+
+    // export default () => {}  /  export default function(){}
+    if (ts.isExportAssignment(stmt) && stmt.expression) {
+      const e = stmt.expression;
+
+      if (ts.isArrowFunction(e) || ts.isFunctionExpression(e)) {
+        pushFn('default', e.parameters, e.body?.getText(sf) ?? '', leadingComment(sf, stmt));
+      }
+    }
+
+    // export class X { m(){} static s(){} constructor(){} }
+    if (ts.isClassDeclaration(stmt) && isExport(stmt)) {
+      const cname = stmt.name?.text ?? 'default';
+
+      for (const m of stmt.members) {
+        if ((ts.isMethodDeclaration(m) || ts.isConstructorDeclaration(m)) && m.body) {
+          const mname = ts.isConstructorDeclaration(m) ? 'constructor' : ((m.name as ts.Identifier)?.text ?? 'method');
+          pushFn(`${cname}.${mname}`, m.parameters, m.body.getText(sf), leadingComment(sf, m));
         }
       }
     }
@@ -173,8 +214,14 @@ function checkCommercialServiceModule(name: string, src: string): string[] {
     return [`${name} __QHUB_MODULE_CLASSIFICATION is not a literal reviewed value`];
   }
 
-  // A protected implementation must not be re-exported through a barrel.
-  if (/export\s+\{[^}]*\}\s+from\s+/.test(src) && mod !== 'INTERNAL_SERVER_ONLY') {
+  /*
+   * A protected implementation must not be re-exported through a barrel (named, aliased, or
+   * export-star) from a non-internal module.
+   */
+  if (
+    (/export\s+\{[^}]*\}\s+from\s+/.test(src) || /export\s+\*\s+from\s+/.test(src)) &&
+    mod !== 'INTERNAL_SERVER_ONLY'
+  ) {
     violations.push(`${name} re-exports through a barrel from a non-internal module`);
   }
 
@@ -327,12 +374,20 @@ function checkRouteFile(name: string, src: string): string[] {
 
   const cls = classes[0];
 
-  if (cls === 'PUBLIC_SAFE' && SENSITIVE_ROUTE_IO.test(src)) {
+  if (cls === 'PUBLIC_SAFE' && routeHasProtectedIO(src)) {
     violations.push(`${name} PUBLIC_SAFE route performs protected I/O`);
   }
 
   if (cls === 'STAFF_ONLY' && !/requireStaff\s*\(/.test(src)) {
     violations.push(`${name} STAFF_ONLY route does not use requireStaff`);
+  }
+
+  /*
+   * R7: an INTERNAL_SERVER_ONLY route must NOT be anonymously browser-reachable — it must
+   * gate its HTTP handler on an authoritative auth guard (a strong internal-service boundary).
+   */
+  if (cls === 'INTERNAL_SERVER_ONLY' && !AUTH_GUARDS.test(src)) {
+    violations.push(`${name} INTERNAL_SERVER_ONLY route is browser-reachable (no authoritative auth guard)`);
   }
 
   if (cls === 'SIGNATURE_AUTH') {
@@ -625,5 +680,58 @@ describe('fixtures: the AST checker rejects violations', () => {
   it('a valid COMMERCIAL_READY route fixture passes', () => {
     const src = `// @qhub-route: COMMERCIAL_READY\nexport async function action(env) {\n const g = await requireCommercialContext();\n const ready = await requireCommercialReady(env);\n if (!ready.ok) return ready.response;\n await createCheckoutIntent(ready.token, {}, env);\n}`;
     expect(checkRouteFile('f.ts', src)).toEqual([]);
+  });
+
+  // ── R7 additions ──────────────────────────────────────────────────────────────
+
+  it('INTERNAL_SERVER_ONLY route with NO auth guard (browser-reachable) → rejected', () => {
+    const src = `// @qhub-route: INTERNAL_SERVER_ONLY\nexport async function action(env) { await createClient(env).from('x').insert({}); }`;
+    expect(checkRouteFile('f.ts', src).join()).toMatch(/browser-reachable \(no authoritative auth guard\)/);
+  });
+
+  it('a guarded INTERNAL_SERVER_ONLY route passes', () => {
+    const src = `// @qhub-route: INTERNAL_SERVER_ONLY\nexport async function action(req, env) { const s = await requireStaff(req, env); if (!s.ok) return s.response; await createClient(env).from('x').insert({}); }`;
+    expect(checkRouteFile('f.ts', src)).toEqual([]);
+  });
+
+  it('protected I/O is detected by CATEGORY even when the DB wrapper is renamed', () => {
+    // A renamed protected wrapper still performs the underlying DB mutation → caught.
+    const src = `// @qhub-route: PUBLIC_SAFE\nexport async function action(env) { const put = (t) => sb.from(t).insert({}); await put('x'); }`;
+    expect(checkRouteFile('f.ts', src).join()).toMatch(/PUBLIC_SAFE route performs protected I\/O/);
+  });
+
+  it('protected I/O is detected for a server-secret VALUE export category', () => {
+    const src = `// @qhub-route: PUBLIC_SAFE\nimport { exportKeys } from '~/routes/api.export-api-keys';\nexport async function loader() { return exportKeys(); }`;
+    expect(checkRouteFile('f.ts', src).join()).toMatch(/protected I\/O/);
+  });
+
+  it('protected I/O is detected for a renamed model-generation / stripe / deploy category', () => {
+    for (const io of [
+      'await gen()  /* streamText */ streamText(x)',
+      "import { createBillingProvider } from '~/x'",
+      'await deploy() // netlify-deploy',
+    ]) {
+      const src = `// @qhub-route: PUBLIC_SAFE\nexport async function action() { ${io} }`;
+      expect(checkRouteFile('f.ts', src).join(), io).toMatch(/protected I\/O/);
+    }
+  });
+
+  it('DEFAULT-export token function is discovered + checked', () => {
+    const src = svc(
+      `/** @qhub-service: REQUIRES_COMMERCIAL_READY_TOKEN */\nexport default async function (token: CommercialReadyToken, env) { return 1; }`,
+    );
+    expect(checkCommercialServiceModule('f.ts', src).join()).toMatch(/accepts a token but never validates it/);
+  });
+
+  it('CLASS-METHOD mutation without a token is discovered + rejected', () => {
+    const src = svc(
+      `/** @qhub-service: REQUIRES_COMMERCIAL_READY_TOKEN */\nexport class Repo {\n /** @qhub-service: INTERNAL_SERVER_ONLY */\n async write(env) { await admin(env).from('x').insert({}); }\n}`,
+    );
+    expect(checkCommercialServiceModule('f.ts', src).join()).toMatch(/not a token-guarded export/);
+  });
+
+  it('export-star barrel from a non-internal module → rejected', () => {
+    const src = svc(`export * from './secret-impl';`);
+    expect(checkCommercialServiceModule('f.ts', src).join()).toMatch(/re-exports through a barrel/);
   });
 });
