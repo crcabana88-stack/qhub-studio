@@ -68,6 +68,26 @@ function serverSecretEnvReads(src: string): string[] {
   return [...hits];
 }
 
+/**
+ * R9 §6: DYNAMIC / COMPUTED server-env access — the class of read that evades the static
+ * name-based detector because the variable name is computed at runtime. A PUBLIC_SAFE route may
+ * not read the server environment this way at all (it can never be proven non-secret).
+ */
+const DYNAMIC_ENV_PATTERNS: Array<{ label: string; re: RegExp }> = [
+  { label: 'computed process.env[...] access', re: /process\.env\s*\[/ },
+  { label: 'computed env-object member access', re: /\.env\s*\[|\benv\s*\[/ },
+  {
+    label: 'Object.entries/keys/values/assign over an env object',
+    re: /Object\.(entries|keys|values|assign|fromEntries)\s*\(\s*[^)]*\benv\b/,
+  },
+  { label: 'spread of an env object', re: /\.\.\.\s*(?:[\w.?]*\.)?(?:process\.env|env)\b/ },
+  { label: 'serialization of an env object', re: /JSON\.stringify\s*\(\s*[^)]*\.env\b/ },
+];
+
+function dynamicEnvAccess(src: string): string[] {
+  return DYNAMIC_ENV_PATTERNS.filter(({ re }) => re.test(src)).map(({ label }) => label);
+}
+
 const SERVICE_EXPORT_CLASSES = [
   'REQUIRES_COMMERCIAL_READY_TOKEN',
   'REQUIRES_STAFF_CONTEXT',
@@ -478,6 +498,13 @@ function checkRouteFile(name: string, src: string): string[] {
 
     if (secrets.length > 0) {
       violations.push(`${name} PUBLIC_SAFE route reads a server secret from env (${secrets.join(', ')})`);
+    }
+
+    // R9 §6: a PUBLIC_SAFE route may not read the server env DYNAMICALLY (computed/spread/serialize).
+    const dyn = dynamicEnvAccess(src);
+
+    if (dyn.length > 0) {
+      violations.push(`${name} PUBLIC_SAFE route performs dynamic server-env access (${dyn.join('; ')})`);
     }
   }
 
@@ -906,6 +933,25 @@ describe('fixtures: the AST checker rejects violations', () => {
   it('the public anon key + non-secret operational env vars are NOT flagged as secrets (R8 §1)', () => {
     const src = `// @qhub-route: PUBLIC_SAFE\nexport async function loader({ context }) { const a = context.cloudflare.env.SUPABASE_ANON_KEY; const b = process.env.QHUB_BUILD_ARTIFACT_HASH; const c = process.env.CF_PAGES_URL; const d = process.env.STRIPE_ACCOUNT_ID; return [a,b,c,d]; }`;
     expect(checkRouteFile('f.ts', src)).toEqual([]);
+  });
+
+  it('PUBLIC_SAFE route with DYNAMIC/computed server-env access → rejected (R9 §6)', () => {
+    for (const read of [
+      'const v = process.env[name];',
+      'const v = context.cloudflare.env[key];',
+      'const v = llmManager.env[apiTokenKey];',
+      'const all = Object.entries(process.env);',
+      'const copy = { ...process.env };',
+      'const s = JSON.stringify(context.cloudflare.env);',
+    ]) {
+      const src = `// @qhub-route: PUBLIC_SAFE\nexport async function loader({ context }) { ${read} return v; }`;
+      expect(checkRouteFile('f.ts', src).join(), read).toMatch(/dynamic server-env access/);
+    }
+  });
+
+  it('a STAFF_ONLY / INTERNAL route MAY read env dynamically (returns only metadata) — not flagged', () => {
+    const staff = `// @qhub-route: STAFF_ONLY\nexport async function loader({ request, context }) { const s = await requireStaff(request, context.cloudflare.env); if (!s.ok) return s.response; const configured = !!process.env[name]; return { configured }; }`;
+    expect(checkRouteFile('f.ts', staff)).toEqual([]);
   });
 
   it('GETTER performing I/O under a PURE_NO_IO class is discovered + rejected (R8 §4)', () => {

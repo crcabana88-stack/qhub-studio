@@ -137,6 +137,53 @@ describe('no route returns a raw server credential (repo-wide)', () => {
   });
 });
 
+describe('R9 §6: dynamic/computed server-env access + SDK-error redaction', () => {
+  // Mirror of the architecture dynamic-env detector.
+  const DYNAMIC_ENV: RegExp[] = [
+    /process\.env\s*\[/,
+    /\.env\s*\[|\benv\s*\[/,
+    /Object\.(entries|keys|values|assign|fromEntries)\s*\(\s*[^)]*\benv\b/,
+    /\.\.\.\s*(?:[\w.?]*\.)?(?:process\.env|env)\b/,
+    /JSON\.stringify\s*\(\s*[^)]*\.env\b/,
+  ];
+
+  it('no PUBLIC_SAFE route performs dynamic/computed server-env access', () => {
+    const offenders: string[] = [];
+
+    for (const f of routeFiles()) {
+      const src = read(f);
+
+      if (!/@qhub-route:\s*PUBLIC_SAFE/.test(src)) {
+        continue;
+      }
+
+      if (DYNAMIC_ENV.some((re) => re.test(src))) {
+        offenders.push(f.slice(ROOT.length));
+      }
+    }
+
+    expect(offenders, offenders.join('\n')).toEqual([]);
+  });
+
+  it('the dynamic-env routes (check-env-key, configured-providers) are INTERNAL_SERVER_ONLY + guarded', () => {
+    for (const p of ['api.check-env-key.ts', 'api.configured-providers.ts']) {
+      const src = read(`${ROUTES}${p}`);
+      expect(src, p).toMatch(/@qhub-route:\s*INTERNAL_SERVER_ONLY/);
+      expect(src, p).toMatch(/getVerifiedUser/);
+    }
+  });
+
+  it('api.bug-report.ts never logs the raw SDK error object (would leak the bot token)', () => {
+    const src = read(`${ROUTES}api.bug-report.ts`);
+
+    // The old unredacted `console.error('...', error)` form must be gone.
+    expect(src).not.toMatch(/console\.error\([^)]*,\s*error\s*\)/);
+
+    // Only a sanitized status is logged.
+    expect(src).toMatch(/github status/);
+  });
+});
+
 describe('the secret-export detector catches synthetic offenders (fixtures)', () => {
   it('a renamed secret-read wrapper is still detected (effect-based, not name-based)', () => {
     // Regardless of the wrapper function's name, the underlying env-secret READ is caught.

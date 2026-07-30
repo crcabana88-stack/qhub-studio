@@ -18,9 +18,8 @@ import type { CommercialExecutionContext } from '~/lib/qhub/commercial/commercia
 import { hasCapability, type Capability } from '~/lib/qhub/commercial/capabilities';
 import { assertReadyToken, type CommercialReadyToken } from '~/lib/qhub/commercial/commercial-schema-check.server';
 import {
-  assertCurrentReviewAuthorization,
+  assertBoundReviewAuthorization,
   getGovernanceRecord,
-  isModelInvocationAllowed,
 } from '~/lib/qhub/commercial/governance-essentials.server';
 import { consumeBuildCredit, type CreditResult } from '~/lib/qhub/commercial/commercial-store.server';
 
@@ -140,7 +139,7 @@ export async function invokeCommercialModel<T>(
 
   const gov = await getGovernanceRecord(ctx.projectOrgId, ctx.projectId, env);
 
-  if (!isModelInvocationAllowed(gov)) {
+  if (!assertBoundReviewAuthorization(gov).ok) {
     return { ok: false, reason: 'governance_gate_blocked' };
   }
 
@@ -230,7 +229,7 @@ export async function exportCommercialProject(
    * export side effect.
    */
   const gov = await getGovernanceRecord(ctx.projectOrgId, ctx.projectId, env);
-  const auth = assertCurrentReviewAuthorization(gov);
+  const auth = assertBoundReviewAuthorization(gov);
 
   if (!auth.ok) {
     return { ok: false, reason: `review_${auth.reason}` };
@@ -265,7 +264,7 @@ export async function requestCommercialPublication(
    * proceed disposition). A stale approval fails BEFORE any publication side effect.
    */
   const gov = await getGovernanceRecord(ctx.projectOrgId, ctx.projectId, env);
-  const auth = assertCurrentReviewAuthorization(gov);
+  const auth = assertBoundReviewAuthorization(gov);
 
   if (!auth.ok) {
     return { ok: false, reason: `review_${auth.reason}` };

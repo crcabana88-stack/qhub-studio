@@ -1,12 +1,22 @@
 /*
- * @qhub-route: PUBLIC_SAFE
- * @qhub-boundary: PUBLIC_SAFE — read-only non-secret status (booleans / provider names / model list); returns no key values.
+ * @qhub-route: INTERNAL_SERVER_ONLY
+ * @qhub-boundary: INTERNAL_SERVER_ONLY — reports whether a provider key is configured server-side.
+ * It reads server env values (dynamically, by provider key name), so it requires an authenticated
+ * session and returns ONLY a boolean (isSet) — never a raw key value (R9 §6).
  */
 import type { LoaderFunction } from '@remix-run/cloudflare';
 import { LLMManager } from '~/lib/modules/llm/manager';
 import { getApiKeysFromCookie } from '~/lib/api/cookies';
+import { getVerifiedUser } from '~/lib/auth/session';
 
 export const loader: LoaderFunction = async ({ context, request }) => {
+  const env = (context?.cloudflare?.env as unknown as Record<string, string | undefined>) ?? {};
+  const user = await getVerifiedUser(request, env);
+
+  if (user === null || user === 'missing_config') {
+    return Response.json({ error: 'unauthenticated' }, { status: 401 });
+  }
+
   const url = new URL(request.url);
   const provider = url.searchParams.get('provider');
 

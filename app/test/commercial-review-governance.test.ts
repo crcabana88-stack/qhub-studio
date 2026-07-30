@@ -10,7 +10,9 @@ import {
   isModelInvocationAllowed,
   isPublicationAllowed,
   buildEvidenceExport,
+  assertBoundReviewAuthorization,
   type GovernanceRecord,
+  type ApprovedReviewBinding,
 } from '~/lib/qhub/commercial/governance-essentials.server';
 import {
   currentReviewPolicyVersion,
@@ -133,5 +135,91 @@ describe('governance gates', () => {
     const ev = buildEvidenceExport(base);
     expect(ev).toMatchObject({ project_id: 'p1', disposition: 'proceed', schema: 'qhub-governance-essentials-1.0.0' });
     expect(JSON.stringify(ev)).not.toMatch(/prompt|secret|password/i);
+  });
+});
+
+describe('R9 §10: assertBoundReviewAuthorization requires a fully-bound, current approved review', () => {
+  const HASH = 'a'.repeat(64);
+  const boundBase: GovernanceRecord = {
+    projectId: 'p1',
+    orgId: 'org1',
+    disposition: 'manual_review',
+    declarationComplete: true,
+    acknowledged: true,
+    reviewState: 'approved',
+    riskTier: 'T1',
+    reviewPolicyVersion: currentReviewPolicyVersion(),
+    policyCardVersion: currentGovernancePolicyCardVersion(),
+    acknowledgmentVersion: currentRequiredAcknowledgmentVersion(),
+    recordVersion: 4,
+    declarationIdentityHash: HASH,
+    acknowledgmentRecordId: 'ack-1',
+  };
+
+  const matchingBinding: ApprovedReviewBinding = {
+    governanceRecordVersion: 4,
+    declarationIdentityHash: HASH,
+    acknowledgmentRecordId: 'ack-1',
+    acknowledgmentVersion: currentRequiredAcknowledgmentVersion(),
+    requiredAcknowledgmentVersion: currentRequiredAcknowledgmentVersion(),
+    policyVersion: currentReviewPolicyVersion(),
+    requesterUserId: 'u1',
+  };
+
+  it('a clean proceed disposition needs no approved-review binding', () => {
+    expect(assertBoundReviewAuthorization({ ...boundBase, disposition: 'proceed', reviewState: 'none' }).ok).toBe(true);
+  });
+
+  it('a fully-bound, current approved review authorizes', () => {
+    expect(assertBoundReviewAuthorization({ ...boundBase, approvedReview: matchingBinding }).ok).toBe(true);
+  });
+
+  it('a manual_review approval with NO loaded binding is non-authorizing (legacy NULL review blocks)', () => {
+    expect(assertBoundReviewAuthorization({ ...boundBase, approvedReview: null }).reason).toBe(
+      'non_authorizing_legacy_review',
+    );
+  });
+
+  it('a binding with ANY null field is non-authorizing', () => {
+    for (const k of Object.keys(matchingBinding) as Array<keyof ApprovedReviewBinding>) {
+      const broken = { ...matchingBinding, [k]: null } as ApprovedReviewBinding;
+      expect(assertBoundReviewAuthorization({ ...boundBase, approvedReview: broken }).reason, k).toBe(
+        'non_authorizing_legacy_review',
+      );
+    }
+  });
+
+  it('a stale binding (declaration hash / record version / ack drift) is rejected before side effects', () => {
+    expect(
+      assertBoundReviewAuthorization({
+        ...boundBase,
+        approvedReview: { ...matchingBinding, declarationIdentityHash: 'b'.repeat(64) },
+      }).reason,
+    ).toBe('review_binding_stale');
+    expect(
+      assertBoundReviewAuthorization({
+        ...boundBase,
+        approvedReview: { ...matchingBinding, governanceRecordVersion: 5 },
+      }).reason,
+    ).toBe('review_binding_stale');
+    expect(
+      assertBoundReviewAuthorization({
+        ...boundBase,
+        approvedReview: { ...matchingBinding, acknowledgmentRecordId: 'other' },
+      }).reason,
+    ).toBe('review_binding_stale');
+  });
+
+  it('a stale acknowledgment / governance version blocks at the record level (before binding)', () => {
+    expect(
+      assertBoundReviewAuthorization({ ...boundBase, acknowledged: false, approvedReview: matchingBinding }).reason,
+    ).toBe('acknowledgment_required');
+    expect(
+      assertBoundReviewAuthorization({
+        ...boundBase,
+        policyCardVersion: '2020-01-01.old',
+        approvedReview: matchingBinding,
+      }).reason,
+    ).toBe('governance_stale_version');
   });
 });

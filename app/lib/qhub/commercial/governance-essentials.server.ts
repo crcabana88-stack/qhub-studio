@@ -92,6 +92,30 @@ export interface GovernanceRecord {
 
   /** R8 §6: the canonical declaration_identity_hash of the current material declaration. */
   declarationIdentityHash?: string | null;
+
+  /** R9: the material data classes declared (used to derive the review category server-side). */
+  dataClasses?: DataClass[];
+
+  /** R9: the authoritative acknowledgment record id bound to the project's current acknowledgment. */
+  acknowledgmentRecordId?: string | null;
+
+  /**
+   * R9: the stored binding of the APPROVED review (loaded server-side by getGovernanceRecord when
+   * the disposition is manual_review). Null when there is no fully-bound approved review — a legacy
+   * NULL-bound review can never be approved by qhub_decide_review, so its absence blocks authorization.
+   */
+  approvedReview?: ApprovedReviewBinding | null;
+}
+
+/** R9: the persisted authoritative identity a review was APPROVED under. */
+export interface ApprovedReviewBinding {
+  governanceRecordVersion: number | null;
+  declarationIdentityHash: string | null;
+  acknowledgmentRecordId: string | null;
+  acknowledgmentVersion: string | null;
+  requiredAcknowledgmentVersion: string | null;
+  policyVersion: string | null;
+  requesterUserId: string | null;
 }
 
 /**
@@ -191,7 +215,7 @@ export async function upsertDeclaration(
     { onConflict: 'project_id' },
   );
 
-  // Resolve the authoritative Governance record id for the review binding.
+  // Resolve the authoritative Governance record id (for the later authoritative review binding).
   let governanceRecordId = (prior?.id as string) ?? null;
 
   if (!governanceRecordId) {
@@ -204,20 +228,13 @@ export async function upsertDeclaration(
     governanceRecordId = (fresh?.id as string) ?? null;
   }
 
-  // Open a staff review request for sensitive data — BOUND to this Governance identity.
-  if (evalResult.disposition === 'manual_review') {
-    const sensitive = input.dataClasses.find((c) => ['personal', 'financial', 'restricted'].includes(c));
-
-    if (sensitive) {
-      await createReviewRequest(
-        ctx,
-        { projectId: input.projectId, category: sensitive, reason: 'Sensitive data declared in Governance Essentials' },
-        token,
-        env,
-        { governanceRecordId, governanceRecordVersion: recordVersion, declarationIdentityHash },
-      );
-    }
-  }
+  /*
+   * R9 §1: a manual_review disposition sets the Governance record to REVIEW_REQUIRED
+   * (disposition=manual_review, review_state=requested). The review REQUEST row is NOT created
+   * here — it is opened only by the authoritative submitCustomerReview flow AFTER the customer has
+   * acknowledged, so every review request is fully bound (Governance + acknowledgment identity) at
+   * creation and no NULL-bound review can ever exist for a new project.
+   */
 
   return {
     projectId: input.projectId,
@@ -241,10 +258,15 @@ export async function upsertDeclaration(
 /**
  * @qhub-service: REQUIRES_COMMERCIAL_READY_TOKEN
  * Record the human acknowledgment for a project. Only valid once declaration-complete.
+ *
+ * R9 §4: the acknowledgment version is SERVER-derived (currentRequiredAcknowledgmentVersion) —
+ * the browser has NO authority over it. The inserted acknowledgment row's id is bound onto the
+ * Governance record (acknowledgment_record_id) so every later authorization/decision resolves the
+ * authoritative acknowledgment identity rather than trusting a client-supplied version.
  */
 export async function acknowledgeProject(
   ctx: CommercialContext,
-  input: { projectId: string; acknowledgmentVersion: string },
+  input: { projectId: string },
   token: CommercialReadyToken,
   env: Record<string, string | undefined>,
 ): Promise<{ ok: true } | { ok: false; error: string }> {
@@ -272,24 +294,92 @@ export async function acknowledgeProject(
     return { ok: false, error: 'not_acknowledgeable' };
   }
 
+  // SERVER-derived required version — never taken from the browser.
+  const ackVersion = currentRequiredAcknowledgmentVersion();
+
+  const { data: ack } = await sb
+    .from('qhub_acknowledgments')
+    .insert({
+      org_id: ctx.orgId,
+      user_id: ctx.userId,
+      ack_type: 'acceptable_use',
+      ack_version: ackVersion,
+    })
+    .select('id')
+    .maybeSingle();
+
+  const acknowledgmentRecordId = (ack?.id as string) ?? null;
+
   await sb
     .from('qhub_governance_essentials')
     .update({
       acknowledged: true,
-      acknowledgment_version: input.acknowledgmentVersion,
+      acknowledgment_version: ackVersion,
+      acknowledgment_record_id: acknowledgmentRecordId,
       updated_at: new Date().toISOString(),
     })
     .eq('project_id', input.projectId)
     .eq('org_id', ctx.orgId);
 
-  await sb.from('qhub_acknowledgments').insert({
-    org_id: ctx.orgId,
-    user_id: ctx.userId,
-    ack_type: 'acceptable_use',
-    ack_version: input.acknowledgmentVersion,
-  });
-
   return { ok: true };
+}
+
+/**
+ * @qhub-service: INTERNAL_SERVER_ONLY
+ * R9 §4: the ONE authoritative resolver of a user's CURRENT acknowledgment for a project. It never
+ * trusts a browser-supplied version — it loads the persisted acknowledgment row and the project's
+ * Governance acknowledgment state and proves currency + ownership (org/user/project). Used by review
+ * submission and by the current-review authorization / decision paths.
+ */
+export async function resolveCurrentAcknowledgment(
+  orgId: string,
+  projectId: string,
+  userId: string,
+  env: Record<string, string | undefined>,
+): Promise<{ ok: true; recordId: string; version: string; requiredVersion: string } | { ok: false; reason: string }> {
+  const requiredVersion = currentRequiredAcknowledgmentVersion();
+  const sb = admin(env);
+
+  // The project's Governance acknowledgment state must be current.
+  const { data: g } = await sb
+    .from('qhub_governance_essentials')
+    .select('acknowledged,acknowledgment_version,acknowledgment_record_id')
+    .eq('project_id', projectId)
+    .eq('org_id', orgId)
+    .maybeSingle();
+
+  if (!g) {
+    return { ok: false, reason: 'no_governance_record' };
+  }
+
+  if (!g.acknowledged || !g.acknowledgment_record_id) {
+    return { ok: false, reason: 'acknowledgment_required' };
+  }
+
+  if (g.acknowledgment_version !== requiredVersion) {
+    return { ok: false, reason: 'acknowledgment_stale' };
+  }
+
+  // The requester's OWN acknowledgment row must exist for the current required version.
+  const { data: a } = await sb
+    .from('qhub_acknowledgments')
+    .select('id,org_id,user_id,ack_version')
+    .eq('id', g.acknowledgment_record_id as string)
+    .maybeSingle();
+
+  if (!a) {
+    return { ok: false, reason: 'acknowledgment_not_found' };
+  }
+
+  if (a.org_id !== orgId || a.user_id !== userId) {
+    return { ok: false, reason: 'acknowledgment_owner_mismatch' };
+  }
+
+  if (a.ack_version !== requiredVersion) {
+    return { ok: false, reason: 'acknowledgment_stale' };
+  }
+
+  return { ok: true, recordId: a.id as string, version: a.ack_version as string, requiredVersion };
 }
 
 /** @qhub-service: INTERNAL_SERVER_ONLY */
@@ -302,7 +392,7 @@ export async function getGovernanceRecord(
   const { data } = await sb
     .from('qhub_governance_essentials')
     .select(
-      'id,project_id,org_id,disposition,declaration_complete,acknowledged,review_state,risk_tier,review_policy_version,policy_card_version,acknowledgment_version,record_version,declaration_identity_hash',
+      'id,project_id,org_id,disposition,declaration_complete,acknowledged,review_state,risk_tier,review_policy_version,policy_card_version,acknowledgment_version,record_version,declaration_identity_hash,data_classes,acknowledgment_record_id',
     )
     .eq('project_id', projectId)
     .eq('org_id', orgId)
@@ -310,6 +400,41 @@ export async function getGovernanceRecord(
 
   if (!data) {
     return null;
+  }
+
+  const governanceRecordId = (data.id as string) ?? null;
+  let approvedReview: ApprovedReviewBinding | null = null;
+
+  /*
+   * R9 §10: when the disposition requires manual review, load the APPROVED review's stored binding
+   * so the authorization check can prove it is fully bound + current. A NULL result (no fully-bound
+   * approved review — the only kind qhub_decide_review can produce) blocks authorization.
+   */
+  if ((data.disposition as Disposition) === 'manual_review' && governanceRecordId) {
+    const { data: rev } = await sb
+      .from('qhub_manual_review_requests')
+      .select(
+        'governance_record_version,declaration_identity_hash,acknowledgment_record_id,acknowledgment_version,required_acknowledgment_version,policy_version,requester_user_id',
+      )
+      .eq('org_id', orgId)
+      .eq('project_id', projectId)
+      .eq('governance_record_id', governanceRecordId)
+      .eq('status', 'approved')
+      .order('decided_at', { ascending: false })
+      .limit(1)
+      .maybeSingle();
+
+    if (rev) {
+      approvedReview = {
+        governanceRecordVersion: (rev.governance_record_version as number) ?? null,
+        declarationIdentityHash: (rev.declaration_identity_hash as string) ?? null,
+        acknowledgmentRecordId: (rev.acknowledgment_record_id as string) ?? null,
+        acknowledgmentVersion: (rev.acknowledgment_version as string) ?? null,
+        requiredAcknowledgmentVersion: (rev.required_acknowledgment_version as string) ?? null,
+        policyVersion: (rev.policy_version as string) ?? null,
+        requesterUserId: (rev.requester_user_id as string) ?? null,
+      };
+    }
   }
 
   return {
@@ -323,9 +448,12 @@ export async function getGovernanceRecord(
     reviewPolicyVersion: (data.review_policy_version as string) ?? null,
     policyCardVersion: (data.policy_card_version as string) ?? null,
     acknowledgmentVersion: (data.acknowledgment_version as string) ?? null,
-    governanceRecordId: (data.id as string) ?? null,
+    governanceRecordId,
     recordVersion: (data.record_version as number) ?? null,
     declarationIdentityHash: (data.declaration_identity_hash as string) ?? null,
+    dataClasses: (data.data_classes as DataClass[]) ?? [],
+    acknowledgmentRecordId: (data.acknowledgment_record_id as string) ?? null,
+    approvedReview,
   };
 }
 
@@ -382,6 +510,126 @@ export function assertCurrentReviewAuthorization(rec: GovernanceRecord | null): 
   }
 
   return { ok: true, reason: 'approved_current_policy' };
+}
+
+/**
+ * @qhub-service: PURE_NO_IO
+ * R9 §10: the SINGLE authoritative current-review authorization every protected reviewed operation
+ * (model/build, publication, evidence export) must call. It layers a FULLY-BOUND check over the
+ * record-level currency check: for a manual_review disposition it requires the loaded APPROVED
+ * review binding to be present, every stored field non-null, and EXACTLY equal to the current
+ * Governance + acknowledgment identity + current policy/required-ack versions. A legacy NULL-bound
+ * review (never producible by qhub_decide_review) is rejected. Fails BEFORE any side effect.
+ */
+export function assertBoundReviewAuthorization(rec: GovernanceRecord | null): { ok: boolean; reason: string } {
+  const base = assertCurrentReviewAuthorization(rec);
+
+  if (!base.ok || !rec) {
+    return base;
+  }
+
+  // Only a manual_review disposition has an approved review to bind; 'proceed' needs none.
+  if (rec.disposition !== 'manual_review') {
+    return base;
+  }
+
+  const ar = rec.approvedReview;
+
+  if (
+    !ar ||
+    ar.governanceRecordVersion == null ||
+    !ar.declarationIdentityHash ||
+    !ar.acknowledgmentRecordId ||
+    !ar.acknowledgmentVersion ||
+    !ar.requiredAcknowledgmentVersion ||
+    !ar.policyVersion ||
+    !ar.requesterUserId
+  ) {
+    return { ok: false, reason: 'non_authorizing_legacy_review' };
+  }
+
+  if (
+    ar.governanceRecordVersion !== rec.recordVersion ||
+    ar.declarationIdentityHash !== rec.declarationIdentityHash ||
+    ar.acknowledgmentRecordId !== rec.acknowledgmentRecordId ||
+    ar.acknowledgmentVersion !== rec.acknowledgmentVersion ||
+    ar.requiredAcknowledgmentVersion !== currentRequiredAcknowledgmentVersion() ||
+    ar.policyVersion !== currentReviewPolicyVersion()
+  ) {
+    return { ok: false, reason: 'review_binding_stale' };
+  }
+
+  return { ok: true, reason: 'approved_bound' };
+}
+
+/**
+ * @qhub-service: REQUIRES_COMMERCIAL_READY_TOKEN
+ * R9 §1: the AUTHORITATIVE customer review-submission path. The browser supplies ONLY the project,
+ * a bounded reason, and an idempotency key. EVERYTHING that binds authorization is derived
+ * server-side: the project must be REVIEW_REQUIRED (disposition manual_review), the requester's
+ * authoritative acknowledgment must already exist at the current required version, the category is
+ * derived from the declared sensitive data class, and the full Governance + acknowledgment identity
+ * is bound into the request. No NULL binding fields can result.
+ */
+export async function submitCustomerReview(
+  ctx: CommercialContext,
+  input: { projectId: string; reason: string; idempotencyKey?: string },
+  token: CommercialReadyToken,
+  env: Record<string, string | undefined>,
+): Promise<{ ok: true; requestId: string; idempotent: boolean } | { ok: false; error: string }> {
+  // Fail closed on readiness before any read or the delegated (token-guarded) review write.
+  assertReadyToken(token, env);
+
+  if (!ctx.orgId) {
+    return { ok: false, error: 'no_org_context' };
+  }
+
+  const rec = await getGovernanceRecord(ctx.orgId, input.projectId, env);
+
+  if (!rec) {
+    return { ok: false, error: 'no_governance_record' };
+  }
+
+  if (!rec.declarationComplete) {
+    return { ok: false, error: 'declaration_incomplete' };
+  }
+
+  // The project must be in the REVIEW_REQUIRED state (a clean proceed disposition needs no review).
+  if (rec.disposition !== 'manual_review') {
+    return { ok: false, error: 'review_not_required' };
+  }
+
+  if (!rec.governanceRecordId || rec.recordVersion == null || !rec.declarationIdentityHash) {
+    return { ok: false, error: 'governance_binding_incomplete' };
+  }
+
+  // The requester's authoritative acknowledgment must already exist at the current required version.
+  const ack = await resolveCurrentAcknowledgment(ctx.orgId, input.projectId, ctx.userId, env);
+
+  if (!ack.ok) {
+    return { ok: false, error: ack.reason };
+  }
+
+  // The review category is DERIVED from the declared sensitive data class (never browser-supplied).
+  const category = (rec.dataClasses ?? []).find((c) => ['personal', 'financial', 'restricted'].includes(c));
+
+  if (!category) {
+    return { ok: false, error: 'no_review_eligible_category' };
+  }
+
+  return createReviewRequest(
+    ctx,
+    { projectId: input.projectId, category, reason: input.reason, idempotencyKey: input.idempotencyKey },
+    token,
+    env,
+    {
+      governanceRecordId: rec.governanceRecordId,
+      governanceRecordVersion: rec.recordVersion,
+      declarationIdentityHash: rec.declarationIdentityHash,
+      acknowledgmentRecordId: ack.recordId,
+      acknowledgmentVersion: ack.version,
+    },
+  );
 }
 
 /**

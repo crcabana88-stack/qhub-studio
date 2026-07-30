@@ -243,9 +243,18 @@ export async function action({ request, context }: ActionFunctionArgs) {
       message: 'Bug report submitted successfully!',
     });
   } catch (error) {
-    console.error('Error creating bug report:', error);
+    /*
+     * R9 §6: NEVER log the raw SDK error — an Octokit RequestError carries the outbound request
+     * headers, including `Authorization: Bearer <bot token>`. Log only a sanitized status code, so
+     * the server bot credential can never reach logs, responses, or serialized errors.
+     */
+    const safeStatus =
+      error && typeof error === 'object' && 'status' in error
+        ? String((error as { status?: unknown }).status)
+        : 'unknown';
+    console.error(`Error creating bug report (github status: ${safeStatus})`);
 
-    // Handle validation errors
+    // Handle validation errors (Zod errors carry only the caller's own field paths — no secret).
     if (error instanceof z.ZodError) {
       return json({ error: 'Invalid input data', details: error.errors }, { status: 400 });
     }

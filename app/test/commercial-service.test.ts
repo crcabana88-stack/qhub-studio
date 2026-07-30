@@ -209,7 +209,28 @@ describe('R6 current-policy authorization blocks stale reviews BEFORE side effec
     policyCardVersion: currentGovernancePolicyCardVersion(),
     acknowledgmentVersion: currentRequiredAcknowledgmentVersion(),
   };
-  const currentApproval: GovernanceRecord = { ...staleApproval, reviewPolicyVersion: currentReviewPolicyVersion() };
+
+  /*
+   * A CURRENT-policy approval that is also FULLY BOUND (R9): the loaded approved-review binding
+   * matches the record's Governance + acknowledgment identity + the current required/policy versions.
+   */
+  const HASH = 'a'.repeat(64);
+  const currentApproval: GovernanceRecord = {
+    ...staleApproval,
+    reviewPolicyVersion: currentReviewPolicyVersion(),
+    recordVersion: 4,
+    declarationIdentityHash: HASH,
+    acknowledgmentRecordId: 'ack-rec-1',
+    approvedReview: {
+      governanceRecordVersion: 4,
+      declarationIdentityHash: HASH,
+      acknowledgmentRecordId: 'ack-rec-1',
+      acknowledgmentVersion: currentRequiredAcknowledgmentVersion(),
+      requiredAcknowledgmentVersion: currentRequiredAcknowledgmentVersion(),
+      policyVersion: currentReviewPolicyVersion(),
+      requesterUserId: 'u1',
+    },
+  };
 
   it('build/model is blocked on a stale approval (no credit consumed, no model run)', async () => {
     H.getGov.mockResolvedValue(staleApproval);

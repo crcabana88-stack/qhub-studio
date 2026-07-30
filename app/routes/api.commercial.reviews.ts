@@ -13,7 +13,7 @@
 import { json, type ActionFunctionArgs } from '@remix-run/cloudflare';
 import { requireCommercialProject } from '~/lib/qhub/commercial/commercial-context.server';
 import { requireCommercialReady } from '~/lib/qhub/commercial/commercial-schema-check.server';
-import { createReviewRequest } from '~/lib/qhub/commercial/review.server';
+import { submitCustomerReview } from '~/lib/qhub/commercial/governance-essentials.server';
 import { checkRateLimit, isSameOrigin, readBoundedJson } from '~/lib/qhub/commercial/request-guards.server';
 
 export async function action({ request, context }: ActionFunctionArgs) {
@@ -27,7 +27,13 @@ export async function action({ request, context }: ActionFunctionArgs) {
     return json({ ok: false, error: 'csrf_origin_rejected' }, { status: 403 });
   }
 
-  let body: { projectId?: string; category?: string; reason?: string };
+  /*
+   * R9 §1: the browser may supply ONLY the project, a bounded reason, and an optional idempotency
+   * key. It CANNOT supply the review category or any authoritative version/identity field — those
+   * are all derived server-side by submitCustomerReview from the persisted Governance record and
+   * the requester's authoritative acknowledgment.
+   */
+  let body: { projectId?: string; reason?: string; idempotencyKey?: string };
 
   try {
     body = await readBoundedJson(request, 8 * 1024);
@@ -35,7 +41,7 @@ export async function action({ request, context }: ActionFunctionArgs) {
     return json({ ok: false, error: e instanceof Error ? e.message : 'invalid_json' }, { status: 400 });
   }
 
-  if (!body.projectId || !body.category || !body.reason) {
+  if (!body.projectId || !body.reason) {
     return json({ ok: false, error: 'missing_fields' }, { status: 400 });
   }
 
@@ -60,9 +66,9 @@ export async function action({ request, context }: ActionFunctionArgs) {
     return json({ ok: false, error: 'rate_limited' }, { status: 429 });
   }
 
-  const result = await createReviewRequest(
+  const result = await submitCustomerReview(
     ctx,
-    { projectId: body.projectId, category: body.category, reason: body.reason },
+    { projectId: body.projectId, reason: body.reason, idempotencyKey: body.idempotencyKey },
     ready.token,
     env,
   );

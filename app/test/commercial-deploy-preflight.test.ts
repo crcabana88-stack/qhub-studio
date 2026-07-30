@@ -220,6 +220,31 @@ describe('every repository deploy/preview path runs schema verification', () => 
     const bad = 'wrangler pages dev ./build/client';
     expect(PKG_SERVE.test(bad) && !PKG_PREFLIGHT.test(bad)).toBe(true);
   });
+
+  /*
+   * R9 §7 — the DEV/preview inner-loop is NOT exempt: `pnpm dev` (remix vite:dev) and any
+   * `vite dev|preview` script must run the startup preflight first, so a supported dev/preview
+   * command cannot serve without an explicit local/test env (missing/unknown env exits nonzero).
+   */
+  const PKG_DEV = /remix\s+vite:(dev|preview)|vite\s+(dev|preview)/;
+
+  it('every dev/preview package script runs the startup preflight (pnpm dev not exempt, R9 §7)', () => {
+    const offenders = Object.entries(pkg.scripts).filter(([, cmd]) => PKG_DEV.test(cmd) && !PKG_PREFLIGHT.test(cmd));
+    expect(
+      offenders.map(([n]) => n),
+      offenders.map(([n]) => n).join(', '),
+    ).toEqual([]);
+  });
+
+  it('the dev script chains the startup preflight before the vite dev server', () => {
+    expect(pkg.scripts.dev).toMatch(/startup-preflight\.mjs/);
+    expect(pkg.scripts.dev.indexOf('startup-preflight')).toBeLessThan(pkg.scripts.dev.indexOf('vite:dev'));
+  });
+
+  it('a new dev/preview script WITHOUT preflight is detected (fixture)', () => {
+    const bad = 'remix vite:dev';
+    expect(PKG_DEV.test(bad) && !PKG_PREFLIGHT.test(bad)).toBe(true);
+  });
 });
 
 // ─── startup preflight subprocess behavior ──────────────────────────────────────

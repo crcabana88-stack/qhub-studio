@@ -1,11 +1,14 @@
 /*
- * @qhub-route: PUBLIC_SAFE
- * @qhub-boundary: PUBLIC_SAFE — read-only non-secret status (booleans / provider names / model list); returns no key values.
+ * @qhub-route: INTERNAL_SERVER_ONLY
+ * @qhub-boundary: INTERNAL_SERVER_ONLY — reports which providers are configured server-side. It
+ * reads server env values (dynamically, by provider key name), so it requires an authenticated
+ * session and returns ONLY booleans (isConfigured / configMethod) — never a raw value (R9 §6).
  */
 import type { LoaderFunction } from '@remix-run/cloudflare';
 import { json } from '@remix-run/cloudflare';
 import { LLMManager } from '~/lib/modules/llm/manager';
 import { LOCAL_PROVIDERS } from '~/lib/stores/settings';
+import { getVerifiedUser } from '~/lib/auth/session';
 
 interface ConfiguredProvider {
   name: string;
@@ -21,7 +24,14 @@ interface ConfiguredProvidersResponse {
  * API endpoint that detects which providers are configured via environment variables
  * This helps auto-enable providers that have been set up by the user
  */
-export const loader: LoaderFunction = async ({ context }) => {
+export const loader: LoaderFunction = async ({ context, request }) => {
+  const env = (context?.cloudflare?.env as unknown as Record<string, string | undefined>) ?? {};
+  const user = await getVerifiedUser(request, env);
+
+  if (user === null || user === 'missing_config') {
+    return json({ error: 'unauthenticated' }, { status: 401 });
+  }
+
   try {
     const llmManager = LLMManager.getInstance(context?.cloudflare?.env as any);
     const configuredProviders: ConfiguredProvider[] = [];
