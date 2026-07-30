@@ -576,53 +576,15 @@ export async function recordAcknowledgment(
   });
 }
 
-// ─── Manual review queue ─────────────────────────────────────────────────────────
-
-export interface ManualReviewRequest {
-  orgId: string;
-  projectId?: string;
-  requestType: string;
-  reason: string;
-}
-
-/**
- * @qhub-service: REQUIRES_COMMERCIAL_READY_TOKEN
+/*
+ * ─── Manual review queue ─────────────────────────────────────────────────────────
+ *
+ * R6: the legacy non-atomic createManualReviewRequest() and decideManualReview() store
+ * methods were REMOVED. Review requests are created via review.server.createReviewRequest
+ * (policy-bound identity), and the ONLY terminal decision path is the atomic RPC
+ * qhub_decide_review (decideReviewAtomic below). No store method performs a non-atomic
+ * review-status mutation; the architecture test enforces this.
  */
-export async function createManualReviewRequest(
-  token: CommercialReadyToken,
-  input: ManualReviewRequest,
-  env: Record<string, string | undefined>,
-): Promise<void> {
-  const sb = mutator(token, env);
-  await sb.from('qhub_manual_review_requests').insert({
-    org_id: input.orgId,
-    project_id: input.projectId ?? null,
-    request_type: input.requestType,
-    reason: input.reason,
-    status: 'pending',
-    created_at: new Date().toISOString(),
-  });
-}
-
-/**
- * @qhub-service: REQUIRES_COMMERCIAL_READY_TOKEN
- */
-export async function decideManualReview(
-  token: CommercialReadyToken,
-  input: { requestId: string; decision: 'approved' | 'rejected'; actor: string; reason: string },
-  env: Record<string, string | undefined>,
-): Promise<void> {
-  const sb = mutator(token, env);
-  await sb
-    .from('qhub_manual_review_requests')
-    .update({
-      status: input.decision,
-      decided_by: input.actor,
-      decision_reason: input.reason,
-      decided_at: new Date().toISOString(),
-    })
-    .eq('id', input.requestId);
-}
 
 // ─── Entitlement-change audit ────────────────────────────────────────────────────
 

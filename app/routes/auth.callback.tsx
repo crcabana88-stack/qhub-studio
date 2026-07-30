@@ -1,3 +1,4 @@
+// @qhub-route: PUBLIC_SAFE
 /**
  * QHUB Studio — Supabase OAuth Callback
  * app/routes/auth.callback.tsx
@@ -21,13 +22,18 @@ export async function loader({ request, context }: LoaderFunctionArgs) {
   const next = url.searchParams.get('next') ?? '/';
 
   if (!code) {
-    // Diagnostic: Supabase redirects back with ?error=... (no code) when the
-    // redirect URL isn't allow-listed or the provider flow failed.
+    /*
+     * Diagnostic: Supabase redirects back with ?error=... (no code) when the
+     * redirect URL isn't allow-listed or the provider flow failed.
+     */
     console.warn(
       '[Auth] callback missing code —',
-      'error=', url.searchParams.get('error'),
-      'error_code=', url.searchParams.get('error_code'),
-      'error_description=', url.searchParams.get('error_description'),
+      'error=',
+      url.searchParams.get('error'),
+      'error_code=',
+      url.searchParams.get('error_code'),
+      'error_description=',
+      url.searchParams.get('error_description'),
     );
     return redirect('/login?error=no_code');
   }

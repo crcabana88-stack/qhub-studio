@@ -1,3 +1,4 @@
+// @qhub-route: INTERNAL_SERVER_ONLY
 import { json, type LoaderFunction, type LoaderFunctionArgs } from '@remix-run/cloudflare';
 import { requireStaff } from '~/lib/qhub/commercial/commercial-context.server';
 

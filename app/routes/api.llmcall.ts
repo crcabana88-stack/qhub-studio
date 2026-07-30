@@ -1,3 +1,4 @@
+// @qhub-route: INTERNAL_SERVER_ONLY
 import { type ActionFunctionArgs } from '@remix-run/cloudflare';
 import { requireStaff } from '~/lib/qhub/commercial/commercial-context.server';
 import { streamText } from '~/lib/.server/llm/stream-text';

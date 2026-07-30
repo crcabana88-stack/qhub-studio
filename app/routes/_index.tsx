@@ -1,3 +1,4 @@
+// @qhub-route: PUBLIC_SAFE
 import { json, type MetaFunction } from '@remix-run/cloudflare';
 import { ClientOnly } from 'remix-utils/client-only';
 import { BaseChat } from '~/components/chat/BaseChat';
@@ -6,7 +7,10 @@ import { Header } from '~/components/header/Header';
 import BackgroundRays from '~/components/ui/BackgroundRays';
 
 export const meta: MetaFunction = () => {
-  return [{ title: 'QHUB Studio' }, { name: 'description', content: 'QHUB Studio — Governed AI App Builder by Quantex Technologies' }];
+  return [
+    { title: 'QHUB Studio' },
+    { name: 'description', content: 'QHUB Studio — Governed AI App Builder by Quantex Technologies' },
+  ];
 };
 
 export const loader = () => json({});

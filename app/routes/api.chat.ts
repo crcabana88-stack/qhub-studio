@@ -1,3 +1,4 @@
+// @qhub-route: INTERNAL_SERVER_ONLY
 import { type ActionFunctionArgs } from '@remix-run/cloudflare';
 import { requireStaff } from '~/lib/qhub/commercial/commercial-context.server';
 import { generateStableSessionId } from '~/lib/qhub/session-id.server';

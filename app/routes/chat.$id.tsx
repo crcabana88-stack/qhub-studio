@@ -1,3 +1,4 @@
+// @qhub-route: PUBLIC_SAFE
 import { json, type LoaderFunctionArgs } from '@remix-run/cloudflare';
 import { default as IndexRoute } from './_index';
 

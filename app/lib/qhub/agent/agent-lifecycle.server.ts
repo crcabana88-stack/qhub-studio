@@ -147,3 +147,6 @@ export async function killSwitchAgent(input: {
 
   return { ok: true };
 }
+
+/** AST-readable module authority classification (commercial-architecture.test.ts). */
+export const __QHUB_MODULE_CLASSIFICATION = 'INTERNAL_SERVER_ONLY' as const;

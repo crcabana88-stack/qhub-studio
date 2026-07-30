@@ -3,43 +3,47 @@
  * QHUB startup preflight — scripts/startup-preflight.mjs
  *
  * Process-startup enforcement (layer B of the deployment preflight). Runs BEFORE the
- * server starts serving. In a DEPLOYED target (staging/production, or a Fly prod marker)
- * it runs the full schema verification (Gate 01–05 + Agent Foundation + Commercial R4)
- * via scripts/schema-smoke-check.mjs and PROPAGATES its exit code — so a NOT_READY /
- * UNAVAILABLE schema makes the process exit nonzero and the server starts in a closed,
- * non-serving state. It never silently continues on failure in staging/production.
+ * server serves. The deployment environment is parsed by the ONE shared fail-closed
+ * parser (scripts/deploy-env.mjs):
  *
- * In a non-deployed local/test target the startup preflight is advisory (exit 0) — the
- * runtime commercial fail-closed service boundary still protects every commercial route —
- * so local development is not bricked by an intentionally-unapplied migration.
+ *   - DEPLOYED (staging/production): runs the full schema verification (Gate 01–05 + Agent
+ *     Foundation + Commercial R4) via schema-smoke-check.mjs and PROPAGATES its exit code,
+ *     so a NOT_READY/UNAVAILABLE schema makes the process exit nonzero and the server starts
+ *     in a closed, non-serving state. Never silently continues on failure.
+ *   - INVALID (missing / empty / unknown / misspelled / mixed-case): CONFIGURATION_ERROR →
+ *     exits nonzero. A misspelled environment can NEVER fail open into a serving state.
+ *   - LOCAL (local/test): advisory (exit 0) — the runtime commercial fail-closed boundary
+ *     still protects every commercial route, so local development is not bricked.
  */
 
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
+import { parseDeployEnv } from './deploy-env.mjs';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const smoke = join(here, 'schema-smoke-check.mjs');
 
-const deployEnv = (process.env.QHUB_DEPLOY_ENV ?? '').toLowerCase();
-const flyApp = (process.env.FLY_APP_NAME ?? '').toLowerCase();
-const isDeployedTarget =
-  deployEnv === 'staging' ||
-  deployEnv === 'preview' ||
-  deployEnv === 'production' ||
-  deployEnv === 'prod' ||
-  flyApp.includes('staging') ||
-  flyApp.includes('prod');
+const parsed = parseDeployEnv(process.env.QHUB_DEPLOY_ENV);
 
-if (!isDeployedTarget) {
+if (parsed.kind === 'INVALID') {
+  console.error(
+    `[startup-preflight] FAIL (CONFIGURATION_ERROR / ${parsed.code}): QHUB_DEPLOY_ENV must be exactly ` +
+      'one of local|test|staging|production. A missing/unknown/misspelled/mixed-case environment can never ' +
+      'serve commercial traffic (fail-closed).',
+  );
+  process.exit(1);
+}
+
+if (parsed.kind === 'LOCAL') {
   console.warn(
-    `[startup-preflight] non-deployed target (QHUB_DEPLOY_ENV=${deployEnv || 'unset'}). ` +
-      'Schema preflight is advisory here; the runtime commercial fail-closed boundary still applies.',
+    `[startup-preflight] non-deployed target (QHUB_DEPLOY_ENV=${parsed.env}). Schema preflight is advisory ` +
+      'here; the runtime commercial fail-closed boundary still applies.',
   );
   process.exit(0);
 }
 
-console.log(`[startup-preflight] deployed target (QHUB_DEPLOY_ENV=${deployEnv}). Running schema verification…`);
+console.log(`[startup-preflight] deployed target (QHUB_DEPLOY_ENV=${parsed.env}). Running schema verification…`);
 
 const res = spawnSync(process.execPath, [smoke], { stdio: 'inherit' });
 

@@ -1,3 +1,4 @@
+// @qhub-route: PUBLIC_SAFE
 /**
  * QHUB Studio — Login Page
  * app/routes/login.tsx
@@ -52,10 +53,7 @@ export async function action({ request, context }: ActionFunctionArgs) {
   }
 
   // ── Google OAuth (default) ───────────────────────────────────────────────────
-  const siteUrl =
-    env.SITE_URL ??
-    process.env.SITE_URL ??
-    (request.headers.get('Origin') || 'http://localhost:5173');
+  const siteUrl = env.SITE_URL ?? process.env.SITE_URL ?? (request.headers.get('Origin') || 'http://localhost:5173');
 
   const { data, error } = await supabase.auth.signInWithOAuth({
     provider: 'google',
@@ -71,7 +69,7 @@ export async function action({ request, context }: ActionFunctionArgs) {
 
 // ── Loader: if already authed, skip login ────────────────────────────────────
 
-export async function loader({ request, context }: LoaderFunctionArgs) {
+export async function loader({ context }: LoaderFunctionArgs) {
   const env = (context.cloudflare?.env as unknown as Record<string, string | undefined>) ?? {};
   const supabaseUrl = env.SUPABASE_URL ?? process.env.SUPABASE_URL ?? '';
 
@@ -118,9 +116,7 @@ export default function LoginPage() {
             <rect x="13" y="10" width="6" height="20" rx="1.5" fill="#1D9E75" />
             <rect x="24" y="2" width="6" height="28" rx="1.5" fill="#1D9E75" />
           </svg>
-          <span style={{ fontSize: 24, fontWeight: 700, letterSpacing: '-0.02em', color: '#fff' }}>
-            QHUB Studio
-          </span>
+          <span style={{ fontSize: 24, fontWeight: 700, letterSpacing: '-0.02em', color: '#fff' }}>QHUB Studio</span>
         </div>
         <span style={{ fontSize: 13, color: 'rgba(255,255,255,0.45)', letterSpacing: '0.06em' }}>
           by Quantex Technologies
@@ -275,7 +271,9 @@ export default function LoginPage() {
           </button>
         </Form>
 
-        <p style={{ fontSize: 12, color: 'rgba(255,255,255,0.3)', textAlign: 'center', marginTop: 24, marginBottom: 0 }}>
+        <p
+          style={{ fontSize: 12, color: 'rgba(255,255,255,0.3)', textAlign: 'center', marginTop: 24, marginBottom: 0 }}
+        >
           Access is limited to authorized Quantex organizations.
           <br />
           Contact{' '}

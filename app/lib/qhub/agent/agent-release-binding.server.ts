@@ -115,3 +115,6 @@ export async function checkReleaseBinding(
 
   return { release_approved: approved, release_stale: stale, manifest_matches_release: matches, reason };
 }
+
+/** AST-readable module authority classification (commercial-architecture.test.ts). */
+export const __QHUB_MODULE_CLASSIFICATION = 'INTERNAL_SERVER_ONLY' as const;

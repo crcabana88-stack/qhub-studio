@@ -347,6 +347,64 @@ describe('runtime-unforgeable token — forgery probes (isolated negative tests)
     expect(() => assertReadyToken(real, ENV)).not.toThrow();
   });
 
+  /*
+   * R6: authoritative metadata is in a module-private WeakMap, so mutating the object is
+   * INEFFECTIVE — it can never make a token valid for a different target/expiry.
+   */
+  it('property mutation cannot re-target a genuine token', () => {
+    const real = __mintReadyTokenForTests(ENV);
+
+    try {
+      (real as unknown as Record<string, unknown>).targetDigest = commercialTargetDigest(ENV_PROD);
+      (real as unknown as Record<string, unknown>).deployEnv = 'production';
+      (real as unknown as Record<string, unknown>).expiresAt = Number.MAX_SAFE_INTEGER;
+    } catch {
+      /* frozen object may throw in strict mode — either way authorization is unaffected */
+    }
+
+    expect(() => assertReadyToken(real, ENV_PROD)).toThrow(CommercialNotReadyError); // still wrong target
+    expect(() => assertReadyToken(real, ENV)).not.toThrow(); // still valid for its own target
+  });
+
+  it('Object.defineProperty cannot re-target a genuine token', () => {
+    const real = __mintReadyTokenForTests(ENV);
+
+    try {
+      Object.defineProperty(real, 'targetDigest', { value: commercialTargetDigest(ENV_PROD), configurable: true });
+    } catch {
+      /* frozen */
+    }
+
+    expect(() => assertReadyToken(real, ENV_PROD)).toThrow(CommercialNotReadyError);
+  });
+
+  it('Object.assign cannot re-target a genuine token', () => {
+    const real = __mintReadyTokenForTests(ENV);
+
+    try {
+      Object.assign(real as object, { targetDigest: commercialTargetDigest(ENV_PROD), deployEnv: 'production' });
+    } catch {
+      /* frozen */
+    }
+
+    expect(() => assertReadyToken(real, ENV_PROD)).toThrow(CommercialNotReadyError);
+  });
+
+  it('a Proxy wrapping a genuine token is rejected (different object identity)', () => {
+    const real = __mintReadyTokenForTests(ENV);
+    const proxied = new Proxy(real as object, {}) as never;
+
+    expect(() => assertReadyToken(proxied, ENV)).toThrow(/readiness_token_forged/);
+  });
+
+  it('a genuine token object exposes NO authorization fields (metadata is private)', () => {
+    const real = __mintReadyTokenForTests(ENV) as unknown as Record<string, unknown>;
+    expect(real.targetDigest).toBeUndefined();
+    expect(real.expiresAt).toBeUndefined();
+    expect(real.schemaVersion).toBeUndefined();
+    expect(Object.isFrozen(real)).toBe(true);
+  });
+
   it('the server clock cannot be overridden in production', () => {
     const prev = process.env.NODE_ENV;
     process.env.NODE_ENV = 'production';
@@ -425,14 +483,15 @@ describe('predeploy schema smoke check wires the commercial verifier (additive)'
     expect(script).toContain('2026-07-27.agent-foundation');
   });
 
-  it('has NO staging/production skip — only a local-test bypass exists', () => {
-    // The old staging bypass ("authorized-staging-bypass") must be gone.
+  it('has NO staging/production skip — driven by the fail-closed deploy-env enum', () => {
     expect(script).not.toMatch(/authorized-staging-bypass/);
-    expect(script).toMatch(/localTestBypassDecision/);
+    expect(script).toMatch(/schemaCheckDecision/);
+    expect(script).toMatch(/parseDeployEnv/);
     expect(script).toMatch(/QHUB_LOCAL_TEST_SCHEMA_BYPASS/);
 
-    // A deployed target can never bypass.
+    // A deployed target can never bypass; an invalid env is a CONFIGURATION_ERROR.
     expect(script).toMatch(/deployed-target-never-bypasses/);
+    expect(script).toMatch(/CONFIG_ERROR/);
   });
 
   it('local-test bypass requires NODE_ENV=test AND the explicit test-only flag', () => {

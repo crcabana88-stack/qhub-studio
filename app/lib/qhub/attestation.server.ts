@@ -574,3 +574,6 @@ export async function evaluateReleaseForDeployment(input: EvalInput): Promise<Ev
     release_candidate_hash: rc.release_candidate_hash,
   };
 }
+
+/** AST-readable module authority classification (commercial-architecture.test.ts). */
+export const __QHUB_MODULE_CLASSIFICATION = 'INTERNAL_SERVER_ONLY' as const;

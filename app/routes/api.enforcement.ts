@@ -1,3 +1,4 @@
+// @qhub-route: INTERNAL_SERVER_ONLY
 /**
  * QHUB Gate 04 — Approval & kill-switch management
  * app/routes/api.enforcement.ts

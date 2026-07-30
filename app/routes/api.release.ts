@@ -1,3 +1,4 @@
+// @qhub-route: INTERNAL_SERVER_ONLY
 /**
  * QHUB Gate 05 — Release readiness, attestation & deployment authorization
  * app/routes/api.release.ts

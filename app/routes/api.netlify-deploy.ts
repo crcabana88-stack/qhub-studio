@@ -1,3 +1,4 @@
+// @qhub-route: INTERNAL_SERVER_ONLY
 import { type ActionFunctionArgs, json } from '@remix-run/cloudflare';
 import crypto from 'crypto';
 import { requireStaff } from '~/lib/qhub/commercial/commercial-context.server';

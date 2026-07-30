@@ -1,3 +1,4 @@
+// @qhub-route: PUBLIC_SAFE
 import { json, type ActionFunctionArgs } from '@remix-run/cloudflare';
 import { Octokit } from '@octokit/rest';
 import { z } from 'zod';

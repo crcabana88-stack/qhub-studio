@@ -45,6 +45,18 @@ jobs:
         env:
           NODE_ENV: production
 
+      # Schema preflight (Gate 01–05 + Agent Foundation + Commercial R4) MUST pass before a
+      # preview deploy. Preview is a DEPLOYED target (QHUB_DEPLOY_ENV=staging) so the smoke
+      # check runs every verifier family and fails closed — no preview can serve commercial
+      # traffic against an unmigrated project. There is no skip flag for preview.
+      - name: Schema preflight (Gate + Agent + Commercial)
+        if: steps.check-secrets.outputs.configured == 'true'
+        run: node scripts/schema-smoke-check.mjs
+        env:
+          QHUB_DEPLOY_ENV: staging
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+
       - name: Deploy to Cloudflare Pages
         if: steps.check-secrets.outputs.configured == 'true'
         id: deploy

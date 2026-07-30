@@ -18,9 +18,9 @@ import type { CommercialExecutionContext } from '~/lib/qhub/commercial/commercia
 import { hasCapability, type Capability } from '~/lib/qhub/commercial/capabilities';
 import { assertReadyToken, type CommercialReadyToken } from '~/lib/qhub/commercial/commercial-schema-check.server';
 import {
+  assertCurrentReviewAuthorization,
   getGovernanceRecord,
   isModelInvocationAllowed,
-  isPublicationAllowed,
 } from '~/lib/qhub/commercial/governance-essentials.server';
 import { consumeBuildCredit, type CreditResult } from '~/lib/qhub/commercial/commercial-store.server';
 
@@ -224,6 +224,18 @@ export async function exportCommercialProject(
     return { ok: false, reason: 'schema_not_ready' };
   }
 
+  /*
+   * R6: evidence export requires a review that is valid for the CURRENT policy version — a
+   * stale approval (decided under an older policy) cannot authorize. Checked BEFORE any
+   * export side effect.
+   */
+  const gov = await getGovernanceRecord(ctx.projectOrgId, ctx.projectId, env);
+  const auth = assertCurrentReviewAuthorization(gov);
+
+  if (!auth.ok) {
+    return { ok: false, reason: `review_${auth.reason}` };
+  }
+
   return { ok: true, value: { projectId: ctx.projectId } };
 }
 
@@ -248,10 +260,18 @@ export async function requestCommercialPublication(
     return { ok: false, reason: 'schema_not_ready' };
   }
 
+  /*
+   * R6: publication requires a review valid for the CURRENT policy version (or a clean
+   * proceed disposition). A stale approval fails BEFORE any publication side effect.
+   */
   const gov = await getGovernanceRecord(ctx.projectOrgId, ctx.projectId, env);
+  const auth = assertCurrentReviewAuthorization(gov);
 
-  // Publication requires an approved review (or a clean proceed disposition).
-  return { ok: true, value: { projectId: ctx.projectId, publishable: isPublicationAllowed(gov) } };
+  if (!auth.ok) {
+    return { ok: false, reason: `review_${auth.reason}` };
+  }
+
+  return { ok: true, value: { projectId: ctx.projectId, publishable: true } };
 }
 
 /** AST-readable module authority classification (commercial-architecture.test.ts). */

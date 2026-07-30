@@ -1,3 +1,4 @@
+// @qhub-route: PUBLIC_SAFE
 import { type LoaderFunction } from '@remix-run/cloudflare';
 
 export const loader: LoaderFunction = async ({ request }) => {

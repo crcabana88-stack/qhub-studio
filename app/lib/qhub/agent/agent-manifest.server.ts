@@ -233,3 +233,6 @@ export function computeManifestHash(manifest: AgentManifest): string {
 
   return sha256(canonicalAgentManifestString(material));
 }
+
+/** AST-readable module authority classification (commercial-architecture.test.ts). */
+export const __QHUB_MODULE_CLASSIFICATION = 'INTERNAL_SERVER_ONLY' as const;

@@ -795,3 +795,6 @@ export async function resumeAgentRun(input: {
 
   return driveRun({ ...ctx, startStep: stepIndex + 1, priorResults: [decision.result], counters });
 }
+
+/** AST-readable module authority classification (commercial-architecture.test.ts). */
+export const __QHUB_MODULE_CLASSIFICATION = 'INTERNAL_SERVER_ONLY' as const;

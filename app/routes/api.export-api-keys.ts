@@ -1,3 +1,4 @@
+// @qhub-route: INTERNAL_SERVER_ONLY
 /**
  * QHUB Commercial Launch R4 — GET /api/export-api-keys  (STAFF-ONLY, no secrets)
  * app/routes/api.export-api-keys.ts

@@ -1,3 +1,4 @@
+// @qhub-route: INTERNAL_SERVER_ONLY
 /**
  * QHUB Gate 02 — Classification analysis endpoint
  * app/routes/api.classify.ts

@@ -26,9 +26,9 @@ import { createHash } from 'node:crypto';
  * @returns 'studio-{12 hex chars}'
  */
 export function generateStableSessionId(userId: string, conversationId: string): string {
-  const hash = createHash('sha256')
-    .update(`${userId}:${conversationId}`)
-    .digest('hex')
-    .slice(0, 12);
+  const hash = createHash('sha256').update(`${userId}:${conversationId}`).digest('hex').slice(0, 12);
   return `studio-${hash}`;
 }
+
+/** AST-readable module authority classification (commercial-architecture.test.ts). */
+export const __QHUB_MODULE_CLASSIFICATION = 'INTERNAL_SERVER_ONLY' as const;

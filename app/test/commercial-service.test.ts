@@ -41,7 +41,9 @@ import {
   invokeCommercialModel,
   canonicalRequestHash,
   exportCommercialProject,
+  requestCommercialPublication,
 } from '~/lib/qhub/commercial/commercial-service.server';
+import { currentReviewPolicyVersion } from '~/lib/qhub/commercial/governance-essentials';
 
 function execCtx(caps: string[] = ['MODEL_INVOKE', 'CODE_EXPORT']): CommercialExecutionContext {
   return {
@@ -74,6 +76,7 @@ const goodGov: GovernanceRecord = {
   acknowledged: true,
   reviewState: 'none',
   riskTier: 'T1',
+  reviewPolicyVersion: null,
 };
 
 const req = {
@@ -183,5 +186,54 @@ describe('exportCommercialProject', () => {
 
     const r = await exportCommercialProject(execCtx(['CODE_EXPORT']), TOKEN, {});
     expect(r.ok === false && r.reason).toBe('schema_not_ready');
+  });
+});
+
+describe('R6 current-policy authorization blocks stale reviews BEFORE side effects', () => {
+  // An approval decided under an OLDER policy version — stale, cannot authorize.
+  const staleApproval: GovernanceRecord = {
+    projectId: 'p1',
+    orgId: 'org1',
+    disposition: 'manual_review',
+    declarationComplete: true,
+    acknowledged: true,
+    reviewState: 'approved',
+    riskTier: 'T1',
+    reviewPolicyVersion: '2020-01-01.old-policy',
+  };
+  const currentApproval: GovernanceRecord = { ...staleApproval, reviewPolicyVersion: currentReviewPolicyVersion() };
+
+  it('build/model is blocked on a stale approval (no credit consumed, no model run)', async () => {
+    H.getGov.mockResolvedValue(staleApproval);
+
+    let ran = false;
+    const r = await invokeCommercialModel(execCtx(), req, 'k1', TOKEN, {}, async () => {
+      ran = true;
+      return 'x';
+    });
+    expect(r.ok === false && r.reason).toBe('governance_gate_blocked');
+    expect(H.consume).not.toHaveBeenCalled();
+    expect(ran).toBe(false);
+  });
+
+  it('evidence export is blocked on a stale approval', async () => {
+    H.getGov.mockResolvedValue(staleApproval);
+
+    const r = await exportCommercialProject(execCtx(['CODE_EXPORT']), TOKEN, {});
+    expect(r.ok === false && r.reason).toBe('review_review_stale_policy');
+  });
+
+  it('publication is blocked on a stale approval', async () => {
+    H.getGov.mockResolvedValue(staleApproval);
+
+    const r = await requestCommercialPublication(execCtx(['PUBLISH_REQUEST'] as never), TOKEN, {});
+    expect(r.ok === false && r.reason).toBe('review_review_stale_policy');
+  });
+
+  it('a current-policy approval authorizes export + publication', async () => {
+    H.getGov.mockResolvedValue(currentApproval);
+
+    expect((await exportCommercialProject(execCtx(['CODE_EXPORT']), TOKEN, {})).ok).toBe(true);
+    expect((await requestCommercialPublication(execCtx(['PUBLISH_REQUEST'] as never), TOKEN, {})).ok).toBe(true);
   });
 });

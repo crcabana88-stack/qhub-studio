@@ -1,3 +1,4 @@
+// @qhub-route: PUBLIC_SAFE
 /**
  * QHUB Commercial Launch — /builder
  * app/routes/builder.tsx

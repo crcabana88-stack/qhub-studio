@@ -1,3 +1,4 @@
+// @qhub-route: INTERNAL_SERVER_ONLY
 /**
  * QHUB Commercial Launch — GET /api/entitlements
  * app/routes/api.entitlements.ts

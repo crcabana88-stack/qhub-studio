@@ -1,3 +1,4 @@
+// @qhub-route: INTERNAL_SERVER_ONLY
 /**
  * QHUB build identity diagnostic — app/routes/api.system.build-info.ts
  *

@@ -1,3 +1,4 @@
+// @qhub-route: PUBLIC_SAFE
 /**
  * QHUB Commercial Launch — /governance-essentials
  * app/routes/governance-essentials.tsx

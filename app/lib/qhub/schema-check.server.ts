@@ -350,3 +350,6 @@ export async function assertGovernanceSchemaReady(env: Record<string, string | u
     throw new SchemaNotReadyError(report);
   }
 }
+
+/** AST-readable module authority classification (commercial-architecture.test.ts). */
+export const __QHUB_MODULE_CLASSIFICATION = 'INTERNAL_SERVER_ONLY' as const;

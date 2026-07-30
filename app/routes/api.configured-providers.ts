@@ -1,4 +1,7 @@
-// @qhub-boundary: PUBLIC_SAFE — read-only non-secret status (booleans / provider names / model list); returns no key values.
+/*
+ * @qhub-route: INTERNAL_SERVER_ONLY
+ * @qhub-boundary: PUBLIC_SAFE — read-only non-secret status (booleans / provider names / model list); returns no key values.
+ */
 import type { LoaderFunction } from '@remix-run/cloudflare';
 import { json } from '@remix-run/cloudflare';
 import { LLMManager } from '~/lib/modules/llm/manager';

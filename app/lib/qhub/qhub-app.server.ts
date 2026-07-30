@@ -1,3 +1,4 @@
+/* eslint-disable @typescript-eslint/naming-convention -- pre-existing DB-mapped snake_case / private-method naming; unrelated to R6 (module is only annotated with __QHUB_MODULE_CLASSIFICATION) */
 /**
  * QHUB Application Identity — SERVER ONLY
  * app/lib/qhub/qhub-app.server.ts
@@ -642,3 +643,6 @@ export async function updatePolicyStatus(
     }
   }
 }
+
+/** AST-readable module authority classification (commercial-architecture.test.ts). */
+export const __QHUB_MODULE_CLASSIFICATION = 'INTERNAL_SERVER_ONLY' as const;

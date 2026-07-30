@@ -15,6 +15,7 @@ import type { CommercialContext } from '~/lib/qhub/commercial/commercial-context
 import type { RiskTier } from '~/lib/qhub/classification';
 import { assertReadyToken, type CommercialReadyToken } from '~/lib/qhub/commercial/commercial-schema-check.server';
 import {
+  currentReviewPolicyVersion,
   evaluateGovernanceEssentials,
   type DataClass,
   type Disposition,
@@ -65,6 +66,9 @@ export interface GovernanceRecord {
   acknowledged: boolean;
   reviewState: 'none' | 'requested' | 'approved' | 'rejected';
   riskTier: RiskTier;
+
+  /** The SERVER policy version the current approval was decided under (R6 currency check). */
+  reviewPolicyVersion: string | null;
 }
 
 /**
@@ -145,6 +149,9 @@ export async function upsertDeclaration(
     acknowledged: false,
     reviewState,
     riskTier: input.riskTier,
+
+    // A fresh declaration has no decided review yet (any prior approval was invalidated).
+    reviewPolicyVersion: null,
   };
 }
 
@@ -211,7 +218,9 @@ export async function getGovernanceRecord(
   const sb = admin(env);
   const { data } = await sb
     .from('qhub_governance_essentials')
-    .select('project_id,org_id,disposition,declaration_complete,acknowledged,review_state,risk_tier')
+    .select(
+      'project_id,org_id,disposition,declaration_complete,acknowledged,review_state,risk_tier,review_policy_version',
+    )
     .eq('project_id', projectId)
     .eq('org_id', orgId)
     .maybeSingle();
@@ -228,38 +237,70 @@ export async function getGovernanceRecord(
     acknowledged: !!data.acknowledged,
     reviewState: (data.review_state as GovernanceRecord['reviewState']) ?? 'none',
     riskTier: (data.risk_tier as RiskTier) ?? 'UNCLASSIFIED',
+    reviewPolicyVersion: (data.review_policy_version as string) ?? null,
   };
 }
 
 /**
  * @qhub-service: PURE_NO_IO
- * Model invocation requires a complete + acknowledged declaration that may proceed.
+ * R6: the SINGLE current-policy authorization check every protected reviewed operation
+ * (model/build, publication, evidence export) must call. It requires a complete +
+ * acknowledged declaration and — crucially — that any review approval was decided under
+ * the EXACT current server policy version. An approval made under an older policy is STALE
+ * and cannot authorize; a clean 'proceed' disposition needs no review. The browser can
+ * never influence the policy version (it is server-derived).
  */
-export function isModelInvocationAllowed(rec: GovernanceRecord | null): boolean {
+export function assertCurrentReviewAuthorization(rec: GovernanceRecord | null): { ok: boolean; reason: string } {
   if (!rec) {
-    return false;
+    return { ok: false, reason: 'no_governance_record' };
   }
 
-  const dispositionOk =
-    rec.disposition === 'proceed' || (rec.disposition === 'manual_review' && rec.reviewState === 'approved');
+  if (!rec.declarationComplete) {
+    return { ok: false, reason: 'declaration_incomplete' };
+  }
 
-  return rec.declarationComplete && rec.acknowledged && dispositionOk;
+  if (!rec.acknowledged) {
+    return { ok: false, reason: 'acknowledgment_required' };
+  }
+
+  if (rec.disposition === 'prohibited' || rec.disposition === 'blocked') {
+    return { ok: false, reason: 'disposition_blocked' };
+  }
+
+  // A clean proceed disposition needs no manual review.
+  if (rec.disposition === 'proceed') {
+    return { ok: true, reason: 'proceed' };
+  }
+
+  // manual_review: an APPROVED review is required, AND it must be for the CURRENT policy.
+  if (rec.reviewState !== 'approved') {
+    return { ok: false, reason: 'review_required' };
+  }
+
+  if (rec.reviewPolicyVersion !== currentReviewPolicyVersion()) {
+    // Stale approval: the applicable policy changed since the review was decided.
+    return { ok: false, reason: 'review_stale_policy' };
+  }
+
+  return { ok: true, reason: 'approved_current_policy' };
 }
 
 /**
  * @qhub-service: PURE_NO_IO
- * Publication requires an approved review (or a clean proceed disposition).
+ * Model invocation requires a complete + acknowledged declaration that may proceed under
+ * the CURRENT policy (a stale approval cannot authorize).
+ */
+export function isModelInvocationAllowed(rec: GovernanceRecord | null): boolean {
+  return assertCurrentReviewAuthorization(rec).ok;
+}
+
+/**
+ * @qhub-service: PURE_NO_IO
+ * Publication requires an approved review valid for the CURRENT policy (or a clean proceed
+ * disposition).
  */
 export function isPublicationAllowed(rec: GovernanceRecord | null): boolean {
-  if (!rec) {
-    return false;
-  }
-
-  if (rec.disposition === 'prohibited' || rec.disposition === 'blocked') {
-    return false;
-  }
-
-  return rec.reviewState === 'approved' || rec.disposition === 'proceed';
+  return assertCurrentReviewAuthorization(rec).ok;
 }
 
 /**

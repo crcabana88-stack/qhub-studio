@@ -1,3 +1,4 @@
+// @qhub-route: PUBLIC_SAFE
 import { json, type LoaderFunction, type LoaderFunctionArgs } from '@remix-run/cloudflare';
 
 interface GitInfo {

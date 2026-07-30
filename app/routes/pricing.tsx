@@ -1,3 +1,4 @@
+// @qhub-route: PUBLIC_SAFE
 /**
  * QHUB Commercial Launch — pricing (/pricing)
  * app/routes/pricing.tsx

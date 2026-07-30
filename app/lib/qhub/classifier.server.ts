@@ -1,3 +1,4 @@
+/* eslint-disable @typescript-eslint/naming-convention -- pre-existing DB-mapped snake_case / private-method naming; unrelated to R6 (module is only annotated with __QHUB_MODULE_CLASSIFICATION) */
 /**
  * QHUB Gate 02 — AI classifier (SERVER ONLY)
  * app/lib/qhub/classifier.server.ts
@@ -77,6 +78,7 @@ function keepValid<T>(value: unknown, allowed: T[]): T[] {
   if (!Array.isArray(value)) {
     return [];
   }
+
   return value.filter((v): v is T => allowed.includes(v as T));
 }
 
@@ -113,9 +115,11 @@ When uncertain, choose the HIGHER tier. Regulatory domains are applicability tag
 function extractJson(text: string): Record<string, unknown> | null {
   const start = text.indexOf('{');
   const end = text.lastIndexOf('}');
+
   if (start === -1 || end === -1 || end <= start) {
     return null;
   }
+
   try {
     return JSON.parse(text.slice(start, end + 1)) as Record<string, unknown>;
   } catch {
@@ -139,45 +143,58 @@ function heuristicSignals(description: string): { signals: ClassificationSignals
     integration_types.push('TRADING_OR_ORDERS');
     regulatory_domains.push('SEC', 'FINRA');
   }
+
   if (has('payment', 'transfer money', 'move money', 'wire', 'ach', 'disburse', 'payout')) {
     integration_types.push('PAYMENTS_OR_TRANSFERS');
   }
+
   if (has('email customer', 'send email', 'sms', 'notify client', 'outreach', 'send message to')) {
     integration_types.push('OUTBOUND_COMMUNICATION');
   }
+
   if (has('client', 'customer', 'account holder', 'investor')) {
     data_classes.push('CLIENT_PII');
   }
+
   if (has('trade data', 'transaction', 'commission', 'settlement', 'reconcile', 'reconciliation')) {
     data_classes.push('TRANSACTION_DATA');
   }
+
   if (has('books and records', 'recordkeeping', 'compliance record', 'audit record')) {
     data_classes.push('REGULATED_RECORDS');
     regulatory_domains.push('BOOKS_AND_RECORDS');
   }
+
   if (has('supervis', 'compliance workflow', 'surveillance')) {
     regulatory_domains.push('SUPERVISION');
   }
+
   if (has('recommend', 'advice', 'suitab')) {
     ai_behavior = has('financ', 'invest', 'portfolio', 'trade') ? 'FINANCIAL_RECOMMENDATION' : 'RECOMMENDATION';
   }
+
   if (has('autonomous', 'automatically execute', 'without human', 'agent that acts', 'auto-execute')) {
     autonomy_level = 'AUTONOMOUS';
     deployment_surface = 'PRODUCTION';
   }
+
   if (has('accounting', 'quickbooks', 'erp', 'salesforce', 'crm', 'system of record')) {
     integration_types.push('EXTERNAL_SYSTEM_OF_RECORD');
   }
+
   if (has('marketing', 'landing page', 'microsite', 'brochure', 'public website') && data_classes.length === 0) {
     data_classes.push('PUBLIC');
     deployment_surface = 'INTERNAL';
   }
+
   if (data_classes.length === 0) {
     data_classes.push('INTERNAL_BUSINESS');
   }
+
   if (integration_types.length === 0) {
     integration_types.push('NONE');
   }
+
   if (regulatory_domains.length === 0) {
     regulatory_domains.push('NONE_IDENTIFIED');
   }
@@ -191,6 +208,7 @@ function heuristicSignals(description: string): { signals: ClassificationSignals
     regulatory_domains,
   };
   const { floor } = computeRiskFloor(signals);
+
   return { signals, tier: floor };
 }
 
@@ -223,6 +241,7 @@ async function callAnthropicClassifier(
     const data = (await res.json()) as { content?: { type: string; text?: string }[] };
     const text = (data.content ?? []).map((c) => c.text ?? '').join('');
     const parsed = extractJson(text);
+
     if (!parsed) {
       return null;
     }
@@ -235,12 +254,15 @@ async function callAnthropicClassifier(
       deployment_surface: oneOf(parsed.deployment_surface, DEPLOYMENT_SURFACES, 'INTERNAL'),
       regulatory_domains: keepValid(parsed.regulatory_domains, REG_DOMAINS),
     };
+
     if (signals.data_classes.length === 0) {
       signals.data_classes = ['INTERNAL_BUSINESS'];
     }
+
     if (signals.integration_types.length === 0) {
       signals.integration_types = ['NONE'];
     }
+
     if (signals.regulatory_domains.length === 0) {
       signals.regulatory_domains = ['NONE_IDENTIFIED'];
     }
@@ -317,3 +339,6 @@ export async function classifyApplication(
     classifier_version: CLASSIFIER_VERSION,
   };
 }
+
+/** AST-readable module authority classification (commercial-architecture.test.ts). */
+export const __QHUB_MODULE_CLASSIFICATION = 'INTERNAL_SERVER_ONLY' as const;

@@ -1,3 +1,4 @@
+// @qhub-route: INTERNAL_SERVER_ONLY
 import { type ActionFunctionArgs, type LoaderFunctionArgs, json } from '@remix-run/cloudflare';
 import { requireStaff } from '~/lib/qhub/commercial/commercial-context.server';
 import type { VercelProjectInfo } from '~/types/vercel';

@@ -17,7 +17,7 @@
  * boundary (a deserialized object is not registered).
  */
 
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { json } from '@remix-run/cloudflare';
 import { createClient } from '@supabase/supabase-js';
 
@@ -165,52 +165,66 @@ export function commercialTargetKey(env: Record<string, string | undefined>): st
   return commercialTargetDigest(env);
 }
 
-// ─── Runtime-authentic readiness token ──────────────────────────────────────────
+// ─── Immutable, runtime-authentic readiness token ───────────────────────────────
 
 /**
- * The real token. A JS #private field brands the CLASS, and every minted instance is
- * registered in a module-private WeakSet. Authenticity is proven by registry membership
- * at validation time, so no forged/copied/cloned/cast object can pass.
+ * Authoritative token metadata. This is stored ONLY in a module-private WeakMap keyed by
+ * the token instance — never on the object itself — so it can never be read or written
+ * through object properties, defineProperty, Object.assign, spread, a Proxy, or a cast.
  */
-class ReadyToken {
-  readonly #authentic = true;
+interface TokenMeta {
   readonly schemaVersion: string;
   readonly targetDigest: string;
   readonly deployEnv: string;
   readonly verifierIdentity: string;
   readonly checkedAt: number;
   readonly expiresAt: number;
+  readonly nonce: string;
+}
 
-  constructor(env: Record<string, string | undefined>, now: number) {
-    this.schemaVersion = EXPECTED_COMMERCIAL_SCHEMA_VERSION;
-    this.targetDigest = commercialTargetDigest(env);
-    this.deployEnv = deploymentEnv(env);
-    this.verifierIdentity = VERIFIER_IDENTITY;
-    this.checkedAt = now;
-    this.expiresAt = now + TOKEN_TTL_MS;
+/**
+ * The token object itself carries NO authorization fields — a #private field only brands
+ * the class. All authority lives in the WeakMap. The instance is frozen as defense in
+ * depth, but freezing is not what makes it authentic; WeakMap membership is.
+ */
+class ReadyToken {
+  readonly #authentic = true;
+
+  constructor() {
     void this.#authentic;
+    Object.freeze(this);
   }
 }
 
-/** Only genuine, module-minted instances live here. */
-const tokenRegistry = new WeakSet<object>();
+/** token instance → immutable, frozen authoritative metadata (the source of truth). */
+const tokenMeta = new WeakMap<object, TokenMeta>();
 
 /**
- * Opaque handle. Application code receives this type but can never see the class or build
- * an instance — authenticity is a runtime property (registry membership), not a shape.
+ * Opaque handle. Application code receives this type but can never see the class, read its
+ * metadata, or build an instance — authenticity is a runtime property (WeakMap membership).
  */
 export type CommercialReadyToken = { readonly __commercialReadyToken: unique symbol };
 
 function mintReadyToken(env: Record<string, string | undefined>): CommercialReadyToken {
-  const t = new ReadyToken(env, clockNow());
-  tokenRegistry.add(t);
+  const now = clockNow();
+  const t = new ReadyToken();
+  const meta: TokenMeta = Object.freeze({
+    schemaVersion: EXPECTED_COMMERCIAL_SCHEMA_VERSION,
+    targetDigest: commercialTargetDigest(env),
+    deployEnv: deploymentEnv(env),
+    verifierIdentity: VERIFIER_IDENTITY,
+    checkedAt: now,
+    expiresAt: now + TOKEN_TTL_MS,
+    nonce: randomUUID(),
+  });
+  tokenMeta.set(t, meta);
 
   return t as unknown as CommercialReadyToken;
 }
 
 /**
- * Test-only mint of a GENUINE (registered) token. Throws in production. This is not an
- * `as` bypass — it produces an authentic registry-backed token, and only under test.
+ * Test-only mint of a GENUINE (WeakMap-registered) token. Throws in production. This is not
+ * an `as` bypass — it produces an authentic token, and only under test.
  */
 export function __mintReadyTokenForTests(env: Record<string, string | undefined>): CommercialReadyToken {
   if ((process.env.NODE_ENV ?? '').toLowerCase() === 'production') {
@@ -221,13 +235,14 @@ export function __mintReadyTokenForTests(env: Record<string, string | undefined>
 }
 
 /**
- * Re-validate a token at the mutation choke point. Throws CommercialNotReadyError on ANY
- * failure: forgery (not registry-backed), wrong schema version / verifier / target digest /
- * deployment environment, malformed or future checkedAt, expiry, or age beyond the TTL.
+ * Re-validate a token at the mutation choke point. Reads AUTHORITATIVE metadata from the
+ * WeakMap (never the object's properties), so mutation/defineProperty/assign/spread/Proxy/
+ * cast cannot influence authorization. Throws CommercialNotReadyError on ANY failure:
+ * forgery (not WeakMap-backed), wrong schema version / verifier / target digest / deployment
+ * environment, malformed or future checkedAt, expiry, or age beyond the TTL.
  */
 export function assertReadyToken(token: CommercialReadyToken, env: Record<string, string | undefined>): void {
   const now = clockNow();
-  const t = token as unknown as ReadyToken | null | undefined;
 
   const fail = (code: string): never => {
     throw new CommercialNotReadyError({
@@ -240,46 +255,53 @@ export function assertReadyToken(token: CommercialReadyToken, env: Record<string
   };
 
   /*
-   * 1. Runtime authenticity — the single non-bypassable check. Only module-minted class
-   * instances are registered; every forgery/clone/cast fails here.
+   * 1. Runtime authenticity — the single non-bypassable check. Only genuine minted
+   * instances are WeakMap keys; a Proxy, plain object, copy, clone, or cast is a DIFFERENT
+   * (or non-)object identity and has no metadata.
    */
-  if (!t || typeof t !== 'object' || !tokenRegistry.has(t)) {
+  const obj = token as unknown;
+  const rawMeta =
+    obj && (typeof obj === 'object' || typeof obj === 'function') ? tokenMeta.get(obj as object) : undefined;
+
+  if (!rawMeta) {
     fail('readiness_token_forged');
 
     return;
   }
 
-  // 2. Binding to the exact contract + target.
-  if (t.schemaVersion !== EXPECTED_COMMERCIAL_SCHEMA_VERSION) {
+  const meta = rawMeta;
+
+  // 2. Binding to the exact contract + target — read from the immutable WeakMap metadata.
+  if (meta.schemaVersion !== EXPECTED_COMMERCIAL_SCHEMA_VERSION) {
     fail('readiness_token_version');
   }
 
-  if (t.verifierIdentity !== VERIFIER_IDENTITY) {
+  if (meta.verifierIdentity !== VERIFIER_IDENTITY) {
     fail('readiness_token_verifier');
   }
 
-  if (t.targetDigest !== commercialTargetDigest(env)) {
+  if (meta.targetDigest !== commercialTargetDigest(env)) {
     fail('readiness_token_target');
   }
 
-  if (t.deployEnv !== deploymentEnv(env)) {
+  if (meta.deployEnv !== deploymentEnv(env)) {
     fail('readiness_token_env');
   }
 
   // 3. Freshness — checkedAt/expiresAt validated on every use, bounded by the cache TTL.
-  if (!Number.isFinite(t.checkedAt) || !Number.isFinite(t.expiresAt)) {
+  if (!Number.isFinite(meta.checkedAt) || !Number.isFinite(meta.expiresAt)) {
     fail('readiness_token_malformed');
   }
 
-  if (t.checkedAt > now + CLOCK_SKEW_MS) {
+  if (meta.checkedAt > now + CLOCK_SKEW_MS) {
     fail('readiness_token_future');
   }
 
-  if (now >= t.expiresAt) {
+  if (now >= meta.expiresAt) {
     fail('readiness_token_expired');
   }
 
-  if (now - t.checkedAt > TOKEN_TTL_MS + CLOCK_SKEW_MS) {
+  if (now - meta.checkedAt > TOKEN_TTL_MS + CLOCK_SKEW_MS) {
     fail('readiness_token_stale');
   }
 }

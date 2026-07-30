@@ -1,3 +1,4 @@
+// @qhub-route: PUBLIC_SAFE
 import { json, type ActionFunction } from '@remix-run/cloudflare';
 
 export const action: ActionFunction = async ({ request }) => {

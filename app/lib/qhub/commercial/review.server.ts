@@ -141,83 +141,13 @@ export async function createReviewRequest(
   return { ok: true, requestId: (data?.id as string) ?? '', idempotent: false };
 }
 
-/**
- * @qhub-service: REQUIRES_COMMERCIAL_READY_TOKEN
- * Decide a manual-review request. Requires an authoritative staff actor (isStaff). The
- * actor is derived from the staff context, never the browser. Prohibited categories
- * cannot be approved. The policy version is SERVER-DERIVED (never the browser): the
- * decision is bound to the version the request was evaluated under; if the current
- * policy changed materially, re-review is required.
+/*
+ * R6: the non-atomic decideReviewRequest() service was REMOVED. There is exactly ONE
+ * supported terminal review-decision path — the atomic RPC qhub_decide_review (invoked
+ * via commercial-store.decideReviewAtomic). No exported service performs a multi-update
+ * review decision; the architecture test enforces that no commercial service updates
+ * qhub_manual_review_requests outside the atomic RPC.
  */
-export async function decideReviewRequest(
-  ctx: CommercialContext,
-  input: { requestId: string; decision: 'approved' | 'rejected'; reason: string },
-  token: CommercialReadyToken,
-  env: Record<string, string | undefined>,
-): Promise<{ ok: true; policyVersion: string } | { ok: false; error: string }> {
-  if (!ctx.isStaff) {
-    return { ok: false, error: 'staff_required' };
-  }
-
-  const sb = mutator(token, env);
-  const { data: req } = await sb
-    .from('qhub_manual_review_requests')
-    .select('id,category,status,org_id,project_id,policy_version')
-    .eq('id', input.requestId)
-    .maybeSingle();
-
-  if (!req) {
-    return { ok: false, error: 'not_found' };
-  }
-
-  if (req.status !== 'pending') {
-    return { ok: false, error: 'not_pending' };
-  }
-
-  if (input.decision === 'approved' && req.category && PROHIBITED_CATEGORIES.has(req.category as string)) {
-    return { ok: false, error: 'prohibited_cannot_approve' };
-  }
-
-  /*
-   * SERVER-derived policy authority. The request's evaluated-under version is the bind
-   * target; a materially changed current policy forces re-review (no silent override).
-   */
-  const evaluatedVersion = (req.policy_version as string) ?? currentReviewPolicyVersion();
-
-  if (evaluatedVersion !== currentReviewPolicyVersion()) {
-    return { ok: false, error: 'policy_version_changed' };
-  }
-
-  const policyVersion = evaluatedVersion;
-
-  await sb
-    .from('qhub_manual_review_requests')
-    .update({
-      status: input.decision,
-      decided_by: ctx.userId, // authoritative staff user id
-      decision_reason: input.reason,
-      policy_version: policyVersion,
-      decided_at: new Date().toISOString(),
-    })
-    .eq('id', input.requestId);
-
-  // Atomically reflect the decision in the project's Governance Essentials workflow.
-  if (req.project_id) {
-    await sb
-      .from('qhub_governance_essentials')
-      .update({
-        review_state: input.decision === 'approved' ? 'approved' : 'rejected',
-        reviewed_by: ctx.userId,
-        reviewed_at: new Date().toISOString(),
-        review_policy_version: policyVersion,
-        updated_at: new Date().toISOString(),
-      })
-      .eq('project_id', req.project_id as string)
-      .eq('org_id', req.org_id as string);
-  }
-
-  return { ok: true, policyVersion };
-}
 
 /**
  * @qhub-service: INTERNAL_SERVER_ONLY

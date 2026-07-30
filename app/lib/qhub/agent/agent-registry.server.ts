@@ -332,3 +332,6 @@ export async function setKillSwitch(
 
   await sb.from('qhub_agents').update(patch).eq('agent_id', agentId).eq('org_id', orgId);
 }
+
+/** AST-readable module authority classification (commercial-architecture.test.ts). */
+export const __QHUB_MODULE_CLASSIFICATION = 'INTERNAL_SERVER_ONLY' as const;

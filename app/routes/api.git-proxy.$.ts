@@ -1,3 +1,4 @@
+// @qhub-route: PUBLIC_SAFE
 import { json } from '@remix-run/cloudflare';
 import type { ActionFunctionArgs, LoaderFunctionArgs } from '@remix-run/cloudflare';
 

@@ -317,3 +317,6 @@ const REGISTRY = new Map<GovernedActionType, GovernedActionAdapter>([
 export function getGovernedActionAdapter(actionType: GovernedActionType): GovernedActionAdapter | null {
   return REGISTRY.get(actionType) ?? null;
 }
+
+/** AST-readable module authority classification (commercial-architecture.test.ts). */
+export const __QHUB_MODULE_CLASSIFICATION = 'INTERNAL_SERVER_ONLY' as const;

@@ -5,18 +5,14 @@
 
 import { describe, it, expect } from 'vitest';
 import type { CommercialContext } from '~/lib/qhub/commercial/commercial-context.server';
-import {
-  createReviewRequest,
-  decideReviewRequest,
-  setStaffOverride,
-  isProhibitedCategory,
-} from '~/lib/qhub/commercial/review.server';
+import { createReviewRequest, setStaffOverride, isProhibitedCategory } from '~/lib/qhub/commercial/review.server';
 import {
   isModelInvocationAllowed,
   isPublicationAllowed,
   buildEvidenceExport,
   type GovernanceRecord,
 } from '~/lib/qhub/commercial/governance-essentials.server';
+import { currentReviewPolicyVersion } from '~/lib/qhub/commercial/governance-essentials';
 import { testReadyToken } from '~/test/helpers/commercial-ready-token';
 
 /*
@@ -56,16 +52,6 @@ describe('manual review authority (pre-DB guards)', () => {
     expect(r.ok === false && r.error).toBe('not_review_eligible');
   });
 
-  it('a non-staff caller cannot decide a review', async () => {
-    const r = await decideReviewRequest(
-      ctx({ isStaff: false }),
-      { requestId: 'r1', decision: 'approved', reason: 'ok' },
-      TOKEN,
-      ENV,
-    );
-    expect(r.ok === false && r.error).toBe('staff_required');
-  });
-
   it('a non-staff caller cannot set an entitlement override', async () => {
     const r = await setStaffOverride(
       ctx({ isStaff: false }),
@@ -92,6 +78,7 @@ describe('governance gates', () => {
     acknowledged: true,
     reviewState: 'none',
     riskTier: 'T1',
+    reviewPolicyVersion: currentReviewPolicyVersion(),
   };
 
   it('allows model invocation only when complete + acknowledged + proceed', () => {
@@ -102,9 +89,19 @@ describe('governance gates', () => {
     expect(isModelInvocationAllowed(null)).toBe(false);
   });
 
-  it('allows manual-review disposition only after approval', () => {
+  it('allows manual-review disposition only after approval under the CURRENT policy', () => {
     expect(isModelInvocationAllowed({ ...base, disposition: 'manual_review', reviewState: 'requested' })).toBe(false);
     expect(isModelInvocationAllowed({ ...base, disposition: 'manual_review', reviewState: 'approved' })).toBe(true);
+
+    // R6: an approval decided under an OLDER policy version is STALE and cannot authorize.
+    expect(
+      isModelInvocationAllowed({
+        ...base,
+        disposition: 'manual_review',
+        reviewState: 'approved',
+        reviewPolicyVersion: '2020-01-01.old-policy',
+      }),
+    ).toBe(false);
   });
 
   it('gates publication on approval / clean proceed', () => {

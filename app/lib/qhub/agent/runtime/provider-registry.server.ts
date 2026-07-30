@@ -56,3 +56,6 @@ export const LOCAL_SIMULATION = {
   id: LOCAL_SIMULATION_PROVIDER_ID,
   version: LOCAL_SIMULATION_PROVIDER_VERSION,
 };
+
+/** AST-readable module authority classification (commercial-architecture.test.ts). */
+export const __QHUB_MODULE_CLASSIFICATION = 'INTERNAL_SERVER_ONLY' as const;

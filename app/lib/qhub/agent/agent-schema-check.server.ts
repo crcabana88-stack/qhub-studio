@@ -259,3 +259,6 @@ export async function assertAgentSchemaReady(env: Record<string, string | undefi
     throw new SchemaNotReadyError(report);
   }
 }
+
+/** AST-readable module authority classification (commercial-architecture.test.ts). */
+export const __QHUB_MODULE_CLASSIFICATION = 'INTERNAL_SERVER_ONLY' as const;

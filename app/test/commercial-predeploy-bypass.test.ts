@@ -55,26 +55,27 @@ describe('predeploy schema check has NO staging/production bypass', () => {
     expect(code).not.toBe(0);
   });
 
-  it('a FLY staging marker skip attempt exits nonzero', () => {
-    const { code } = run({ QHUB_LOCAL_TEST_SCHEMA_BYPASS: '1', NODE_ENV: 'test', FLY_APP_NAME: 'qhub-staging' });
+  it('a misspelled deploy env is a CONFIGURATION_ERROR (nonzero), never a skip', () => {
+    const { code, out } = run({ QHUB_LOCAL_TEST_SCHEMA_BYPASS: '1', NODE_ENV: 'test', QHUB_DEPLOY_ENV: 'stagng' });
     expect(code).not.toBe(0);
+    expect(out).toMatch(/CONFIGURATION_ERROR|deploy_env_invalid/);
   });
 
-  it('a misspelled/unset deploy env without NODE_ENV=test cannot skip', () => {
-    const { code } = run({ QHUB_SKIP_SCHEMA_CHECK: '1', QHUB_DEPLOY_ENV: 'stagng' });
+  it('a MISSING deploy env is a CONFIGURATION_ERROR (nonzero)', () => {
+    const { code } = run({ QHUB_LOCAL_TEST_SCHEMA_BYPASS: '1', NODE_ENV: 'test' });
     expect(code).not.toBe(0);
   });
 
   it('the legacy QHUB_SKIP_SCHEMA_CHECK alone (no test conditions) cannot skip', () => {
-    const { code } = run({ QHUB_SKIP_SCHEMA_CHECK: '1', QHUB_DEPLOY_ENV: 'dev' });
+    const { code } = run({ QHUB_SKIP_SCHEMA_CHECK: '1', QHUB_DEPLOY_ENV: 'local' });
     expect(code).not.toBe(0);
   });
 
-  it('a local test bypass (NODE_ENV=test + explicit flag + non-deployed target) exits 0 before any probe', () => {
+  it('a local test bypass (QHUB_DEPLOY_ENV=local + NODE_ENV=test + explicit flag) exits 0 before any probe', () => {
     const { code } = run({
       QHUB_LOCAL_TEST_SCHEMA_BYPASS: '1',
       NODE_ENV: 'test',
-      QHUB_DEPLOY_ENV: 'dev',
+      QHUB_DEPLOY_ENV: 'local',
     });
     expect(code).toBe(0);
   });

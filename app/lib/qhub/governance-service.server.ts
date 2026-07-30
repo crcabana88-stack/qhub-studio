@@ -1,3 +1,4 @@
+/* eslint-disable @typescript-eslint/naming-convention -- pre-existing DB-mapped snake_case / private-method naming; unrelated to R6 (module is only annotated with __QHUB_MODULE_CLASSIFICATION) */
 /**
  * QHUB GovernanceService — SERVER ONLY
  * app/lib/qhub/governance-service.server.ts
@@ -735,6 +736,7 @@ export class GovernanceService {
     builderProjectId?: string;
     provider: string;
     model: string;
+
     /**
      * Gate 04 enforcement references. When present, this AI invocation is bound
      * to a prior exact ALLOW decision — the action event references that evaluation.
@@ -776,9 +778,11 @@ export class GovernanceService {
     // Gate 02: stamp the REAL persisted tier (UNCLASSIFIED until classification confirmed).
     const riskTier = await getPersistedRiskTier(params.conversationId, this.ctx.orgId, this.ctx.env);
 
-    // Gate 03: reference the assigned policy profile so every AI invocation is
-    // provably bound to the controls in force at the time. Null before policy
-    // assignment; present (with hash) once POLICY_PROFILE_ASSIGNED has committed.
+    /*
+     * Gate 03: reference the assigned policy profile so every AI invocation is
+     * provably bound to the controls in force at the time. Null before policy
+     * assignment; present (with hash) once POLICY_PROFILE_ASSIGNED has committed.
+     */
     const policy = await getPolicyProfile(appRecord.qhub_app_id, this.ctx.env);
 
     const body: LambdaEventBody = {
@@ -1130,3 +1134,6 @@ export class GovernanceService {
 export function createGovernanceService(ctx: GovernanceContext): GovernanceService {
   return new GovernanceService(ctx);
 }
+
+/** AST-readable module authority classification (commercial-architecture.test.ts). */
+export const __QHUB_MODULE_CLASSIFICATION = 'INTERNAL_SERVER_ONLY' as const;

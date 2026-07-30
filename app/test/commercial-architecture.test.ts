@@ -1,21 +1,20 @@
 /**
- * QHUB Commercial Launch R5 — AST ARCHITECTURE INVENTORY (auto-discovered)
+ * QHUB Commercial Launch R6 — REPOSITORY-WIDE AST ARCHITECTURE INVENTORY
  * app/test/commercial-architecture.test.ts
  *
- * TRUE automatic inventory — no hard-coded filename arrays. Commercial routes are
- * discovered by scanning app/routes recursively and matching the commercial path pattern
- * (api.billing.* / api.commercial.* / api.internal.commercial.* / api.system.schema-check),
- * so a NEW commercial route (or the previously-omitted api.commercial.reviews.$requestId.ts)
- * is included automatically. Commercial server modules are discovered by globbing
- * app/lib/qhub/commercial/ ** / *.server.ts.
+ * Discovery is filesystem-wide, not filename-filtered:
+ *   - EVERY route under app/routes/ ** /*.{ts,tsx} must carry exactly one literal
+ *     @qhub-route classification; the expected count is derived from the filesystem.
+ *   - EVERY server module under app/lib/ ** /*.server.ts must carry an AST-readable
+ *     __QHUB_MODULE_CLASSIFICATION literal; the expected count is derived from the filesystem.
  *
- * Every commercial route carries exactly one literal @qhub-route classification; every
- * commercial server module carries an AST-readable __QHUB_MODULE_CLASSIFICATION constant.
- * The checks are AST + flow based: token-classified exports must take a required
- * CommercialReadyToken and validate it before any side effect; any exported DB mutation
- * without a token fails; readiness in a COMMERCIAL_READY route must precede protected work,
- * be used, and not be swallowed; no `as CommercialReadyToken` cast or direct verifier call
- * escapes the readiness module. Synthetic fixtures prove each rule rejects its violation.
+ * The COMMERCIAL boundary (app/lib/qhub/commercial) is enforced strictly: token-classified
+ * exports (function declarations AND arrow-function exports) must take a required
+ * CommercialReadyToken and validate it before any side effect; any exported DB mutation must
+ * be token-guarded; a protected implementation may not be re-exported through a barrel; and
+ * there is exactly ONE review-decision mutation path (the atomic RPC — no service updates
+ * qhub_manual_review_requests). Repo-wide, no `as CommercialReadyToken` cast and no direct
+ * commercial-verifier call escape the readiness module. Synthetic fixtures prove each rule.
  */
 
 import { readFileSync, readdirSync } from 'node:fs';
@@ -35,7 +34,6 @@ const SERVICE_EXPORT_CLASSES = [
   'PURE_NO_IO',
   'INTERNAL_SERVER_ONLY',
 ] as const;
-
 const MODULE_CLASSES = [...SERVICE_EXPORT_CLASSES, 'MIXED_EXPLICIT_EXPORT_CLASSIFICATION'] as const;
 const ROUTE_CLASSES = [
   'PUBLIC_SAFE',
@@ -47,18 +45,40 @@ const ROUTE_CLASSES = [
 
 const ANY_DB_OP = /\.(from|rpc|insert|update|upsert|delete)\s*\(/;
 const TOKEN_TYPE = 'CommercialReadyToken';
+const COMMERCIAL_GUARDS = /requireCommercialContext|requireCommercialProject|requireCommercialReady|requireStaff/;
 
-/**
- * A Supabase DB MUTATION — insert/upsert/delete, a qhub_ RPC (not the read-only verifier),
- * or an `.update(` used on a query builder (guarded by a `.from(` in the same scope so the
- * hashing `createHash(...).update(...)` is not a false positive).
- */
+/** Protected I/O a PUBLIC_SAFE route may never contain (matches the classifier signals). */
+const SENSITIVE_ROUTE_IO =
+  /\.(insert|update|upsert|delete)\s*\(|\.rpc\s*\(|streamText|generateText|LLMManager|createClient|SERVICE_ROLE|getApiKeysFromCookie|requireStaff|requireCommercial|getSession|getVerifiedUser|Deploy|netlify|vercel|MCPService/;
+
+/** A Supabase DB MUTATION (not the read-only verifier; `.update(` needs a `.from(` nearby). */
 function mutates(text: string): boolean {
   return (
     /\.(insert|upsert|delete)\s*\(/.test(text) ||
     /\.rpc\(\s*['"]qhub_(?!verify_commercial_schema)/.test(text) ||
     (/\.from\s*\(/.test(text) && /\.update\s*\(/.test(text))
   );
+}
+
+function firstMatchPos(body: string, re: RegExp): number {
+  const m = re.exec(body);
+  return m ? m.index : Number.POSITIVE_INFINITY;
+}
+
+function walk(dir: string): string[] {
+  const out: string[] = [];
+
+  for (const e of readdirSync(dir, { withFileTypes: true })) {
+    const p = `${dir}${e.name}`;
+
+    if (e.isDirectory()) {
+      out.push(...walk(`${p}/`));
+    } else if ((e.name.endsWith('.ts') || e.name.endsWith('.tsx')) && !e.name.endsWith('.d.ts')) {
+      out.push(p);
+    }
+  }
+
+  return out;
 }
 
 // ─── generic AST helpers ────────────────────────────────────────────────────────
@@ -70,15 +90,51 @@ function leadingComment(sf: ts.SourceFile, node: ts.Node): string {
   return ranges.map((r) => full.slice(r.pos, r.end)).join('\n');
 }
 
-function isExportedFn(node: ts.Node): node is ts.FunctionDeclaration {
-  return (
-    ts.isFunctionDeclaration(node) &&
-    !!node.name &&
-    !!node.modifiers?.some((m) => m.kind === ts.SyntaxKind.ExportKeyword)
-  );
+/** All exported callables: function declarations AND exported arrow/function-expression consts. */
+interface ExportedCallable {
+  name: string;
+  params: readonly ts.ParameterDeclaration[];
+  body: string;
+  comment: string;
 }
 
-/** Read the AST-declared module classification constant, or a marker for missing/dynamic. */
+function exportedCallables(sf: ts.SourceFile): ExportedCallable[] {
+  const out: ExportedCallable[] = [];
+
+  for (const stmt of sf.statements) {
+    const isExport = (n: ts.Node) =>
+      ts.canHaveModifiers(n) && ts.getModifiers(n)?.some((m) => m.kind === ts.SyntaxKind.ExportKeyword);
+
+    if (ts.isFunctionDeclaration(stmt) && stmt.name && isExport(stmt)) {
+      out.push({
+        name: stmt.name.text,
+        params: stmt.parameters,
+        body: stmt.body?.getText(sf) ?? '',
+        comment: leadingComment(sf, stmt),
+      });
+    }
+
+    if (ts.isVariableStatement(stmt) && isExport(stmt)) {
+      for (const d of stmt.declarationList.declarations) {
+        if (
+          ts.isIdentifier(d.name) &&
+          d.initializer &&
+          (ts.isArrowFunction(d.initializer) || ts.isFunctionExpression(d.initializer))
+        ) {
+          out.push({
+            name: d.name.text,
+            params: d.initializer.parameters,
+            body: (d.initializer.body?.getText(sf) ?? '') || '',
+            comment: leadingComment(sf, stmt),
+          });
+        }
+      }
+    }
+  }
+
+  return out;
+}
+
 function moduleClassification(sf: ts.SourceFile): string | 'MISSING' | 'DYNAMIC' {
   for (const stmt of sf.statements) {
     if (!ts.isVariableStatement(stmt)) {
@@ -99,19 +155,12 @@ function moduleClassification(sf: ts.SourceFile): string | 'MISSING' | 'DYNAMIC'
       return ts.isStringLiteral(init) ? init.text : 'DYNAMIC';
     }
   }
-
   return 'MISSING';
 }
 
-function firstMatchPos(body: string, re: RegExp): number {
-  const m = re.exec(body);
+// ─── commercial service module checker (strict) ─────────────────────────────────
 
-  return m ? m.index : Number.POSITIVE_INFINITY;
-}
-
-// ─── service module checker ─────────────────────────────────────────────────────
-
-function checkServiceModule(name: string, src: string): string[] {
+function checkCommercialServiceModule(name: string, src: string): string[] {
   const sf = parse(name, src);
   const violations: string[] = [];
   const mod = moduleClassification(sf);
@@ -124,68 +173,78 @@ function checkServiceModule(name: string, src: string): string[] {
     return [`${name} __QHUB_MODULE_CLASSIFICATION is not a literal reviewed value`];
   }
 
-  for (const stmt of sf.statements) {
-    if (!isExportedFn(stmt)) {
-      continue;
-    }
+  // A protected implementation must not be re-exported through a barrel.
+  if (/export\s+\{[^}]*\}\s+from\s+/.test(src) && mod !== 'INTERNAL_SERVER_ONLY') {
+    violations.push(`${name} re-exports through a barrel from a non-internal module`);
+  }
 
-    const fn = stmt.name!.text;
-    const body = stmt.body?.getText(sf) ?? '';
-    const tokenParams = stmt.parameters.filter((p) => p.type?.getText(sf) === TOKEN_TYPE);
-    const mutatesBody = mutates(body);
+  // Exactly one review-decision mutation path: no service updates the review-request table.
+  if (/\.from\(\s*['"]qhub_manual_review_requests['"]\)[\s\S]{0,200}?\.update\s*\(/.test(src)) {
+    violations.push(`${name} performs a non-atomic review-request UPDATE (only the atomic RPC may decide)`);
+  }
 
-    // A whole-module (non-mixed) class assigns the same authority to every export.
+  for (const fn of exportedCallables(sf)) {
+    const tokenParams = fn.params.filter((p) => p.type?.getText(sf) === TOKEN_TYPE);
+    const mutatesBody = mutates(fn.body);
     const cls =
       mod === 'MIXED_EXPLICIT_EXPORT_CLASSIFICATION'
-        ? SERVICE_EXPORT_CLASSES.find((c) => leadingComment(sf, stmt).includes(`@qhub-service: ${c}`))
+        ? SERVICE_EXPORT_CLASSES.find((c) => fn.comment.includes(`@qhub-service: ${c}`))
         : mod;
 
     if (mod === 'MIXED_EXPLICIT_EXPORT_CLASSIFICATION' && !cls) {
-      violations.push(`${name}:${fn} (mixed module) exported function lacks a @qhub-service classification`);
+      violations.push(`${name}:${fn.name} (mixed module) exported function lacks a @qhub-service classification`);
       continue;
     }
 
-    // HARD security rule: any exported DB mutation MUST be token-classified + take a token.
     if (mutatesBody && (cls !== 'REQUIRES_COMMERCIAL_READY_TOKEN' || tokenParams.length === 0)) {
-      violations.push(`${name}:${fn} performs a DB mutation but is not a token-guarded export`);
+      violations.push(`${name}:${fn.name} performs a DB mutation but is not a token-guarded export`);
     }
 
     if (cls === 'REQUIRES_COMMERCIAL_READY_TOKEN') {
       if (tokenParams.length === 0) {
-        violations.push(`${name}:${fn} REQUIRES_COMMERCIAL_READY_TOKEN but has no CommercialReadyToken parameter`);
+        violations.push(`${name}:${fn.name} REQUIRES_COMMERCIAL_READY_TOKEN but has no CommercialReadyToken parameter`);
         continue;
       }
 
       if (tokenParams.some((p) => p.questionToken || p.initializer)) {
-        violations.push(`${name}:${fn} readiness token parameter must not be optional/defaulted`);
+        violations.push(`${name}:${fn.name} readiness token parameter must not be optional/defaulted`);
       }
 
       const tok = ts.isIdentifier(tokenParams[0].name) ? tokenParams[0].name.text : '';
-      const validationRe = new RegExp(`(mutator|assertReadyToken|tokenValid)\\(\\s*${tok}\\b`);
-      const validationPos = firstMatchPos(body, validationRe);
+      const validationPos = firstMatchPos(fn.body, new RegExp(`(mutator|assertReadyToken|tokenValid)\\(\\s*${tok}\\b`));
 
-      // Token must actually be validated (not accepted-and-ignored).
       if (!Number.isFinite(validationPos)) {
-        violations.push(`${name}:${fn} accepts a token but never validates it`);
+        violations.push(`${name}:${fn.name} accepts a token but never validates it`);
         continue;
       }
 
-      // No protected side effect before validation.
-      const sideEffectPos = firstMatchPos(body, ANY_DB_OP);
-
-      if (sideEffectPos < validationPos) {
-        violations.push(`${name}:${fn} performs a side effect BEFORE token validation`);
+      if (firstMatchPos(fn.body, ANY_DB_OP) < validationPos) {
+        violations.push(`${name}:${fn.name} performs a side effect BEFORE token validation`);
       }
     }
 
-    if (cls === 'PURE_NO_IO') {
-      if (/\b(admin|mutator|createClient)\s*\(|\.rpc\(|\.from\(|\bfetch\s*\(/.test(body)) {
-        violations.push(`${name}:${fn} classified PURE_NO_IO but performs I/O`);
-      }
+    if (cls === 'PURE_NO_IO' && /\b(admin|mutator|createClient)\s*\(|\.rpc\(|\.from\(|\bfetch\s*\(/.test(fn.body)) {
+      violations.push(`${name}:${fn.name} classified PURE_NO_IO but performs I/O`);
     }
   }
 
   return violations;
+}
+
+// ─── repo-wide (light) module checker ───────────────────────────────────────────
+
+function checkModuleClassificationPresent(name: string, src: string): string[] {
+  const mod = moduleClassification(parse(name, src));
+
+  if (mod === 'MISSING') {
+    return [`${name} has no __QHUB_MODULE_CLASSIFICATION`];
+  }
+
+  if (mod === 'DYNAMIC' || !(MODULE_CLASSES as readonly string[]).includes(mod)) {
+    return [`${name} __QHUB_MODULE_CLASSIFICATION is not a literal reviewed value`];
+  }
+
+  return [];
 }
 
 // ─── route checker ──────────────────────────────────────────────────────────────
@@ -208,14 +267,11 @@ const PROTECTED_CALLS = [
   'exportCommercialProject',
   'requestCommercialPublication',
   'setStaffOverride',
-  'decideReviewRequest',
   'createInvitation',
   'consumeCheckoutIntent',
   '.createCheckoutSession',
   '.createBillingPortalSession',
 ];
-
-const COMMERCIAL_GUARDS = /requireCommercialContext|requireCommercialProject|requireCommercialReady|requireStaff/;
 
 function routeClassifications(src: string): string[] {
   return ROUTE_CLASSES.filter((c) => new RegExp(`@qhub-route:\\s*${c}\\b`).test(src));
@@ -240,7 +296,6 @@ function findHandlerBody(sf: ts.SourceFile): ts.Node | null {
       }
     }
   }
-
   return null;
 }
 
@@ -272,22 +327,27 @@ function checkRouteFile(name: string, src: string): string[] {
 
   const cls = classes[0];
 
+  if (cls === 'PUBLIC_SAFE' && SENSITIVE_ROUTE_IO.test(src)) {
+    violations.push(`${name} PUBLIC_SAFE route performs protected I/O`);
+  }
+
   if (cls === 'STAFF_ONLY' && !/requireStaff\s*\(/.test(src)) {
     violations.push(`${name} STAFF_ONLY route does not use requireStaff`);
   }
 
-  if (cls === 'PUBLIC_SAFE' && (mutates(src) || COMMERCIAL_GUARDS.test(src))) {
-    violations.push(`${name} PUBLIC_SAFE route performs protected I/O`);
+  if (cls === 'SIGNATURE_AUTH') {
+    const sigPos = firstMatchPos(src, /verifyAndParseWebhook|verifySignature|stripe-signature/);
+    const mutPos = firstMatchPos(src, /\.(insert|update|upsert|delete)\s*\(|\.rpc\s*\(/);
+
+    if (!Number.isFinite(sigPos) || mutPos < sigPos) {
+      violations.push(`${name} SIGNATURE_AUTH route mutates before verifying the signature`);
+    }
   }
 
   if (cls !== 'COMMERCIAL_READY') {
     return violations;
   }
 
-  /*
-   * COMMERCIAL_READY: must use a commercial guard; any protected mutation must be preceded
-   * by requireCommercialReady, whose result is used (guard + return) and not swallowed.
-   */
   if (!COMMERCIAL_GUARDS.test(src)) {
     violations.push(`${name} COMMERCIAL_READY route uses no commercial guard`);
   }
@@ -326,13 +386,11 @@ function checkRouteFile(name: string, src: string): string[] {
 
     ts.forEachChild(node, visit);
   };
-
   visit(body);
 
   const doesProtectedWork = Number.isFinite(firstProtectedPos);
 
   if (!readinessCall) {
-    // A guarded READ (no protected mutation) is allowed without a readiness token.
     if (doesProtectedWork) {
       violations.push(`${name} performs protected work with no readiness gate`);
     }
@@ -364,54 +422,42 @@ function checkRouteFile(name: string, src: string): string[] {
   return violations;
 }
 
-// ─── filesystem discovery ───────────────────────────────────────────────────────
-
-function walk(dir: string): string[] {
-  const out: string[] = [];
-
-  for (const e of readdirSync(dir, { withFileTypes: true })) {
-    const p = `${dir}${e.name}`;
-
-    if (e.isDirectory()) {
-      out.push(...walk(`${p}/`));
-    } else if ((e.name.endsWith('.ts') || e.name.endsWith('.tsx')) && !e.name.endsWith('.d.ts')) {
-      out.push(p);
-    }
-  }
-
-  return out;
-}
-
-const COMMERCIAL_ROUTE_RE = /(^|\/)api\.(billing|commercial|internal\.commercial)\.|(^|\/)api\.system\.schema-check\./;
+// ─── discovery ──────────────────────────────────────────────────────────────────
 
 const allRoutes = walk(`${APP}routes/`);
-const commercialRoutes = allRoutes.filter((f) => COMMERCIAL_ROUTE_RE.test(f));
-const commercialServiceModules = walk(`${APP}lib/qhub/commercial/`).filter((f) => f.endsWith('.server.ts'));
+const allServerModules = walk(`${APP}lib/`).filter((f) => f.endsWith('.server.ts'));
+const commercialServiceModules = allServerModules.filter((f) => f.includes('/qhub/commercial/'));
 
 // ─── real-source assertions ─────────────────────────────────────────────────────
 
-describe('auto-discovered commercial routes are classified + readiness-correct (AST)', () => {
-  it('discovers commercial routes from the filesystem (incl. the reviews status route)', () => {
-    const names = commercialRoutes.map((f) => f.slice(APP.length));
-    expect(names).toContain('routes/api.commercial.reviews.$requestId.ts');
-    expect(commercialRoutes.length).toBeGreaterThanOrEqual(9);
+describe('repository-wide route inventory (AST)', () => {
+  it('every route file under app/routes is discovered (count from filesystem)', () => {
+    expect(allRoutes.length).toBeGreaterThanOrEqual(60);
+
+    const names = allRoutes.map((f) => f.slice(APP.length));
+    expect(names).toContain('routes/api.commercial.reviews.$requestId.ts'); // omitted route now included
+    expect(names).toContain('routes/home.tsx'); // a legacy/marketing route is included too
   });
 
-  for (const f of commercialRoutes) {
+  for (const f of allRoutes) {
     it(`${f.slice(APP.length)} passes the route architecture contract`, () => {
       expect(checkRouteFile(f.slice(APP.length), readFileSync(f, 'utf8'))).toEqual([]);
     });
   }
 });
 
-describe('auto-discovered commercial server modules are classified + token-guarded (AST)', () => {
-  it('discovers every commercial *.server.ts from the filesystem', () => {
-    expect(commercialServiceModules.length).toBe(10);
+describe('repository-wide service inventory (AST)', () => {
+  it('every *.server.ts under app/lib is discovered + classified (count from filesystem)', () => {
+    expect(allServerModules.length).toBeGreaterThanOrEqual(20);
+
+    for (const f of allServerModules) {
+      expect(checkModuleClassificationPresent(f.slice(APP.length), readFileSync(f, 'utf8'))).toEqual([]);
+    }
   });
 
   for (const f of commercialServiceModules) {
-    it(`${f.slice(APP.length)} passes the service architecture contract`, () => {
-      expect(checkServiceModule(f.slice(APP.length), readFileSync(f, 'utf8'))).toEqual([]);
+    it(`${f.slice(APP.length)} passes the STRICT commercial service contract`, () => {
+      expect(checkCommercialServiceModule(f.slice(APP.length), readFileSync(f, 'utf8'))).toEqual([]);
     });
   }
 });
@@ -440,6 +486,16 @@ describe('global: token cast + direct verifier confined to allowed files', () =>
     });
     expect(offenders).toEqual([]);
   });
+
+  it('no exported non-atomic review-decision path exists in commercial services', () => {
+    for (const f of commercialServiceModules) {
+      const src = readFileSync(f, 'utf8');
+      expect(
+        /\.from\(\s*['"]qhub_manual_review_requests['"]\)[\s\S]{0,200}?\.update\s*\(/.test(src),
+        `${f.slice(APP.length)} has a non-atomic review UPDATE`,
+      ).toBe(false);
+    }
+  });
 });
 
 // ─── synthetic fixtures ─────────────────────────────────────────────────────────
@@ -449,17 +505,20 @@ describe('fixtures: the AST checker rejects violations', () => {
     `export const __QHUB_MODULE_CLASSIFICATION = 'MIXED_EXPLICIT_EXPORT_CLASSIFICATION' as const;\n${body}`;
 
   it('module without classification → rejected', () => {
-    expect(checkServiceModule('f.ts', `export function x() {}`).join()).toMatch(/no __QHUB_MODULE_CLASSIFICATION/);
+    expect(checkCommercialServiceModule('f.ts', `export function x() {}`).join()).toMatch(
+      /no __QHUB_MODULE_CLASSIFICATION/,
+    );
   });
 
   it('computed/dynamic module classification → rejected', () => {
-    const src = `export const __QHUB_MODULE_CLASSIFICATION = computeIt();\nexport function x() {}`;
-    expect(checkServiceModule('f.ts', src).join()).toMatch(/not a literal reviewed value/);
+    expect(
+      checkCommercialServiceModule('f.ts', `export const __QHUB_MODULE_CLASSIFICATION = compute();`).join(),
+    ).toMatch(/not a literal/);
   });
 
   it('unclassified export in a mixed module → rejected', () => {
     expect(
-      checkServiceModule(
+      checkCommercialServiceModule(
         'f.ts',
         svc(`export async function w(env) { const sb = admin(env); await sb.from('x').select(); }`),
       ).join(),
@@ -470,40 +529,52 @@ describe('fixtures: the AST checker rejects violations', () => {
     const src = svc(
       `/** @qhub-service: INTERNAL_SERVER_ONLY */\nexport async function w(env) { const sb = admin(env); await sb.from('x').insert({}); }`,
     );
-    expect(checkServiceModule('f.ts', src).join()).toMatch(/DB mutation but is not a token-guarded export/);
+    expect(checkCommercialServiceModule('f.ts', src).join()).toMatch(/not a token-guarded export/);
   });
 
   it('token export with no token param → rejected', () => {
     const src = svc(
       `/** @qhub-service: REQUIRES_COMMERCIAL_READY_TOKEN */\nexport async function w(input, env) { return 1; }`,
     );
-    expect(checkServiceModule('f.ts', src).join()).toMatch(/has no CommercialReadyToken parameter/);
+    expect(checkCommercialServiceModule('f.ts', src).join()).toMatch(/has no CommercialReadyToken parameter/);
   });
 
   it('optional/defaulted token → rejected', () => {
     const src = svc(
       `/** @qhub-service: REQUIRES_COMMERCIAL_READY_TOKEN */\nexport async function w(token?: CommercialReadyToken, env?) { assertReadyToken(token, env); }`,
     );
-    expect(checkServiceModule('f.ts', src).join()).toMatch(/must not be optional\/defaulted/);
+    expect(checkCommercialServiceModule('f.ts', src).join()).toMatch(/must not be optional\/defaulted/);
   });
 
-  it('token accepted but never validated → rejected', () => {
+  it('ARROW-FUNCTION token export not validated → rejected', () => {
     const src = svc(
-      `/** @qhub-service: REQUIRES_COMMERCIAL_READY_TOKEN */\nexport async function w(token: CommercialReadyToken, env) { return 1; }`,
+      `/** @qhub-service: REQUIRES_COMMERCIAL_READY_TOKEN */\nexport const w = async (token: CommercialReadyToken, env) => { return 1; };`,
     );
-    expect(checkServiceModule('f.ts', src).join()).toMatch(/accepts a token but never validates it/);
+    expect(checkCommercialServiceModule('f.ts', src).join()).toMatch(/accepts a token but never validates it/);
   });
 
   it('side effect before token validation → rejected', () => {
     const src = svc(
       `/** @qhub-service: REQUIRES_COMMERCIAL_READY_TOKEN */\nexport async function w(token: CommercialReadyToken, env) { const sb = admin(env); await sb.from('x').insert({}); mutator(token, env); }`,
     );
-    expect(checkServiceModule('f.ts', src).join()).toMatch(/side effect BEFORE token validation/);
+    expect(checkCommercialServiceModule('f.ts', src).join()).toMatch(/side effect BEFORE token validation/);
+  });
+
+  it('barrel re-export of a protected impl → rejected', () => {
+    const src = svc(`export { doProtectedThing } from './secret-impl';`);
+    expect(checkCommercialServiceModule('f.ts', src).join()).toMatch(/re-exports through a barrel/);
+  });
+
+  it('alternate non-atomic review decision path → rejected', () => {
+    const src = svc(
+      `/** @qhub-service: REQUIRES_COMMERCIAL_READY_TOKEN */\nexport async function decide(token: CommercialReadyToken, env) { mutator(token, env); await admin(env).from('qhub_manual_review_requests').update({ status: 'approved' }); }`,
+    );
+    expect(checkCommercialServiceModule('f.ts', src).join()).toMatch(/non-atomic review-request UPDATE/);
   });
 
   it('PURE_NO_IO that performs I/O → rejected', () => {
     const src = svc(`/** @qhub-service: PURE_NO_IO */\nexport function w(env) { return admin(env).from('x'); }`);
-    expect(checkServiceModule('f.ts', src).join()).toMatch(/PURE_NO_IO but performs I\/O/);
+    expect(checkCommercialServiceModule('f.ts', src).join()).toMatch(/PURE_NO_IO but performs I\/O/);
   });
 
   it('unclassified route → rejected', () => {
@@ -515,8 +586,24 @@ describe('fixtures: the AST checker rejects violations', () => {
     expect(checkRouteFile('f.ts', src).join()).toMatch(/exactly one @qhub-route/);
   });
 
+  it('PUBLIC_SAFE route doing protected I/O → rejected', () => {
+    const src = `// @qhub-route: PUBLIC_SAFE\nexport async function action(env) { await createClient(env).from('x').insert({}); }`;
+    expect(checkRouteFile('f.ts', src).join()).toMatch(/PUBLIC_SAFE route performs protected I\/O/);
+  });
+
+  it('STAFF_ONLY route without requireStaff → rejected', () => {
+    expect(checkRouteFile('f.ts', `// @qhub-route: STAFF_ONLY\nexport async function loader() {}`).join()).toMatch(
+      /does not use requireStaff/,
+    );
+  });
+
+  it('SIGNATURE_AUTH route mutating before signature verify → rejected', () => {
+    const src = `// @qhub-route: SIGNATURE_AUTH\nexport async function action(sb) { await sb.from('x').insert({}); await verifyAndParseWebhook(); }`;
+    expect(checkRouteFile('f.ts', src).join()).toMatch(/mutates before verifying the signature/);
+  });
+
   it('hard-coded READY (no requireCommercialReady) → rejected', () => {
-    const src = `// @qhub-route: COMMERCIAL_READY\nexport async function action(env) {\n const g = await requireCommercialContext();\n const ready = { ok: true, token: {} };\n await createCheckoutIntent(ready.token, {}, env);\n}`;
+    const src = `// @qhub-route: COMMERCIAL_READY\nexport async function action(env) {\n const g = await requireCommercialContext();\n await createCheckoutIntent(null, {}, env);\n}`;
     expect(checkRouteFile('f.ts', src).join()).toMatch(/protected work with no readiness gate/);
   });
 
@@ -533,11 +620,6 @@ describe('fixtures: the AST checker rejects violations', () => {
   it('ignored guard result → rejected', () => {
     const src = `// @qhub-route: COMMERCIAL_READY\nexport async function action(env) {\n const g = await requireCommercialContext();\n const ready = await requireCommercialReady(env);\n await createCheckoutIntent(ready.token, {}, env);\n}`;
     expect(checkRouteFile('f.ts', src).join()).toMatch(/readiness result is ignored/);
-  });
-
-  it('STAFF_ONLY route without requireStaff → rejected', () => {
-    const src = `// @qhub-route: STAFF_ONLY\nexport async function loader() { return null; }`;
-    expect(checkRouteFile('f.ts', src).join()).toMatch(/does not use requireStaff/);
   });
 
   it('a valid COMMERCIAL_READY route fixture passes', () => {

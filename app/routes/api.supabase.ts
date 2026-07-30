@@ -1,3 +1,4 @@
+// @qhub-route: PUBLIC_SAFE
 import { json, type ActionFunction } from '@remix-run/cloudflare';
 import type { SupabaseProject } from '~/types/supabase';
 

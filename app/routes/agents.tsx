@@ -1,3 +1,4 @@
+// @qhub-route: INTERNAL_SERVER_ONLY
 /**
  * QHUB Agent Framework Foundation — Agents page (registry + creation choice)
  * app/routes/agents.tsx

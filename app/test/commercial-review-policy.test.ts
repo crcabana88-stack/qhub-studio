@@ -147,10 +147,9 @@ vi.mock('@supabase/supabase-js', () => {
   };
 });
 
-import { createReviewRequest, decideReviewRequest } from '~/lib/qhub/commercial/review.server';
+import { createReviewRequest } from '~/lib/qhub/commercial/review.server';
 
 const CTX = { userId: 'u1', orgId: 'org1', isStaff: false } as never;
-const STAFF = { userId: 'staff1', orgId: 'org1', isStaff: true } as never;
 const ENV = { SUPABASE_URL: 'https://ref.supabase.co', SUPABASE_SERVICE_ROLE_KEY: 'svc' };
 
 beforeEach(() => {
@@ -159,60 +158,10 @@ beforeEach(() => {
   SB.reqRow = null;
 });
 
-describe('review.server stores + binds the server-derived policy version', () => {
+describe('review.server stores the server-derived policy version at submission', () => {
   it('createReviewRequest stamps the current server policy version on the request', async () => {
     const r = await createReviewRequest(CTX, { category: 'personal', reason: 'x' }, testReadyToken(ENV), ENV);
     expect(r.ok).toBe(true);
     expect((SB.insertRow as { policy_version?: string }).policy_version).toBe(currentReviewPolicyVersion());
-  });
-
-  it('decideReviewRequest binds the evaluated-under version and never a browser value', async () => {
-    SB.reqRow = {
-      id: 'req1',
-      category: 'personal',
-      status: 'pending',
-      org_id: 'org1',
-      project_id: 'p1',
-      policy_version: currentReviewPolicyVersion(),
-    };
-
-    const r = await decideReviewRequest(
-      STAFF,
-      { requestId: 'req1', decision: 'approved', reason: 'ok' },
-      testReadyToken(ENV),
-      ENV,
-    );
-    expect(r.ok).toBe(true);
-
-    /*
-     * The request row is stamped with the server policy version; the governance row is
-     * stamped with the same server version under review_policy_version.
-     */
-    const versions = SB.updates.map(
-      (u) =>
-        (u as { policy_version?: string; review_policy_version?: string }).policy_version ??
-        (u as { review_policy_version?: string }).review_policy_version,
-    );
-    expect(versions).toContain(currentReviewPolicyVersion());
-  });
-
-  it('decideReviewRequest rejects a request evaluated under a materially older policy', async () => {
-    SB.reqRow = {
-      id: 'req1',
-      category: 'personal',
-      status: 'pending',
-      org_id: 'org1',
-      project_id: 'p1',
-      policy_version: '2020-01-01.old-policy',
-    };
-
-    const r = await decideReviewRequest(
-      STAFF,
-      { requestId: 'req1', decision: 'approved', reason: 'ok' },
-      testReadyToken(ENV),
-      ENV,
-    );
-    expect(r.ok === false && r.error).toBe('policy_version_changed');
-    expect(SB.updates).toEqual([]); // no write on stale policy
   });
 });

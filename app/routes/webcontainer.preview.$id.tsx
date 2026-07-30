@@ -1,3 +1,4 @@
+// @qhub-route: PUBLIC_SAFE
 import { json, type LoaderFunctionArgs } from '@remix-run/cloudflare';
 import { useLoaderData } from '@remix-run/react';
 import { useCallback, useEffect, useRef, useState } from 'react';

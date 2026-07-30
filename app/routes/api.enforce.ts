@@ -1,3 +1,4 @@
+// @qhub-route: INTERNAL_SERVER_ONLY
 /**
  * QHUB Gate 04 — Governed-action enforcement endpoint
  * app/routes/api.enforce.ts

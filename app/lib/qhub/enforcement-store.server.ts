@@ -467,3 +467,6 @@ export async function setKillSwitch(
 
   return !!data && data.length === 1;
 }
+
+/** AST-readable module authority classification (commercial-architecture.test.ts). */
+export const __QHUB_MODULE_CLASSIFICATION = 'INTERNAL_SERVER_ONLY' as const;

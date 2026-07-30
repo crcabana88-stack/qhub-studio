@@ -1,3 +1,4 @@
+// @qhub-route: PUBLIC_SAFE
 import { json } from '@remix-run/cloudflare';
 import { execSync } from 'child_process';
 import { existsSync } from 'fs';
