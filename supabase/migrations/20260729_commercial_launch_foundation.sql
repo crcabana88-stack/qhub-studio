@@ -1,6 +1,8 @@
 -- ============================================================================
 -- QHUB Commercial Launch Foundation — R12 FINAL TWO-BLOCKER CLOSURE
 --   (persisted + revalidated classification authority on review requests)
+--   + R15.1 verifier line-ending portability (CR-normalized body pins only;
+--     no protected function body, signature, ACL, RLS or digest constant changed)
 -- Migration: 20260729_commercial_launch_foundation  (replaces the rejected
 --            4b42555a… contents IN PLACE — one authoritative commercial migration)
 -- Schema version: 2026-07-30.commercial-launch-r8
@@ -1961,8 +1963,17 @@ BEGIN
    * different prosrc → different digest → NOT READY; retained marker text/comments cannot spoof it
    * (any change to the body text changes the digest). prosrc is stored verbatim, so the digest is
    * stable across PG versions.
+   *
+   * R15.1 — APPLICATION-CHANNEL PORTABILITY. Only carriage returns (chr(13)) are stripped before
+   * hashing. Some application channels (a Windows clipboard paste into the SQL Editor) rewrite the
+   * migration's LF line endings to CRLF, which is stored verbatim in prosrc and changed all five
+   * digests uniformly even though the bodies were semantically identical (proved textually — the
+   * CR-stripped live body equals the reviewed LF body exactly — and behaviourally). Normalizing CR
+   * makes an LF-applied and a CRLF-applied database verify identically while leaving every other
+   * character significant: spaces, tabs, LF, comments, dollar quotes and all executable tokens still
+   * change the digest, so real body drift is still detected.
    */
-  IF (SELECT md5(p.prosrc) FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace
+  IF (SELECT md5(replace(p.prosrc, chr(13), '')) FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace
         WHERE n.nspname='public' AND p.proname='qhub_decide_review'
           AND pg_get_function_identity_arguments(p.oid) = 'p_request_id uuid, p_actor text, p_is_staff boolean, p_decision text, p_reason text, p_policy_version text')
      IS DISTINCT FROM '7e678f1e4bba0c540507cfe3743fbe54' THEN
@@ -1987,7 +1998,7 @@ BEGIN
     WHERE n.nspname='public' AND p.proname='qhub_create_review_request'
       AND p.proowner = (SELECT relowner FROM pg_class WHERE oid='public.qhub_manual_review_requests'::regclass);
   IF NOT FOUND THEN v_failed := v_failed || 'r7_create_review_owner_drift'::text; END IF;
-  IF (SELECT md5(p.prosrc) FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace
+  IF (SELECT md5(replace(p.prosrc, chr(13), '')) FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace
         WHERE n.nspname='public' AND p.proname='qhub_create_review_request'
           AND pg_get_function_identity_arguments(p.oid) = 'p_org_id text, p_project_id uuid, p_requester text, p_reason text, p_idempotency_key text')
      IS DISTINCT FROM '6b46c3d75636fd0c8b628b34a86f4084' THEN
@@ -2011,7 +2022,7 @@ BEGIN
     WHERE n.nspname='public' AND p.proname='qhub_record_acknowledgment'
       AND p.proowner = (SELECT relowner FROM pg_class WHERE oid='public.qhub_acknowledgments'::regclass);
   IF NOT FOUND THEN v_failed := v_failed || 'r7_record_ack_owner_drift'::text; END IF;
-  IF (SELECT md5(p.prosrc) FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace
+  IF (SELECT md5(replace(p.prosrc, chr(13), '')) FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace
         WHERE n.nspname='public' AND p.proname='qhub_record_acknowledgment')
      IS DISTINCT FROM 'b6035e9a35f5ecc49369b68000c7b2a6' THEN
     v_failed := v_failed || 'r7_record_ack_body_drift'::text;
@@ -2030,7 +2041,7 @@ BEGIN
       AND p.proowner = (SELECT relowner FROM pg_class WHERE oid='public.qhub_acknowledgments'::regclass)
       AND p.provolatile = 'i';
   IF NOT FOUND THEN v_failed := v_failed || 'r7_canon_cells_owner_or_volatility'::text; END IF;
-  IF (SELECT md5(p.prosrc) FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace
+  IF (SELECT md5(replace(p.prosrc, chr(13), '')) FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace
         WHERE n.nspname='public' AND p.proname='qhub_canon_cells')
      IS DISTINCT FROM '6151a5d4794e56fbc26fc891f8fefdb4' THEN
     v_failed := v_failed || 'r7_canon_cells_body_drift'::text;
@@ -2054,7 +2065,7 @@ BEGIN
   ) THEN
     v_failed := v_failed || 'r7_ack_immutable_trigger'::text;
   END IF;
-  IF (SELECT md5(p.prosrc) FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace
+  IF (SELECT md5(replace(p.prosrc, chr(13), '')) FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace
         WHERE n.nspname='public' AND p.proname='qhub_row_immutable')
      IS DISTINCT FROM '41ae59dde9a471b580d28e2cb45984f5' THEN
     v_failed := v_failed || 'r7_ack_immutable_body_drift'::text;

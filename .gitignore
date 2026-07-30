@@ -52,3 +52,6 @@ PRODUCTION-CREDENTIALS.md
 QHUB-ROTATION-RUNBOOK.md
 *-CREDENTIALS.md
 *-SECRETS.md
+
+# Supabase CLI link state — holds the pooler connection string for the linked project
+supabase/.temp/
