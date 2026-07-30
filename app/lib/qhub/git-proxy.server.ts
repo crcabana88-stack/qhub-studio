@@ -185,7 +185,12 @@ export function resolveApprovedTarget(rawPath: string | undefined, search = ''):
   return { url: parsed.toString(), host: parsed.hostname.toLowerCase() };
 }
 
-/** A redirect Location is only followed if it is itself an exact approved HTTPS origin. */
+/*
+ * R14 — a redirect must stay on the SAME approved origin as the current hop (scheme + host + effective
+ * port identical). github.com → gitlab.com is rejected even though both hosts are individually allowed;
+ * any scheme downgrade, userinfo, port change, or credential is rejected. This prevents an approved host
+ * from bouncing the credential-free relay onto a different approved (or internal) origin.
+ */
 function resolveApprovedRedirect(location: string, base: string): string {
   let target: URL;
 
@@ -195,12 +200,15 @@ function resolveApprovedRedirect(location: string, base: string): string {
     throw new GitProxyError('redirect_not_allowed');
   }
 
+  const from = new URL(base);
+
   if (
     target.protocol !== 'https:' ||
     target.username ||
     target.password ||
     target.port ||
-    !APPROVED.has(target.hostname.toLowerCase())
+    !APPROVED.has(target.hostname.toLowerCase()) ||
+    target.origin !== from.origin
   ) {
     throw new GitProxyError('redirect_not_allowed');
   }

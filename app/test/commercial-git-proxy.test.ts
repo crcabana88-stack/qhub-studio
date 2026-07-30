@@ -129,6 +129,24 @@ describe('R13 §7 — redirect revalidation + credential stripping', () => {
     expect(calls.map((c) => new URL(c.url).hostname)).toEqual(['github.com']);
   });
 
+  it('R14 §7 — a redirect from one approved origin to ANOTHER approved origin is rejected (github→gitlab)', async () => {
+    const { impl, calls } = mockFetch({ redirectTo: 'https://gitlab.com/o/r.git/info/refs' });
+    const { request, path } = proxyReq('github.com/o/r.git/info/refs?service=git-upload-pack');
+    const res = await handleGitProxy(request, path, { authenticate: authedUser, fetchImpl: impl });
+    expect(res.status).toBe(400);
+
+    // gitlab.com was never fetched — the relay stayed on the originating github.com origin.
+    expect(calls.map((c) => new URL(c.url).hostname)).toEqual(['github.com']);
+  });
+
+  it('R14 §7 — a SAME-origin redirect on an approved host IS followed', async () => {
+    const { impl, calls } = mockFetch({ redirectTo: 'https://github.com/o/r.git/git-upload-pack' });
+    const { request, path } = proxyReq('github.com/o/r.git/info/refs?service=git-upload-pack');
+    const res = await handleGitProxy(request, path, { authenticate: authedUser, fetchImpl: impl });
+    expect(res.status).toBe(200);
+    expect(calls.map((c) => new URL(c.url).pathname)).toEqual(['/o/r.git/info/refs', '/o/r.git/git-upload-pack']);
+  });
+
   it('incoming authorization / x-authorization / cookie / api-key are NOT forwarded (tests 8-10)', async () => {
     const { impl, calls } = mockFetch();
     const { request, path } = proxyReq('github.com/o/r.git/info/refs?service=git-upload-pack', 'GET', {

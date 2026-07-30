@@ -436,7 +436,85 @@ function isPublicExempt(moduleRel: string, effect: string): boolean {
   return PUBLIC_IMPORT_EFFECT_EXEMPTIONS.some((e) => e.module.test(`/${moduleRel}`) && e.effect === effect);
 }
 
-/** Classes permitted to perform ANY protected effect (they carry their own runtime authorization). */
+/*
+ * R14 §4 — machine-readable per-route OWN-effect exemptions for the R8-reviewed legacy provider routes:
+ * each calls a FIXED provider origin with a server-constructed request and a caller-cookie token (no
+ * caller-controlled destination — so it is PUBLIC_SAFE-appropriate under the existing model). Exact route
+ * + exact effect + reason, covered by positive + negative tests. Any other route/effect fails closed.
+ */
+const FIXED_PROVIDER_HTTP =
+  'fixed provider origin (api.<provider>.com); server-constructed request; caller-cookie token only; no caller-controlled destination (R8-reviewed)';
+const ROUTE_OWN_EFFECT_EXEMPTIONS: Array<{ route: RegExp; effect: string; reason: string }> = [
+  // Fixed-provider HTTP proxies — a fixed api.<provider>.com origin, caller-cookie token, no caller URL.
+  { route: /api\.github-branches\.ts$/, effect: 'generic external HTTP', reason: FIXED_PROVIDER_HTTP },
+  { route: /api\.github-stats\.ts$/, effect: 'generic external HTTP', reason: FIXED_PROVIDER_HTTP },
+  { route: /api\.github-template\.ts$/, effect: 'generic external HTTP', reason: FIXED_PROVIDER_HTTP },
+  { route: /api\.gitlab-branches\.ts$/, effect: 'generic external HTTP', reason: FIXED_PROVIDER_HTTP },
+  { route: /api\.gitlab-projects\.ts$/, effect: 'generic external HTTP', reason: FIXED_PROVIDER_HTTP },
+  { route: /api\.supabase-user\.ts$/, effect: 'generic external HTTP', reason: FIXED_PROVIDER_HTTP },
+  { route: /api\.supabase\.ts$/, effect: 'generic external HTTP', reason: FIXED_PROVIDER_HTTP },
+  { route: /api\.supabase\.variables\.ts$/, effect: 'generic external HTTP', reason: FIXED_PROVIDER_HTTP },
+  { route: /api\.system\.git-info\.ts$/, effect: 'generic external HTTP', reason: FIXED_PROVIDER_HTTP },
+  { route: /api\.netlify-user\.ts$/, effect: 'generic external HTTP', reason: FIXED_PROVIDER_HTTP },
+  { route: /api\.vercel-user\.ts$/, effect: 'generic external HTTP', reason: FIXED_PROVIDER_HTTP },
+
+  /*
+   * netlify-user / vercel-user: the effect-name matches api.netlify.com / api.vercel.com, but the call is a
+   * read of the connected account ("get current user") — no publish/deploy is performed.
+   */
+  {
+    route: /api\.netlify-user\.ts$/,
+    effect: 'deployment/publication',
+    reason:
+      'reads the connected Netlify account via a fixed api.netlify.com origin (caller-cookie token); performs no deploy/publish (R8-reviewed)',
+  },
+  {
+    route: /api\.vercel-user\.ts$/,
+    effect: 'deployment/publication',
+    reason:
+      'reads the connected Vercel account via a fixed api.vercel.com origin (caller-cookie token); performs no deploy/publish (R8-reviewed)',
+  },
+
+  // models: lists AVAILABLE provider models (read); no generation/invoke.
+  {
+    route: /api\.models\.ts$/,
+    effect: 'model/provider client',
+    reason:
+      'lists available provider models (read-only listing); performs no model generation/invocation (R8-reviewed)',
+  },
+
+  // mcp-check: reads/validates connector config; the effect-name matches but no connector is mutated.
+  {
+    route: /api\.mcp-check\.ts$/,
+    effect: 'MCP/connector mutation',
+    reason:
+      'reads/validates MCP connector configuration (no connector mutation despite the effect-name match) (R8-reviewed)',
+  },
+
+  // git-info / disk-info: FIXED local system commands with NO caller input (command-injection-safe), dev-only.
+  {
+    route: /api\.git-info\.ts$/,
+    effect: 'child process',
+    reason:
+      'runs FIXED local git commands (git rev-parse/status/log) with NO caller input — command-injection-safe local repo status (dev feature) (R8-reviewed)',
+  },
+  {
+    route: /api\.system\.disk-info\.ts$/,
+    effect: 'child process',
+    reason:
+      'runs the FIXED "df -k" command with NO caller input — local disk usage (dev feature, guarded off on Cloudflare) (R8-reviewed)',
+  },
+];
+
+function isRouteExempt(routeRel: string, effect: string): boolean {
+  return ROUTE_OWN_EFFECT_EXEMPTIONS.some((e) => e.route.test(routeRel) && e.effect === effect);
+}
+
+/*
+ * Classes that carry their own runtime authorization and may perform any protected effect. NOTE:
+ * SERVER_ENTRY is deliberately NOT here — R14 §6 removes the blanket "server code may do anything" grant;
+ * each server entry point is instead held to an EXACT allowed-effect set (SERVER_ENTRY_ALLOWED below).
+ */
 const SERVER_AUTHORIZED_CLASSES = new Set([
   'INTERNAL_SERVER_ONLY',
   'COMMERCIAL_READY',
@@ -445,8 +523,38 @@ const SERVER_AUTHORIZED_CLASSES = new Set([
   'REQUIRES_COMMERCIAL_READY_TOKEN',
   'REQUIRES_STAFF_CONTEXT',
   'MIXED_EXPLICIT_EXPORT_CLASSIFICATION',
-  'SERVER_ENTRY',
 ]);
+
+/*
+ * R14 §6 — EXACT allowed-effect set per server-entry group (machine-readable, reasoned). An entry that
+ * performs an effect outside its declared set fails closed. Derived from the actual entry sources.
+ */
+const SERVER_ENTRY_ALLOWED: Array<{ match: RegExp; allowed: string[]; reason: string }> = [
+  {
+    match: /\/functions\//,
+    allowed: [],
+    reason:
+      'Cloudflare Pages Function request entry: delegates to the built server bundle via a literal dynamic import; performs no direct protected effect',
+  },
+  {
+    match: /\/scripts\//,
+    allowed: [
+      'service-role / DB mutation',
+      'generic external HTTP',
+      'dynamic secret read',
+      'filesystem write',
+      'child process',
+    ],
+    reason:
+      'deploy/build/preflight scripts run at release time with host privilege: filesystem, child processes, the service-role schema verifier (read-only), and its Supabase HTTP call',
+  },
+  {
+    match: /\/app\/entry\.server\.tsx$/,
+    allowed: ['queue/event publish'],
+    reason:
+      'Remix server render entry: react-dom/server streaming surfaces an emit()-shaped call; no network/secret/db/fs/process effect',
+  },
+];
 
 // Every other class (PUBLIC_SAFE, PURE_NO_IO, unclassified, ambiguous) may perform NO protected effect.
 
@@ -471,8 +579,23 @@ function unauthorizedEffects(classification: string | undefined, effectLabels: s
     return [];
   }
 
-  // PUBLIC_SAFE / PURE_NO_IO / unclassified / ambiguous → every protected effect is unauthorized.
+  // PUBLIC_SAFE / PURE_NO_IO / SERVER_ENTRY / unclassified / ambiguous → every protected effect is unauthorized here.
   return effectLabels;
+}
+
+/**
+ * File-scoped authorization: SERVER_ENTRY is held to its EXACT allowed-effect set (by module glob);
+ * everything else defers to the class rule. An undeclared server-entry effect fails closed.
+ */
+function unauthorizedForFile(rel: string, classification: string | undefined, effectLabels: string[]): string[] {
+  if (classification === 'SERVER_ENTRY') {
+    const entry = SERVER_ENTRY_ALLOWED.find((e) => e.match.test(`/${rel}`));
+    const allowed = entry?.allowed ?? [];
+
+    return effectLabels.filter((e) => !allowed.includes(e));
+  }
+
+  return unauthorizedEffects(classification, effectLabels);
 }
 
 /** The set of modules reachable from a single entry file (its transitive import closure, incl. itself). */
@@ -541,27 +664,36 @@ function authorizeFixtureGraph(
 }
 
 /*
- * R13 §5 — COMPLETE-GRAPH effect authorization over every visited module. Each module gets an
- * authorization RESULT; every server module + server entry point is ENFORCED (unauthorized effect or
- * sensitive logging → violation). A PUBLIC_SAFE route may reach no protected effect through the server
- * modules in its closure (renamed/re-exported wrappers included).
+ * R13 §5 + R14 §4/§6 — COMPLETE-GRAPH effect authorization. Every visited module gets a result. Every
+ * server module + server entry point is enforced against its class (SERVER_ENTRY against its EXACT set).
+ * EVERY route is enforced against its OWN-source direct effects COMBINED with its transitive imported
+ * effects (no isServerModule filter excludes route-owned effects) + a sensitive-logging check.
  */
+interface RouteVerdict {
+  classification?: string;
+  direct: string[];
+  transitive: string[];
+  unauthorized: string[];
+  sensitiveLog: boolean;
+}
 interface EffectAuthReport {
   results: Map<string, { classification?: string; effects: string[]; enforced: boolean }>;
+  routeVerdicts: Map<string, RouteVerdict>;
   serverModulesEnforced: number;
   serverViolations: string[];
   publicRoutes: number;
-  publicBoundaryViolations: string[];
+  routeViolations: string[];
 }
 
 function runEffectAuthorization(): EffectAuthReport {
   const results = new Map<string, { classification?: string; effects: string[]; enforced: boolean }>();
+  const routeVerdicts = new Map<string, RouteVerdict>();
   const serverViolations: string[] = [];
-  const publicBoundaryViolations: string[] = [];
+  const routeViolations: string[] = [];
   let serverModulesEnforced = 0;
   let publicRoutes = 0;
 
-  // 1. Every visited module receives an authorization result; every server module is enforced.
+  // 1. Every visited module receives a result; every server MODULE (not routes — handled in step 2) is enforced.
   for (const file of graph.visited) {
     const rel = file.slice(REPO.length);
     const src = readFileSync(file, 'utf8');
@@ -576,52 +708,59 @@ function runEffectAuthorization(): EffectAuthReport {
 
     serverModulesEnforced += 1;
 
-    const unauth = unauthorizedEffects(classification, effects);
+    const unauth = unauthorizedForFile(rel, classification, effects);
 
     if (unauth.length) {
       serverViolations.push(`${rel} [${classification ?? 'UNCLASSIFIED'}] unauthorized: ${unauth.join(', ')}`);
     }
 
-    const sens = logsSensitive(src);
-
-    if (sens.length) {
-      serverViolations.push(`${rel} logs sensitive value: ${sens[0]}`);
+    if (logsSensitive(src).length) {
+      serverViolations.push(`${rel} logs sensitive value`);
     }
   }
 
-  // 2. PUBLIC_SAFE route boundary: no protected effect through its transitively-reachable SERVER modules.
+  // 2. EVERY route: enforce its OWN-source direct effects combined with its transitive imported effects.
   for (const entry of routeEntries) {
-    const rel = entry.replace(/\\/g, '/').slice(REPO.length);
-
-    if (routeClassification(readFileSync(entry, 'utf8')) !== 'PUBLIC_SAFE') {
-      continue;
-    }
-
-    publicRoutes += 1;
-
     const canonEntry = entry.replace(/\\/g, '/');
+    const rel = canonEntry.slice(REPO.length);
+    const ownSrc = readFileSync(entry, 'utf8');
+    const classification = routeClassification(ownSrc);
+
+    const direct = detectEffectsStripped(ownSrc);
+    const transitive: string[] = [];
 
     for (const mod of reachableFrom(entry)) {
-      /*
-       * Own-source protected I/O is the architecture test's domain (R8). The import graph enforces the
-       * TRANSITIVE-IMPORT evasion: an imported SERVER module (a renamed/re-exported wrapper) that carries
-       * a protected effect the route's PUBLIC classification does not authorize.
-       */
-      if (mod === canonEntry || !isServerModule(mod)) {
-        continue;
-      }
-
-      const modRel = mod.slice(REPO.length);
-
-      for (const effect of detectEffectsStripped(readFileSync(mod, 'utf8'))) {
-        if (!isPublicExempt(modRel, effect)) {
-          publicBoundaryViolations.push(`${rel} → ${modRel} :: ${effect}`);
+      if (mod !== canonEntry && isServerModule(mod)) {
+        for (const e of detectEffectsStripped(readFileSync(mod, 'utf8'))) {
+          if (!transitive.includes(e) && !isPublicExempt(mod.slice(REPO.length), e)) {
+            transitive.push(e);
+          }
         }
       }
     }
+
+    const combined = [...new Set([...direct, ...transitive])];
+    const unauthorized = combined.filter(
+      (e) => unauthorizedForFile(rel, classification, [e]).length > 0 && !isRouteExempt(rel, e),
+    );
+    const sensitiveLog = logsSensitive(ownSrc).length > 0;
+
+    routeVerdicts.set(rel, { classification, direct, transitive, unauthorized, sensitiveLog });
+
+    if (classification === 'PUBLIC_SAFE') {
+      publicRoutes += 1;
+    }
+
+    if (unauthorized.length) {
+      routeViolations.push(`${rel} [${classification ?? 'UNCLASSIFIED'}] unauthorized: ${unauthorized.join(', ')}`);
+    }
+
+    if (sensitiveLog) {
+      routeViolations.push(`${rel} [${classification ?? 'UNCLASSIFIED'}] logs sensitive value`);
+    }
   }
 
-  return { results, serverModulesEnforced, serverViolations, publicRoutes, publicBoundaryViolations };
+  return { results, routeVerdicts, serverModulesEnforced, serverViolations, publicRoutes, routeViolations };
 }
 
 const effectAuth = runEffectAuthorization();
@@ -692,12 +831,24 @@ describe('import-graph server-module discovery (R9 §8/§9, R11 §7/§8)', () =>
   });
 });
 
-describe('R13 §5 — broad effect authorization is ENFORCED over the complete server graph', () => {
+describe('R13 §5 + R14 §4/§6 — effect authorization ENFORCED over the complete graph incl. route own-source', () => {
   it('every visited module receives an authorization result (test 34, none skipped)', () => {
     expect(effectAuth.results.size).toBe(graph.visited.size);
 
     for (const file of graph.visited) {
       expect(effectAuth.results.has(file.slice(REPO.length)), file).toBe(true);
+    }
+  });
+
+  it('EVERY route receives an authorization verdict with direct + transitive effects (R14 §4, test 33)', () => {
+    const routeRels = routeEntries.map((f) => f.replace(/\\/g, '/').slice(REPO.length));
+    expect(effectAuth.routeVerdicts.size).toBe(routeRels.length);
+
+    for (const rel of routeRels) {
+      const v = effectAuth.routeVerdicts.get(rel);
+      expect(v, `no verdict for ${rel}`).toBeTruthy();
+      expect(Array.isArray(v?.direct)).toBe(true); // direct-effect result present
+      expect(Array.isArray(v?.transitive)).toBe(true); // transitive-effect result present
     }
   });
 
@@ -710,10 +861,8 @@ describe('R13 §5 — broad effect authorization is ENFORCED over the complete s
     expect(effectAuth.serverViolations, effectAuth.serverViolations.slice(0, 30).join('\n')).toEqual([]);
   });
 
-  it('NO PUBLIC_SAFE route reaches a protected effect through its server closure (broad taxonomy)', () => {
-    expect(effectAuth.publicBoundaryViolations, effectAuth.publicBoundaryViolations.slice(0, 30).join('\n')).toEqual(
-      [],
-    );
+  it('NO route performs an unauthorized OWN-source or transitive effect, and none logs sensitive values', () => {
+    expect(effectAuth.routeViolations, effectAuth.routeViolations.slice(0, 40).join('\n')).toEqual([]);
   });
 
   it('the hardened git-proxy is enforced as a server module with an authorized class and NO sensitive logging', () => {
@@ -727,6 +876,28 @@ describe('R13 §5 — broad effect authorization is ENFORCED over the complete s
 
     // The redesigned relay logs NOTHING sensitive (the legacy proxy logged request/response headers).
     expect(logsSensitive(readFileSync(`${REPO}app/lib/qhub/git-proxy.server.ts`, 'utf8'))).toEqual([]);
+  });
+
+  it('route OWN-effect exemptions are narrow (exact route + exact effect + reason) with pos/neg coverage', () => {
+    // Positive: an R8-reviewed fixed-provider route is exempt for its exact reviewed effect.
+    expect(isRouteExempt('app/routes/api.github-branches.ts', 'generic external HTTP')).toBe(true);
+    expect(isRouteExempt('app/routes/api.git-info.ts', 'child process')).toBe(true);
+    expect(isRouteExempt('app/routes/api.models.ts', 'model/provider client')).toBe(true);
+
+    // Negative: a DIFFERENT effect on an exempt route, or a non-exempt route, is NOT exempt (fail closed).
+    expect(isRouteExempt('app/routes/api.github-branches.ts', 'service-role / DB mutation')).toBe(false);
+    expect(isRouteExempt('app/routes/api.web-search.ts', 'generic external HTTP')).toBe(false);
+    expect(isRouteExempt('app/routes/pricing.tsx', 'generic external HTTP')).toBe(false);
+
+    for (const e of ROUTE_OWN_EFFECT_EXEMPTIONS) {
+      expect(e.reason.length).toBeGreaterThan(20);
+    }
+  });
+
+  it('the reclassified web-search route is INTERNAL_SERVER_ONLY (no PUBLIC arbitrary outbound fetch)', () => {
+    const v = effectAuth.routeVerdicts.get('app/routes/api.web-search.ts');
+    expect(v?.classification).toBe('INTERNAL_SERVER_ONLY');
+    expect(v?.unauthorized).toEqual([]); // an authenticated server route may reach the SSRF-safe fetcher
   });
 
   it('PUBLIC-import exemptions are narrow (exact module + exact effect + reason) with pos/neg coverage', () => {
@@ -836,18 +1007,38 @@ describe('R13 §8 — real-graph adversarial effect tests (repository-shaped)', 
     expect(logsSensitive(`export const loader = () => console.log('status', res.status);`)).toEqual([]);
   });
 
-  it('test 30/31 — functions/** + worker/job entry with an unauthorized effect fails under PUBLIC_SAFE', () => {
-    const fn = {
-      'functions/[[path]].ts': `import { h } from './h';\nexport const onRequest = () => h();`,
-      './h': `export const h = () => freezeReleaseCandidate();`,
-    };
-    expect(authorizeFixtureGraph('SERVER_ENTRY', fn, 'functions/[[path]].ts')).toEqual([]);
-    expect(authorizeFixtureGraph('PUBLIC_SAFE', fn, 'functions/[[path]].ts')).toContain('deployment/publication');
+  it('test 30/31/35/36 — functions/** + worker/job entries get EXACT-effect enforcement (R14 §6)', () => {
+    // functions/** allowed set is empty → a deployment effect in a functions entry fails closed.
+    expect(unauthorizedForFile('functions/[[path]].ts', 'SERVER_ENTRY', ['deployment/publication'])).toEqual([
+      'deployment/publication',
+    ]);
+
+    // scripts/** exact allowed set: child_process/filesystem/http/service-role/dynamic-secret pass...
+    expect(
+      unauthorizedForFile('scripts/build-with-identity.mjs', 'SERVER_ENTRY', ['child process', 'filesystem write']),
+    ).toEqual([]);
+
+    // ...but an UNDECLARED effect (e.g. stripe, queue publish) in a script fails closed (no blanket grant).
+    expect(unauthorizedForFile('scripts/build-with-identity.mjs', 'SERVER_ENTRY', ['stripe'])).toEqual(['stripe']);
+    expect(unauthorizedForFile('app/entry.server.tsx', 'SERVER_ENTRY', ['queue/event publish'])).toEqual([]);
+    expect(unauthorizedForFile('app/entry.server.tsx', 'SERVER_ENTRY', ['generic external HTTP'])).toEqual([
+      'generic external HTTP',
+    ]);
   });
 
-  it('test 32 — a deployment/CLI entry receives an explicit classification decision', () => {
+  it('test 32 — a deployment/CLI entry receives an explicit classification + exact-effect decision', () => {
     expect(classifyFile('scripts/build-with-identity.mjs', 'const x = 1;')).toBe('SERVER_ENTRY');
-    expect(unauthorizedEffects('SERVER_ENTRY', ['child process', 'filesystem write'])).toEqual([]);
+
+    // The decision is EXACT, not a blanket allow: the script's declared effects pass, others do not.
+    expect(unauthorizedForFile('scripts/build-with-identity.mjs', 'SERVER_ENTRY', ['child process'])).toEqual([]);
+    expect(
+      unauthorizedForFile('scripts/build-with-identity.mjs', 'SERVER_ENTRY', ['agent/enforcement/approval mutation']),
+    ).toEqual(['agent/enforcement/approval mutation']);
+
+    // Every server-entry allowed set carries a reason.
+    for (const e of SERVER_ENTRY_ALLOWED) {
+      expect(e.reason.length).toBeGreaterThan(20);
+    }
   });
 
   it('test 33 — an approved server-only module with a declared effect passes', () => {
@@ -863,6 +1054,96 @@ describe('R13 §8 — real-graph adversarial effect tests (repository-shaped)', 
     expect(graph.nonLiteralDynamic).toEqual([]); // a non-literal dynamic import is a hard failure
     // The detector itself flags a non-literal dynamic import.
     expect(hasNonLiteralDynamicImport(`await import(userPath)`)).toBe(true);
+  });
+});
+
+describe('R14 §9 — route OWN-source direct-effect enforcement (repository-shaped)', () => {
+  const PUBLIC = '/** @qhub-route: PUBLIC_SAFE */\n';
+
+  /*
+   * A repository-shaped route file (single module) run through the real engine — its OWN-source effects
+   * are combined into the verdict even with no imported module carrying the effect.
+   */
+  const directProbes: Array<[string, string, string]> = [
+    ['test 23 — direct fetch', 'generic external HTTP', `export const loader = () => fetch('https://x');`],
+    ['test 24 — direct secret read', 'dynamic secret read', `export const loader = (c) => c.env['SECRET_KEY'];`],
+    [
+      'test 26 — direct filesystem',
+      'filesystem write',
+      `import { writeFile } from 'node:fs';\nexport const action = () => writeFile('a','b',()=>{});`,
+    ],
+    [
+      'test 27 — direct child_process',
+      'child process',
+      `import { execSync } from 'node:child_process';\nexport const loader = () => execSync('ls');`,
+    ],
+    ['test 28 — direct queue publish', 'queue/event publish', `export const action = (j) => producer.send(j);`],
+    ['test 29a — direct provider', 'model/provider client', `export const loader = (p) => streamText(p);`],
+    ['test 29b — direct deployment', 'deployment/publication', `export const action = () => freezeReleaseCandidate();`],
+    [
+      'test 29c — direct connector',
+      'MCP/connector mutation',
+      `export const action = () => new MCPService().connectorMutate();`,
+    ],
+    [
+      'test 29d — direct service-role write',
+      'service-role / DB mutation',
+      `export const action = (t) => sb.from(t).insert({});`,
+    ],
+  ];
+
+  for (const [label, effect, body] of directProbes) {
+    it(`${label} in a PUBLIC_SAFE route fails; the same route as INTERNAL_SERVER_ONLY passes`, () => {
+      const src = `${PUBLIC}${body}`;
+      expect(authorizeFixtureGraph('PUBLIC_SAFE', { route: src }, 'route')).toContain(effect);
+      expect(authorizeFixtureGraph('INTERNAL_SERVER_ONLY', { route: src }, 'route')).toEqual([]);
+    });
+  }
+
+  it('test 25 — a PUBLIC_SAFE route logging request.headers fails the sensitive-log detector', () => {
+    expect(
+      logsSensitive(`export const loader = ({ request }) => console.log('h', Object.fromEntries(request.headers));`),
+    ).not.toEqual([]);
+  });
+
+  it('test 30 — a route with safe direct source and safe imports passes', () => {
+    const modules = {
+      route: `/** @qhub-route: PUBLIC_SAFE */\nimport { fmt } from './u';\nexport const loader = () => fmt(1);`,
+      './u': `export const fmt = (n) => String(n);`,
+    };
+    expect(authorizeFixtureGraph('PUBLIC_SAFE', modules, 'route')).toEqual([]);
+  });
+
+  it('test 31 — an authenticated/internal route with an explicitly allowed effect passes', () => {
+    const src = `/** @qhub-route: INTERNAL_SERVER_ONLY */\nexport const action = (t) => sb.from(t).insert({});`;
+    expect(authorizeFixtureGraph('INTERNAL_SERVER_ONLY', { route: src }, 'route')).toEqual([]);
+  });
+
+  it('test 32/33/34 — route-owned + transitive effects both appear in a real verdict; no route is filtered out', () => {
+    // Every real route has a verdict carrying BOTH a direct and a transitive effect array.
+    let withDirect = 0;
+    let withTransitive = 0;
+
+    for (const v of effectAuth.routeVerdicts.values()) {
+      expect(Array.isArray(v.direct)).toBe(true);
+      expect(Array.isArray(v.transitive)).toBe(true);
+
+      if (v.direct.length) {
+        withDirect += 1;
+      }
+
+      if (v.transitive.length) {
+        withTransitive += 1;
+      }
+    }
+
+    /*
+     * The verdict set covers routes that carry direct effects (e.g. the R8-reviewed provider routes) AND
+     * routes that only reach effects transitively — proving neither is excluded by isServerModule.
+     */
+    expect(withDirect).toBeGreaterThan(0);
+    expect(withTransitive).toBeGreaterThan(0);
+    expect(effectAuth.routeVerdicts.size).toBe(routeEntries.length);
   });
 });
 
