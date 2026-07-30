@@ -68,18 +68,37 @@ function isReviewEligibleCategory(category: string): boolean {
 export type ReviewResult = { ok: true; requestId: string; idempotent: boolean } | { ok: false; error: string };
 
 /**
+ * The authoritative Governance/acknowledgment identity a review is opened AGAINST (R8 §6).
+ * All values are SERVER-derived from the persisted Governance record — never from the browser.
+ */
+export interface ReviewGovernanceBinding {
+  governanceRecordId?: string | null;
+  governanceRecordVersion?: number | null;
+  declarationIdentityHash?: string | null;
+  acknowledgmentRecordId?: string | null;
+  acknowledgmentVersion?: string | null;
+}
+
+/**
  * @qhub-service: REQUIRES_COMMERCIAL_READY_TOKEN
  * Create a manual-review request. Requires an active membership on the request's
  * org (the caller cannot open a request for a tenant they do not belong to).
  * Prohibited categories are rejected; only review-eligible categories may queue. The
  * review's policy version is SERVER-DERIVED (currentReviewPolicyVersion) and stored on
  * the request — the browser never supplies it.
+ *
+ * R8 §6: the request PERSISTS the full authoritative identity set — the Governance record
+ * id/version, the required + accepted acknowledgment identity, the canonical
+ * declaration_identity_hash, the requester, and the idempotency key — and BINDS the complete
+ * set into request_hash so a changed declaration/policy/acknowledgment yields a distinct
+ * request (a legitimate re-review) while the prior request stays immutable.
  */
 export async function createReviewRequest(
   ctx: CommercialContext,
   input: { projectId?: string; category: string; reason: string; requestType?: string; idempotencyKey?: string },
   token: CommercialReadyToken,
   env: Record<string, string | undefined>,
+  binding: ReviewGovernanceBinding = {},
 ): Promise<ReviewResult> {
   if (!ctx.orgId) {
     return { ok: false, error: 'no_org_context' };
@@ -104,9 +123,10 @@ export async function createReviewRequest(
    * Server-derived request identity BINDS the COMPLETE current version set — org, project,
    * requester, use-case/data classification (requestType + category + reason), the current
    * policy version, the required acknowledgment version, the Governance policy-card version,
-   * and an optional client idempotency key. A change to ANY version yields a DISTINCT request
-   * (a legitimate re-review) while the prior request + audit remain immutable; an exact repeat
-   * under the SAME complete version set is idempotent (the unique(org_id, request_hash)).
+   * the authoritative Governance record id/version + declaration identity hash, and an optional
+   * client idempotency key. A change to ANY version yields a DISTINCT request (a legitimate
+   * re-review) while the prior request + audit remain immutable; an exact repeat under the SAME
+   * complete version set is idempotent (the unique(org_id, request_hash)).
    */
   const requestHash = await sha256Hex(
     [
@@ -119,6 +139,9 @@ export async function createReviewRequest(
       policyVersion,
       ackVersion,
       governanceVersion,
+      binding.governanceRecordId ?? '',
+      binding.governanceRecordVersion == null ? '' : String(binding.governanceRecordVersion),
+      binding.declarationIdentityHash ?? '',
       input.idempotencyKey ?? '',
     ].join('|'),
   );
@@ -135,6 +158,16 @@ export async function createReviewRequest(
       request_hash: requestHash,
       policy_version: policyVersion,
       status: 'pending',
+
+      // R8 §6 — persisted authoritative identity (server-derived only).
+      requester_user_id: ctx.userId,
+      required_acknowledgment_version: ackVersion,
+      idempotency_key: input.idempotencyKey ?? null,
+      governance_record_id: binding.governanceRecordId ?? null,
+      governance_record_version: binding.governanceRecordVersion ?? null,
+      declaration_identity_hash: binding.declarationIdentityHash ?? null,
+      acknowledgment_record_id: binding.acknowledgmentRecordId ?? null,
+      acknowledgment_version: binding.acknowledgmentVersion ?? null,
     })
     .select('id')
     .maybeSingle();

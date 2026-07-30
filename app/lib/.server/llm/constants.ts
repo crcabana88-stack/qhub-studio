@@ -3,6 +3,9 @@
  * This serves as a fallback when model-specific limits are unavailable
  * Modern models like Claude 3.5, GPT-4o, and Gemini Pro support 128k+ tokens
  */
+/** AST-readable module authority classification (commercial-architecture.test.ts). */
+export const __QHUB_MODULE_CLASSIFICATION = 'INTERNAL_SERVER_ONLY' as const;
+
 export const MAX_TOKENS = 128000;
 
 /*

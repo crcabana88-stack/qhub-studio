@@ -1,3 +1,6 @@
+/** AST-readable module authority classification (commercial-architecture.test.ts). */
+export const __QHUB_MODULE_CLASSIFICATION = 'INTERNAL_SERVER_ONLY' as const;
+
 export default class SwitchableStream extends TransformStream {
   private _controller: TransformStreamDefaultController | null = null;
   private _currentReader: ReadableStreamDefaultReader | null = null;

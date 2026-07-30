@@ -15,6 +15,7 @@ import type { CommercialContext } from '~/lib/qhub/commercial/commercial-context
 import type { RiskTier } from '~/lib/qhub/classification';
 import { assertReadyToken, type CommercialReadyToken } from '~/lib/qhub/commercial/commercial-schema-check.server';
 import {
+  buildDeclarationIdentityString,
   currentGovernancePolicyCardVersion,
   currentRequiredAcknowledgmentVersion,
   currentReviewPolicyVersion,
@@ -23,6 +24,11 @@ import {
   type Disposition,
 } from '~/lib/qhub/commercial/governance-essentials';
 import { createReviewRequest } from '~/lib/qhub/commercial/review.server';
+
+async function sha256Hex(s: string): Promise<string> {
+  const buf = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(s));
+  return [...new Uint8Array(buf)].map((b) => b.toString(16).padStart(2, '0')).join('');
+}
 
 function admin(env: Record<string, string | undefined>): SupabaseClient {
   const url = env.SUPABASE_URL ?? process.env.SUPABASE_URL ?? '';
@@ -77,6 +83,15 @@ export interface GovernanceRecord {
 
   /** The acknowledgment version the human accepted (R7 currency check). */
   acknowledgmentVersion: string | null;
+
+  /** R8 §6: the authoritative Governance record id (for review binding). */
+  governanceRecordId?: string | null;
+
+  /** R8 §6: the monotonic Governance record version (bumped on material declaration change). */
+  recordVersion?: number | null;
+
+  /** R8 §6: the canonical declaration_identity_hash of the current material declaration. */
+  declarationIdentityHash?: string | null;
 }
 
 /**
@@ -112,8 +127,40 @@ export async function upsertDeclaration(
     !!input.purpose.trim() && !!input.useCase.trim() && input.dataClasses.length > 0 && !!input.modelDeclaration.trim();
 
   const reviewState = evalResult.disposition === 'manual_review' ? 'requested' : 'none';
+  const policyCardVersion = currentGovernancePolicyCardVersion();
+
+  // R8 §6: the canonical identity of THIS material declaration (server-derived).
+  const declarationIdentityHash = await sha256Hex(
+    buildDeclarationIdentityString({
+      orgId: ctx.orgId,
+      projectId: input.projectId,
+      purpose: input.purpose,
+      useCase: input.useCase,
+      dataClasses: input.dataClasses,
+      riskTier: input.riskTier,
+      modelDeclaration: input.modelDeclaration,
+      connectorDeclaration: input.connectorDeclaration,
+      policyCardVersion,
+    }),
+  );
 
   const sb = mutator(token, env);
+
+  /*
+   * Read the prior record to compute a MONOTONIC record_version — it bumps whenever the
+   * material declaration identity changes (a same-content re-write keeps the version).
+   */
+  const { data: prior } = await sb
+    .from('qhub_governance_essentials')
+    .select('id,record_version,declaration_identity_hash')
+    .eq('project_id', input.projectId)
+    .eq('org_id', ctx.orgId)
+    .maybeSingle();
+
+  const priorVersion = (prior?.record_version as number) ?? 0;
+  const priorHash = (prior?.declaration_identity_hash as string | undefined) ?? undefined;
+  const recordVersion = priorHash === declarationIdentityHash ? priorVersion || 1 : priorVersion + 1;
+
   await sb.from('qhub_governance_essentials').upsert(
     {
       project_id: input.projectId,
@@ -128,7 +175,11 @@ export async function upsertDeclaration(
       declaration_complete: declarationComplete,
 
       // Bind the CURRENT Governance policy-card version to this declaration (R7 currency).
-      policy_card_version: currentGovernancePolicyCardVersion(),
+      policy_card_version: policyCardVersion,
+
+      // R8 §6: persist the monotonic version + canonical declaration identity.
+      record_version: recordVersion,
+      declaration_identity_hash: declarationIdentityHash,
 
       // A new declaration invalidates a prior acknowledgment AND any prior review approval.
       acknowledged: false,
@@ -140,7 +191,20 @@ export async function upsertDeclaration(
     { onConflict: 'project_id' },
   );
 
-  // Open a staff review request for sensitive data.
+  // Resolve the authoritative Governance record id for the review binding.
+  let governanceRecordId = (prior?.id as string) ?? null;
+
+  if (!governanceRecordId) {
+    const { data: fresh } = await sb
+      .from('qhub_governance_essentials')
+      .select('id')
+      .eq('project_id', input.projectId)
+      .eq('org_id', ctx.orgId)
+      .maybeSingle();
+    governanceRecordId = (fresh?.id as string) ?? null;
+  }
+
+  // Open a staff review request for sensitive data — BOUND to this Governance identity.
   if (evalResult.disposition === 'manual_review') {
     const sensitive = input.dataClasses.find((c) => ['personal', 'financial', 'restricted'].includes(c));
 
@@ -150,6 +214,7 @@ export async function upsertDeclaration(
         { projectId: input.projectId, category: sensitive, reason: 'Sensitive data declared in Governance Essentials' },
         token,
         env,
+        { governanceRecordId, governanceRecordVersion: recordVersion, declarationIdentityHash },
       );
     }
   }
@@ -165,8 +230,11 @@ export async function upsertDeclaration(
 
     // A fresh declaration has no decided review yet (any prior approval was invalidated).
     reviewPolicyVersion: null,
-    policyCardVersion: currentGovernancePolicyCardVersion(),
+    policyCardVersion,
     acknowledgmentVersion: null,
+    governanceRecordId,
+    recordVersion,
+    declarationIdentityHash,
   };
 }
 
@@ -234,7 +302,7 @@ export async function getGovernanceRecord(
   const { data } = await sb
     .from('qhub_governance_essentials')
     .select(
-      'project_id,org_id,disposition,declaration_complete,acknowledged,review_state,risk_tier,review_policy_version,policy_card_version,acknowledgment_version',
+      'id,project_id,org_id,disposition,declaration_complete,acknowledged,review_state,risk_tier,review_policy_version,policy_card_version,acknowledgment_version,record_version,declaration_identity_hash',
     )
     .eq('project_id', projectId)
     .eq('org_id', orgId)
@@ -255,6 +323,9 @@ export async function getGovernanceRecord(
     reviewPolicyVersion: (data.review_policy_version as string) ?? null,
     policyCardVersion: (data.policy_card_version as string) ?? null,
     acknowledgmentVersion: (data.acknowledgment_version as string) ?? null,
+    governanceRecordId: (data.id as string) ?? null,
+    recordVersion: (data.record_version as number) ?? null,
+    declarationIdentityHash: (data.declaration_identity_hash as string) ?? null,
   };
 }
 

@@ -1,14 +1,23 @@
 -- ============================================================================
--- QHUB Commercial Launch Foundation — R3 HARDENING
+-- QHUB Commercial Launch Foundation — R8 FINAL SECURITY CLOSURE
 -- Migration: 20260729_commercial_launch_foundation  (replaces the rejected
 --            4b42555a… contents IN PLACE — one authoritative commercial migration)
--- Schema version: 2026-07-30.commercial-launch-r4
+-- Schema version: 2026-07-30.commercial-launch-r5
 --
 -- Central commercial security boundary: authoritative membership/staff, real
 -- project ownership, checkout-intent binding (metadata is never tenant authority),
 -- a recoverable webhook inbox with LEASES, an atomic project-derived credit RPC,
 -- persisted Governance Essentials as the build gate, staff-authorized review, and
 -- a qhub_verify_commercial_schema() contract that checks exact semantics.
+--
+-- R5 (R8) adds PERSISTED AUTHORITATIVE REVIEW IDENTITY: a review request now stores the
+-- exact Governance record id/version, the required + accepted acknowledgment identity, the
+-- canonical declaration_identity_hash, the requester, and the idempotency key; the Governance
+-- record carries a monotonic record_version + declaration_identity_hash. Every reviewed
+-- operation binds to that stored set, so a changed purpose/use-case/data/model/connector/
+-- classification/policy/acknowledgment cannot be satisfied by an older review. All R5 changes
+-- are ADDITIVE (nullable columns + guarded FKs/checks); legacy rows remain readable but their
+-- NULL identity can never satisfy the new current-review authorization.
 --
 -- SAFETY: single transaction (BEGIN/COMMIT — full rollback on any failure).
 -- Additive only: no DROP / DELETE / TRUNCATE / destructive type change / fabricated
@@ -311,6 +320,70 @@ CREATE INDEX IF NOT EXISTS idx_qhub_gov_essentials_org        ON public.qhub_gov
 CREATE INDEX IF NOT EXISTS idx_qhub_webhook_state             ON public.qhub_billing_webhook_events (state, lease_expires_at);
 CREATE INDEX IF NOT EXISTS idx_qhub_checkout_intents_org      ON public.qhub_checkout_intents (org_id, status);
 CREATE INDEX IF NOT EXISTS idx_qhub_entitlement_audit_org     ON public.qhub_entitlement_audit (org_id, created_at);
+
+-- ─── R5 (R8): PERSISTED AUTHORITATIVE REVIEW / GOVERNANCE IDENTITY ───────────
+-- Additive only — nullable columns + guarded FKs/checks. A hex-64 declaration_identity_hash
+-- binds the material customer declaration; the Governance record carries a monotonic
+-- record_version; a review request stores the exact identity set it was authorized against.
+-- Legacy rows keep NULL identity and therefore can never satisfy the new authorization.
+
+ALTER TABLE public.qhub_governance_essentials
+  ADD COLUMN IF NOT EXISTS record_version             BIGINT NOT NULL DEFAULT 1,
+  ADD COLUMN IF NOT EXISTS declaration_identity_hash  TEXT;
+
+ALTER TABLE public.qhub_manual_review_requests
+  ADD COLUMN IF NOT EXISTS governance_record_id           UUID,
+  ADD COLUMN IF NOT EXISTS governance_record_version      BIGINT,
+  ADD COLUMN IF NOT EXISTS required_acknowledgment_version TEXT,
+  ADD COLUMN IF NOT EXISTS acknowledgment_record_id       UUID,
+  ADD COLUMN IF NOT EXISTS acknowledgment_version         TEXT,
+  ADD COLUMN IF NOT EXISTS declaration_identity_hash      TEXT,
+  ADD COLUMN IF NOT EXISTS idempotency_key                TEXT,
+  ADD COLUMN IF NOT EXISTS requester_user_id              TEXT;
+
+-- Canonical declaration_identity_hash format: lowercase SHA-256 hex (64 chars) when present.
+DO $$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_constraint
+    WHERE conrelid = 'public.qhub_governance_essentials'::regclass AND conname = 'chk_qhub_gov_decl_hash_hex'
+  ) THEN
+    ALTER TABLE public.qhub_governance_essentials
+      ADD CONSTRAINT chk_qhub_gov_decl_hash_hex
+      CHECK (declaration_identity_hash IS NULL OR declaration_identity_hash ~ '^[0-9a-f]{64}$');
+  END IF;
+
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_constraint
+    WHERE conrelid = 'public.qhub_manual_review_requests'::regclass AND conname = 'chk_qhub_review_decl_hash_hex'
+  ) THEN
+    ALTER TABLE public.qhub_manual_review_requests
+      ADD CONSTRAINT chk_qhub_review_decl_hash_hex
+      CHECK (declaration_identity_hash IS NULL OR declaration_identity_hash ~ '^[0-9a-f]{64}$');
+  END IF;
+
+  -- FK: review.governance_record_id → the authoritative Governance record.
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_constraint
+    WHERE conrelid = 'public.qhub_manual_review_requests'::regclass AND conname = 'fk_qhub_review_governance_record'
+  ) THEN
+    ALTER TABLE public.qhub_manual_review_requests
+      ADD CONSTRAINT fk_qhub_review_governance_record
+      FOREIGN KEY (governance_record_id) REFERENCES public.qhub_governance_essentials (id);
+  END IF;
+
+  -- FK: review.acknowledgment_record_id → the authoritative acknowledgment row.
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_constraint
+    WHERE conrelid = 'public.qhub_manual_review_requests'::regclass AND conname = 'fk_qhub_review_acknowledgment_record'
+  ) THEN
+    ALTER TABLE public.qhub_manual_review_requests
+      ADD CONSTRAINT fk_qhub_review_acknowledgment_record
+      FOREIGN KEY (acknowledgment_record_id) REFERENCES public.qhub_acknowledgments (id);
+  END IF;
+END $$;
+
+CREATE INDEX IF NOT EXISTS idx_qhub_review_governance_record ON public.qhub_manual_review_requests (governance_record_id);
 
 -- ─── Shared updated_at trigger ──────────────────────────────────────────────
 CREATE OR REPLACE FUNCTION public.qhub_commercial_touch_updated_at()
@@ -853,6 +926,23 @@ BEGIN
     RETURN jsonb_build_object('ok', false, 'reason', 'prohibited_cannot_approve');
   END IF;
 
+  -- R5 (R8): a request that carries a persisted Governance identity may only be APPROVED while
+  -- that identity STILL matches the authoritative Governance record. If the customer changed the
+  -- declaration (new declaration_identity_hash / record_version) after opening the request, the
+  -- stale approval is refused BEFORE any side effect — a new review must be requested. Legacy
+  -- requests with a NULL declaration_identity_hash are unaffected (skip the drift check).
+  IF p_decision = 'approved' AND r.project_id IS NOT NULL AND r.declaration_identity_hash IS NOT NULL THEN
+    PERFORM 1 FROM public.qhub_governance_essentials g
+      WHERE g.project_id = r.project_id AND g.org_id = r.org_id
+        AND g.id IS NOT DISTINCT FROM r.governance_record_id
+        AND g.record_version IS NOT DISTINCT FROM r.governance_record_version
+        AND g.declaration_identity_hash IS NOT DISTINCT FROM r.declaration_identity_hash;
+
+    IF NOT FOUND THEN
+      RETURN jsonb_build_object('ok', false, 'reason', 'governance_changed');
+    END IF;
+  END IF;
+
   UPDATE public.qhub_manual_review_requests
      SET status = p_decision, decided_by = p_actor, decision_reason = p_reason,
          policy_version = p_policy_version, decided_at = NOW()
@@ -865,10 +955,20 @@ BEGIN
      WHERE project_id = r.project_id AND org_id = r.org_id;
   END IF;
 
+  -- Immutable audit binds the FULL decided identity (request, decision, policy, and the persisted
+  -- Governance/acknowledgment/declaration identity the decision was authorized against).
   INSERT INTO public.qhub_entitlement_audit (org_id, actor, change_type, before_state, after_state, reason)
   VALUES (r.org_id, p_actor, 'REVIEW_DECISION',
           jsonb_build_object('request_id', p_request_id::text, 'prev_status', r.status),
-          jsonb_build_object('decision', p_decision, 'policy_version', p_policy_version), p_reason);
+          jsonb_build_object(
+            'decision', p_decision,
+            'policy_version', p_policy_version,
+            'governance_record_id', r.governance_record_id,
+            'governance_record_version', r.governance_record_version,
+            'declaration_identity_hash', r.declaration_identity_hash,
+            'acknowledgment_record_id', r.acknowledgment_record_id,
+            'acknowledgment_version', r.acknowledgment_version
+          ), p_reason);
 
   RETURN jsonb_build_object('ok', true, 'idempotent', false);
 END;
@@ -1194,8 +1294,79 @@ BEGIN
     v_failed := v_failed || 'checkout_session_setup_contract'::text;
   END IF;
 
+  -- R5 (R8): Governance record carries a monotonic record_version (NOT NULL) + a nullable
+  -- declaration_identity_hash.
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_attribute WHERE attrelid='public.qhub_governance_essentials'::regclass
+      AND attname='record_version' AND atttypid='int8'::regtype AND attnotnull AND NOT attisdropped
+  ) THEN
+    v_failed := v_failed || 'r5_gov_record_version'::text;
+  END IF;
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_attribute WHERE attrelid='public.qhub_governance_essentials'::regclass
+      AND attname='declaration_identity_hash' AND atttypid='text'::regtype AND NOT attisdropped
+  ) THEN
+    v_failed := v_failed || 'r5_gov_declaration_hash'::text;
+  END IF;
+
+  -- R5 (R8): the review request persists the FULL authoritative identity set. Each column must
+  -- exist with the exact type; all are NULLABLE (legacy rows readable, but NULL cannot satisfy
+  -- the new authorization).
+  FOR t IN SELECT unnest(ARRAY[
+    'governance_record_id:uuid','governance_record_version:int8','required_acknowledgment_version:text',
+    'acknowledgment_record_id:uuid','acknowledgment_version:text','declaration_identity_hash:text',
+    'idempotency_key:text','requester_user_id:text'
+  ]) LOOP
+    IF NOT EXISTS (
+      SELECT 1 FROM pg_attribute
+      WHERE attrelid='public.qhub_manual_review_requests'::regclass
+        AND attname = split_part(t, ':', 1)
+        AND atttypid = (split_part(t, ':', 2))::regtype
+        AND NOT attisdropped
+    ) THEN
+      v_failed := v_failed || ('r5_review_column:'||split_part(t, ':', 1))::text;
+    END IF;
+  END LOOP;
+
+  -- R5 (R8): declaration_identity_hash hex-64 format checks on BOTH tables.
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_constraint WHERE conrelid='public.qhub_governance_essentials'::regclass
+      AND conname='chk_qhub_gov_decl_hash_hex' AND contype='c'
+  ) THEN
+    v_failed := v_failed || 'r5_gov_hash_format_check'::text;
+  END IF;
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_constraint WHERE conrelid='public.qhub_manual_review_requests'::regclass
+      AND conname='chk_qhub_review_decl_hash_hex' AND contype='c'
+  ) THEN
+    v_failed := v_failed || 'r5_review_hash_format_check'::text;
+  END IF;
+
+  -- R5 (R8): FKs binding the review to the authoritative Governance + acknowledgment rows.
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_constraint WHERE conrelid='public.qhub_manual_review_requests'::regclass
+      AND conname='fk_qhub_review_governance_record' AND contype='f'
+  ) THEN
+    v_failed := v_failed || 'r5_review_governance_fk'::text;
+  END IF;
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_constraint WHERE conrelid='public.qhub_manual_review_requests'::regclass
+      AND conname='fk_qhub_review_acknowledgment_record' AND contype='f'
+  ) THEN
+    v_failed := v_failed || 'r5_review_acknowledgment_fk'::text;
+  END IF;
+
+  -- R5 (R8): the atomic decision RPC keeps its exact signature/security/search_path (the
+  -- Governance-drift + full-identity-audit body change does not alter the contract surface).
+  PERFORM 1 FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace
+    WHERE n.nspname='public' AND p.proname='qhub_decide_review'
+      AND p.prosecdef AND p.proconfig @> ARRAY['search_path=pg_catalog, public']
+      AND pg_get_function_identity_arguments(p.oid) = 'p_request_id uuid, p_actor text, p_is_staff boolean, p_decision text, p_reason text, p_policy_version text'
+      AND p.prorettype='jsonb'::regtype;
+  IF NOT FOUND THEN v_failed := v_failed || 'r5_decide_review_signature'::text; END IF;
+
   RETURN jsonb_build_object(
-    'expected_version', '2026-07-30.commercial-launch-r4',
+    'expected_version', '2026-07-30.commercial-launch-r5',
     'ready', (cardinality(v_failed) = 0),
     'failed', to_jsonb(v_failed)
   );

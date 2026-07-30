@@ -239,6 +239,45 @@ export function currentGovernancePolicyCardVersion(): string {
   return GOVERNANCE_POLICY_CARD_VERSION;
 }
 
+/** The MATERIAL declaration inputs that define a project's governance identity (R8 §6). */
+export interface DeclarationIdentityParts {
+  orgId: string;
+  projectId: string;
+  purpose: string;
+  useCase: string;
+  dataClasses: DataClass[];
+  riskTier: RiskTier;
+  modelDeclaration: string;
+  connectorDeclaration: string[];
+  policyCardVersion: string;
+}
+
+/**
+ * R8 §6: the canonical, deterministic STRING whose SHA-256 is the declaration_identity_hash.
+ * It binds the MATERIAL customer declaration (business purpose, use-case, data declaration,
+ * model declaration, connector declaration, risk classification) together with the policy-card
+ * identity and the project/org identity. Data classes + connectors are sorted and text is
+ * trimmed so the identity is stable under cosmetic reordering/whitespace; ANY material change
+ * (purpose/use-case/data/model/connector/risk/policy-card/project) yields a different identity,
+ * which invalidates a review bound to the old one. Server-derived values only.
+ */
+export function buildDeclarationIdentityString(parts: DeclarationIdentityParts): string {
+  const norm = (s: string) => s.trim();
+
+  return JSON.stringify({
+    v: 'qhub-declaration-identity-1',
+    org: parts.orgId,
+    project: parts.projectId,
+    purpose: norm(parts.purpose),
+    useCase: norm(parts.useCase),
+    data: [...parts.dataClasses].sort(),
+    riskTier: parts.riskTier,
+    model: norm(parts.modelDeclaration),
+    connectors: [...parts.connectorDeclaration].map(norm).sort(),
+    policyCard: parts.policyCardVersion,
+  });
+}
+
 export interface PolicyCard {
   tier: RiskTier;
   allowedDataClasses: DataClass[];

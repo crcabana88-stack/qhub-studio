@@ -6,17 +6,14 @@ import { json } from '@remix-run/cloudflare';
 import { getApiKeysFromCookie } from '~/lib/api/cookies';
 import { withSecurity } from '~/lib/security';
 
-async function supabaseUserLoader({ request, context }: { request: Request; context: any }) {
+async function supabaseUserLoader({ request }: { request: Request }) {
   try {
     // Get API keys from cookies (server-side only)
     const cookieHeader = request.headers.get('Cookie');
     const apiKeys = getApiKeysFromCookie(cookieHeader);
 
-    // Try to get Supabase token from various sources
-    const supabaseToken =
-      apiKeys.VITE_SUPABASE_ACCESS_TOKEN ||
-      context?.cloudflare?.env?.VITE_SUPABASE_ACCESS_TOKEN ||
-      process.env.VITE_SUPABASE_ACCESS_TOKEN;
+    // ONLY the caller's OWN cookie token — never a server env credential (R8 §1).
+    const supabaseToken = apiKeys.VITE_SUPABASE_ACCESS_TOKEN;
 
     if (!supabaseToken) {
       return json({ error: 'Supabase token not found' }, { status: 401 });
@@ -85,7 +82,7 @@ export const loader = withSecurity(supabaseUserLoader, {
   allowedMethods: ['GET'],
 });
 
-async function supabaseUserAction({ request, context }: { request: Request; context: any }) {
+async function supabaseUserAction({ request }: { request: Request }) {
   try {
     const formData = await request.formData();
     const action = formData.get('action');
@@ -94,11 +91,8 @@ async function supabaseUserAction({ request, context }: { request: Request; cont
     const cookieHeader = request.headers.get('Cookie');
     const apiKeys = getApiKeysFromCookie(cookieHeader);
 
-    // Try to get Supabase token from various sources
-    const supabaseToken =
-      apiKeys.VITE_SUPABASE_ACCESS_TOKEN ||
-      context?.cloudflare?.env?.VITE_SUPABASE_ACCESS_TOKEN ||
-      process.env.VITE_SUPABASE_ACCESS_TOKEN;
+    // ONLY the caller's OWN cookie token — never a server env credential (R8 §1).
+    const supabaseToken = apiKeys.VITE_SUPABASE_ACCESS_TOKEN;
 
     if (!supabaseToken) {
       return json({ error: 'Supabase token not found' }, { status: 401 });

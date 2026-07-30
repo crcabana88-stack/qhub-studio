@@ -2,6 +2,9 @@ import { createScopedLogger } from '~/utils/logger';
 
 const logger = createScopedLogger('stream-recovery');
 
+/** AST-readable module authority classification (commercial-architecture.test.ts). */
+export const __QHUB_MODULE_CLASSIFICATION = 'INTERNAL_SERVER_ONLY' as const;
+
 export interface StreamRecoveryOptions {
   maxRetries?: number;
   timeout?: number;

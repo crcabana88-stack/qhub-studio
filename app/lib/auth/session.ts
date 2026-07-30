@@ -20,6 +20,7 @@
 
 import { createServerClient } from '@supabase/ssr';
 import { createCookieMethods } from '~/lib/auth/supabase-cookies';
+import { parseDeployEnv } from '~/lib/qhub/deploy-env';
 
 /**
  * Browser-safe session type.
@@ -42,22 +43,30 @@ export interface QhubSession {
  *   if (!session) return redirect('/login');
  */
 /**
- * Whether an unconfigured-Supabase dev fallback is permitted. Only true when
- * QHUB_ALLOW_DEV_AUTH is explicitly set AND the deploy environment is NOT a
- * staging/preview/production marker. This makes the dev fallback impossible in
- * staging/production (P1-10 fail-closed).
+ * Whether an unconfigured-Supabase dev fallback is permitted.
+ *
+ * Fail-closed by construction (P1 #2):
+ *   1. QHUB_ALLOW_DEV_AUTH must be EXACTLY "true" (no "1", no case/whitespace tolerance).
+ *   2. The deploy environment must parse — via the SINGLE canonical parser — to a LOCAL
+ *      kind, which is ONLY the exact strings `local` or `test`. Anything else (missing,
+ *      empty, whitespace-padded, mixed-case, misspelled, unknown, or the DEPLOYED markers
+ *      staging/production) yields INVALID/DEPLOYED and forbids the fallback.
+ *
+ * NODE_ENV is never consulted and can never re-enable this. There is no manual
+ * lowercasing/trimming/defaulting of the deploy-environment string here — the canonical
+ * parser is the only authority.
  */
 export function isDevAuthAllowed(env: Record<string, string | undefined>): boolean {
-  const flag = (env.QHUB_ALLOW_DEV_AUTH ?? process.env.QHUB_ALLOW_DEV_AUTH ?? '').toLowerCase();
+  const flag = env.QHUB_ALLOW_DEV_AUTH ?? process.env.QHUB_ALLOW_DEV_AUTH;
 
-  if (flag !== 'true' && flag !== '1') {
+  if (flag !== 'true') {
     return false;
   }
 
-  const deployEnv = (env.QHUB_DEPLOY_ENV ?? process.env.QHUB_DEPLOY_ENV ?? '').toLowerCase();
+  const parsed = parseDeployEnv(env.QHUB_DEPLOY_ENV ?? process.env.QHUB_DEPLOY_ENV);
 
-  // Any recognized non-local marker forbids the fallback.
-  return !['staging', 'preview', 'production', 'prod'].includes(deployEnv);
+  // ONLY an exact local/test environment (LOCAL kind) permits the dev fallback.
+  return parsed.kind === 'LOCAL';
 }
 
 /** Signal returned when Supabase auth config is absent and no dev fallback is allowed. */

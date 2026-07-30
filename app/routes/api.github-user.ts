@@ -1,25 +1,37 @@
 /*
- * @qhub-route: PUBLIC_SAFE
- * @qhub-boundary: PUBLIC_SAFE — proxies the caller's OWN connection using their own cookie/header token; no server secret, self-scoped.
+ * @qhub-route: INTERNAL_SERVER_ONLY
+ * @qhub-boundary: INTERNAL_SERVER_ONLY — requires an authenticated session; proxies GitHub
+ * using ONLY the caller's OWN cookie token (never a server secret / env credential), returns
+ * only non-secret metadata (login, repos, branches), and NEVER returns a raw token value.
+ * Errors are redacted (no token, no authorization header, no env value).
  */
 import { json } from '@remix-run/cloudflare';
 import { getApiKeysFromCookie } from '~/lib/api/cookies';
+import { getVerifiedUser } from '~/lib/auth/session';
 import { withSecurity } from '~/lib/security';
+
+/** The caller's OWN GitHub token from THEIR cookie — never a server env credential. */
+function callerGithubToken(cookieHeader: string | null): string | undefined {
+  const apiKeys = getApiKeysFromCookie(cookieHeader);
+  return apiKeys.GITHUB_API_KEY || apiKeys.VITE_GITHUB_ACCESS_TOKEN;
+}
+
+/** Require an authenticated session (a strong internal boundary — not anonymously reachable). */
+async function requireAuth(request: Request, context: any): Promise<boolean> {
+  const env = (context?.cloudflare?.env as Record<string, string | undefined>) ?? {};
+  const user = await getVerifiedUser(request, env);
+
+  return user !== null && user !== 'missing_config';
+}
 
 async function githubUserLoader({ request, context }: { request: Request; context: any }) {
   try {
-    // Get API keys from cookies (server-side only)
-    const cookieHeader = request.headers.get('Cookie');
-    const apiKeys = getApiKeysFromCookie(cookieHeader);
+    if (!(await requireAuth(request, context))) {
+      return json({ error: 'unauthenticated' }, { status: 401 });
+    }
 
-    // Try to get GitHub token from various sources
-    const githubToken =
-      apiKeys.GITHUB_API_KEY ||
-      apiKeys.VITE_GITHUB_ACCESS_TOKEN ||
-      context?.cloudflare?.env?.GITHUB_TOKEN ||
-      context?.cloudflare?.env?.VITE_GITHUB_ACCESS_TOKEN ||
-      process.env.GITHUB_TOKEN ||
-      process.env.VITE_GITHUB_ACCESS_TOKEN;
+    // ONLY the caller's own cookie token — never a server env credential.
+    const githubToken = callerGithubToken(request.headers.get('Cookie'));
 
     if (!githubToken) {
       return json({ error: 'GitHub token not found' }, { status: 401 });
@@ -57,15 +69,9 @@ async function githubUserLoader({ request, context }: { request: Request; contex
       html_url: userData.html_url,
       type: userData.type,
     });
-  } catch (error) {
-    console.error('Error fetching GitHub user:', error);
-    return json(
-      {
-        error: 'Failed to fetch GitHub user information',
-        details: error instanceof Error ? error.message : String(error),
-      },
-      { status: 500 },
-    );
+  } catch {
+    // Redacted — never surface an error message (may carry a token / auth header / env value).
+    return json({ error: 'Failed to fetch GitHub user information' }, { status: 500 });
   }
 }
 
@@ -76,6 +82,10 @@ export const loader = withSecurity(githubUserLoader, {
 
 async function githubUserAction({ request, context }: { request: Request; context: any }) {
   try {
+    if (!(await requireAuth(request, context))) {
+      return json({ error: 'unauthenticated' }, { status: 401 });
+    }
+
     let action: string | null = null;
     let repoFullName: string | null = null;
     let searchQuery: string | null = null;
@@ -98,18 +108,8 @@ async function githubUserAction({ request, context }: { request: Request; contex
       perPage = parseInt(formData.get('per_page') as string) || 30;
     }
 
-    // Get API keys from cookies (server-side only)
-    const cookieHeader = request.headers.get('Cookie');
-    const apiKeys = getApiKeysFromCookie(cookieHeader);
-
-    // Try to get GitHub token from various sources
-    const githubToken =
-      apiKeys.GITHUB_API_KEY ||
-      apiKeys.VITE_GITHUB_ACCESS_TOKEN ||
-      context?.cloudflare?.env?.GITHUB_TOKEN ||
-      context?.cloudflare?.env?.VITE_GITHUB_ACCESS_TOKEN ||
-      process.env.GITHUB_TOKEN ||
-      process.env.VITE_GITHUB_ACCESS_TOKEN;
+    // ONLY the caller's own cookie token — never a server env credential.
+    const githubToken = callerGithubToken(request.headers.get('Cookie'));
 
     if (!githubToken) {
       return json({ error: 'GitHub token not found' }, { status: 401 });
@@ -199,13 +199,6 @@ async function githubUserAction({ request, context }: { request: Request; contex
       });
     }
 
-    if (action === 'get_token') {
-      // Return the GitHub token for git authentication
-      return json({
-        token: githubToken,
-      });
-    }
-
     if (action === 'search_repos') {
       if (!searchQuery) {
         return json({ error: 'Search query is required' }, { status: 400 });
@@ -273,15 +266,9 @@ async function githubUserAction({ request, context }: { request: Request; contex
     }
 
     return json({ error: 'Invalid action' }, { status: 400 });
-  } catch (error) {
-    console.error('Error in GitHub user action:', error);
-    return json(
-      {
-        error: 'Failed to process GitHub request',
-        details: error instanceof Error ? error.message : String(error),
-      },
-      { status: 500 },
-    );
+  } catch {
+    // Redacted — never surface an error message (may carry a token / auth header / env value).
+    return json({ error: 'Failed to process GitHub request' }, { status: 500 });
   }
 }
 

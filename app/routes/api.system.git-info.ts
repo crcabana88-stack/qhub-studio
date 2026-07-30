@@ -24,13 +24,6 @@ interface GitInfo {
   timestamp?: string;
 }
 
-// Define context type
-interface AppContext {
-  env?: {
-    GITHUB_ACCESS_TOKEN?: string;
-  };
-}
-
 interface GitHubRepo {
   name: string;
   full_name: string;
@@ -62,7 +55,7 @@ declare const __GIT_REPO_NAME: string;
  * declare const __GIT_REPO_URL: string;
  */
 
-export const loader: LoaderFunction = async ({ request, context }: LoaderFunctionArgs & { context: AppContext }) => {
+export const loader: LoaderFunction = async ({ request }: LoaderFunctionArgs) => {
   console.log('Git info API called with URL:', request.url);
 
   // Handle CORS preflight requests
@@ -82,24 +75,21 @@ export const loader: LoaderFunction = async ({ request, context }: LoaderFunctio
   console.log('Git info action:', action);
 
   if (action === 'getUser' || action === 'getRepos' || action === 'getOrgs' || action === 'getActivity') {
-    // Use server-side token instead of client-side token
-    const serverGithubToken = process.env.GITHUB_ACCESS_TOKEN || context.env?.GITHUB_ACCESS_TOKEN;
+    /*
+     * SELF-SCOPED: only the caller's OWN token (Authorization header or their cookie) is used.
+     * A server GITHUB_ACCESS_TOKEN is never read here — a PUBLIC_SAFE route must not touch a
+     * server secret (R8 §1). Callers proxy their own GitHub connection, nothing else.
+     */
     const cookieToken = request.headers
       .get('Cookie')
       ?.split(';')
       .find((cookie) => cookie.trim().startsWith('githubToken='))
       ?.split('=')[1];
 
-    // Also check for token in Authorization header
     const authHeader = request.headers.get('Authorization');
     const headerToken = authHeader?.startsWith('Bearer ') ? authHeader.substring(7) : null;
 
-    const token = serverGithubToken || headerToken || cookieToken;
-
-    console.log(
-      'Using GitHub token from:',
-      serverGithubToken ? 'server env' : headerToken ? 'auth header' : cookieToken ? 'cookie' : 'none',
-    );
+    const token = headerToken || cookieToken;
 
     if (!token) {
       console.error('No GitHub token available');

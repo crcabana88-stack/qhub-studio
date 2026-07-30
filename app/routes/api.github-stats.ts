@@ -7,20 +7,11 @@ import { getApiKeysFromCookie } from '~/lib/api/cookies';
 import { withSecurity } from '~/lib/security';
 import type { GitHubUserResponse, GitHubStats } from '~/types/GitHub';
 
-async function githubStatsLoader({ request, context }: { request: Request; context: any }) {
+async function githubStatsLoader({ request }: { request: Request }) {
   try {
-    // Get API keys from cookies (server-side only)
-    const cookieHeader = request.headers.get('Cookie');
-    const apiKeys = getApiKeysFromCookie(cookieHeader);
-
-    // Try to get GitHub token from various sources
-    const githubToken =
-      apiKeys.GITHUB_API_KEY ||
-      apiKeys.VITE_GITHUB_ACCESS_TOKEN ||
-      context?.cloudflare?.env?.GITHUB_TOKEN ||
-      context?.cloudflare?.env?.VITE_GITHUB_ACCESS_TOKEN ||
-      process.env.GITHUB_TOKEN ||
-      process.env.VITE_GITHUB_ACCESS_TOKEN;
+    // ONLY the caller's OWN cookie token — never a server env credential (R8 §1).
+    const apiKeys = getApiKeysFromCookie(request.headers.get('Cookie'));
+    const githubToken = apiKeys.GITHUB_API_KEY || apiKeys.VITE_GITHUB_ACCESS_TOKEN;
 
     if (!githubToken) {
       return json({ error: 'GitHub token not found' }, { status: 401 });

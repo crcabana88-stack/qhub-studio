@@ -6,17 +6,14 @@ import { json } from '@remix-run/cloudflare';
 import { getApiKeysFromCookie } from '~/lib/api/cookies';
 import { withSecurity } from '~/lib/security';
 
-async function netlifyUserLoader({ request, context }: { request: Request; context: any }) {
+async function netlifyUserLoader({ request }: { request: Request }) {
   try {
     // Get API keys from cookies (server-side only)
     const cookieHeader = request.headers.get('Cookie');
     const apiKeys = getApiKeysFromCookie(cookieHeader);
 
-    // Try to get Netlify token from various sources
-    const netlifyToken =
-      apiKeys.VITE_NETLIFY_ACCESS_TOKEN ||
-      context?.cloudflare?.env?.VITE_NETLIFY_ACCESS_TOKEN ||
-      process.env.VITE_NETLIFY_ACCESS_TOKEN;
+    // ONLY the caller's OWN cookie token — never a server env credential (R8 §1).
+    const netlifyToken = apiKeys.VITE_NETLIFY_ACCESS_TOKEN;
 
     if (!netlifyToken) {
       return json({ error: 'Netlify token not found' }, { status: 401 });
@@ -70,7 +67,7 @@ export const loader = withSecurity(netlifyUserLoader, {
   allowedMethods: ['GET'],
 });
 
-async function netlifyUserAction({ request, context }: { request: Request; context: any }) {
+async function netlifyUserAction({ request }: { request: Request }) {
   try {
     const formData = await request.formData();
     const action = formData.get('action');
@@ -79,11 +76,8 @@ async function netlifyUserAction({ request, context }: { request: Request; conte
     const cookieHeader = request.headers.get('Cookie');
     const apiKeys = getApiKeysFromCookie(cookieHeader);
 
-    // Try to get Netlify token from various sources
-    const netlifyToken =
-      apiKeys.VITE_NETLIFY_ACCESS_TOKEN ||
-      context?.cloudflare?.env?.VITE_NETLIFY_ACCESS_TOKEN ||
-      process.env.VITE_NETLIFY_ACCESS_TOKEN;
+    // ONLY the caller's OWN cookie token — never a server env credential (R8 §1).
+    const netlifyToken = apiKeys.VITE_NETLIFY_ACCESS_TOKEN;
 
     if (!netlifyToken) {
       return json({ error: 'Netlify token not found' }, { status: 401 });

@@ -9,6 +9,7 @@
 
 import { createHash } from 'node:crypto';
 import type { RiskTier } from './classification';
+import { parseDeployEnv } from './deploy-env';
 import type { Environment, GovernedActionReceipt, GovernedActionType, GovernedExecutionMode } from './enforcement';
 
 const APPROVED_PROJECT_REF = 'jsjsanmaahvmynblmzkq';
@@ -134,7 +135,8 @@ function commonSimulationPreflight(input: GovernedAdapterPreflightInput): Adapte
     return { available: false, reason: 'simulation adapters are disabled' };
   }
 
-  if (value(env, 'QHUB_DEPLOY_ENV').toLowerCase() !== 'staging') {
+  // Canonical parser only — a DEPLOYED environment whose exact value is `staging`.
+  if (parseDeployEnv(value(env, 'QHUB_DEPLOY_ENV')).env !== 'staging') {
     return { available: false, reason: 'runtime is not staging' };
   }
 

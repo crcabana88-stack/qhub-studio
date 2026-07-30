@@ -183,6 +183,43 @@ describe('every repository deploy/preview path runs schema verification', () => 
     const bad = 'wrangler pages deploy build/client';
     expect(PKG_DEPLOY.test(bad) && !PKG_PREFLIGHT.test(bad)).toBe(true);
   });
+
+  /*
+   * R8 §3 — UNIVERSAL START/PREVIEW PREFLIGHT. Every serving/preview script that accepts
+   * traffic (Wrangler `pages dev`, a `vite preview`, or anything serving ./build/client) MUST
+   * run the startup preflight first. Direct Wrangler start/preview paths are NOT exempt.
+   */
+  const PKG_SERVE = /wrangler\s+pages\s+dev|vite\s+preview|remix-serve|\.\/build\/client/;
+
+  it('every serving/preview package script (incl. direct wrangler pages dev) runs the startup preflight', () => {
+    const offenders = Object.entries(pkg.scripts).filter(([, cmd]) => PKG_SERVE.test(cmd) && !PKG_PREFLIGHT.test(cmd));
+    expect(
+      offenders.map(([n]) => n),
+      offenders.map(([n]) => n).join(', '),
+    ).toEqual([]);
+  });
+
+  it('the concrete serving scripts each chain the startup preflight', () => {
+    for (const s of ['start:windows', 'start:unix', 'dockerstart']) {
+      expect(pkg.scripts[s], `${s} missing`).toBeDefined();
+      expect(pkg.scripts[s], `${s} lacks startup-preflight`).toMatch(/startup-preflight\.mjs/);
+
+      // preflight precedes the wrangler serve.
+      expect(pkg.scripts[s].indexOf('startup-preflight')).toBeLessThan(pkg.scripts[s].indexOf('wrangler'));
+    }
+  });
+
+  it('the preview → start chain reaches a preflighted serving script', () => {
+    expect(pkg.scripts.preview).toMatch(/run\s+start\b/);
+
+    // start spawns start:windows / start:unix, both preflighted above.
+    expect(pkg.scripts.start).toMatch(/start:windows|start:unix/);
+  });
+
+  it('a direct wrangler pages dev serving script WITHOUT preflight is detected (fixture, no Wrangler exemption)', () => {
+    const bad = 'wrangler pages dev ./build/client';
+    expect(PKG_SERVE.test(bad) && !PKG_PREFLIGHT.test(bad)).toBe(true);
+  });
 });
 
 // ─── startup preflight subprocess behavior ──────────────────────────────────────

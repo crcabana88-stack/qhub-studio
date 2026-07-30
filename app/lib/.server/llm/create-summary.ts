@@ -7,6 +7,9 @@ import { LLMManager } from '~/lib/modules/llm/manager';
 
 const logger = createScopedLogger('create-summary');
 
+/** AST-readable module authority classification (commercial-architecture.test.ts). */
+export const __QHUB_MODULE_CLASSIFICATION = 'INTERNAL_SERVER_ONLY' as const;
+
 export async function createSummary(props: {
   messages: Message[];
   env?: Env;

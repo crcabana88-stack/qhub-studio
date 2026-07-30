@@ -22,7 +22,7 @@ interface BranchInfo {
   isDefault: boolean;
 }
 
-async function githubBranchesLoader({ request, context }: { request: Request; context: any }) {
+async function githubBranchesLoader({ request }: { request: Request }) {
   try {
     let owner: string;
     let repo: string;
@@ -52,19 +52,9 @@ async function githubBranchesLoader({ request, context }: { request: Request; co
         return json({ error: 'Owner and repo parameters are required' }, { status: 400 });
       }
 
-      // Get API keys from cookies (server-side only)
-      const cookieHeader = request.headers.get('Cookie');
-      const apiKeys = getApiKeysFromCookie(cookieHeader);
-
-      // Try to get GitHub token from various sources
-      githubToken =
-        apiKeys.GITHUB_API_KEY ||
-        apiKeys.VITE_GITHUB_ACCESS_TOKEN ||
-        context?.cloudflare?.env?.GITHUB_TOKEN ||
-        context?.cloudflare?.env?.VITE_GITHUB_ACCESS_TOKEN ||
-        process.env.GITHUB_TOKEN ||
-        process.env.VITE_GITHUB_ACCESS_TOKEN ||
-        '';
+      // ONLY the caller's OWN cookie token — never a server env credential (R8 §1).
+      const apiKeys = getApiKeysFromCookie(request.headers.get('Cookie'));
+      githubToken = apiKeys.GITHUB_API_KEY || apiKeys.VITE_GITHUB_ACCESS_TOKEN || '';
     }
 
     if (!githubToken) {

@@ -24,8 +24,48 @@ import { describe, it, expect } from 'vitest';
 
 const APP = fileURLToPath(new URL('../', import.meta.url));
 
+function scriptKind(name: string): ts.ScriptKind {
+  return name.endsWith('.tsx') ? ts.ScriptKind.TSX : ts.ScriptKind.TS;
+}
+
 function parse(name: string, src: string): ts.SourceFile {
-  return ts.createSourceFile(name, src, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS);
+  return ts.createSourceFile(name, src, ts.ScriptTarget.Latest, true, scriptKind(name));
+}
+
+/** R8 §4: parse diagnostics must be EMPTY — a parse failure is a hard test failure, never ignored. */
+function parseDiagnostics(name: string, src: string): readonly ts.Diagnostic[] {
+  const sf = parse(name, src);
+  return (sf as unknown as { parseDiagnostics?: ts.Diagnostic[] }).parseDiagnostics ?? [];
+}
+
+/**
+ * R8 §1: a server-secret env NAME. A PUBLIC_SAFE route may never READ one from the server
+ * environment (process.env / cloudflare.env / context.env). The public anon key is browser-safe
+ * by design and explicitly excluded; non-secret operational vars (build info, deploy env, price
+ * IDs, CF Pages markers) do not match the name pattern.
+ */
+const SECRET_ENV_NAME = /(TOKEN|SECRET|CREDENTIAL|PASSWORD|APIKEY|ACCESS_KEY|SERVICE_ROLE|PRIVATE|_KEY$|_KEY_)/;
+const PUBLIC_ENV_NAMES = new Set(['SUPABASE_ANON_KEY']);
+
+/** Names of server-secret env vars READ (from any env object) anywhere in a source file. */
+function serverSecretEnvReads(src: string): string[] {
+  const hits = new Set<string>();
+
+  for (const line of src.split('\n')) {
+    if (!/\.env\b/.test(line)) {
+      continue;
+    }
+
+    for (const m of line.matchAll(/\b([A-Z][A-Z0-9_]{2,})\b/g)) {
+      const name = m[1];
+
+      if (!PUBLIC_ENV_NAMES.has(name) && SECRET_ENV_NAME.test(name)) {
+        hits.add(name);
+      }
+    }
+  }
+
+  return [...hits];
 }
 
 const SERVICE_EXPORT_CLASSES = [
@@ -160,20 +200,74 @@ function exportedCallables(sf: ts.SourceFile): ExportedCallable[] {
       }
     }
 
-    // export class X { m(){} static s(){} constructor(){} }
+    // export class X { m(){} static s(){} constructor(){} get g(){} set s(v){} }
     if (ts.isClassDeclaration(stmt) && isExport(stmt)) {
-      const cname = stmt.name?.text ?? 'default';
+      pushClassMembers(sf, stmt, pushFn);
+    }
 
-      for (const m of stmt.members) {
-        if ((ts.isMethodDeclaration(m) || ts.isConstructorDeclaration(m)) && m.body) {
-          const mname = ts.isConstructorDeclaration(m) ? 'constructor' : ((m.name as ts.Identifier)?.text ?? 'method');
-          pushFn(`${cname}.${mname}`, m.parameters, m.body.getText(sf), leadingComment(sf, m));
+    // export default class X { ... }
+    if (ts.isClassDeclaration(stmt) && stmt.modifiers?.some((m) => m.kind === ts.SyntaxKind.DefaultKeyword)) {
+      pushClassMembers(sf, stmt, pushFn);
+    }
+
+    // export namespace N { export function f(){} export const g = () => {} }
+    if (ts.isModuleDeclaration(stmt) && isExport(stmt) && stmt.body && ts.isModuleBlock(stmt.body)) {
+      const ns = (stmt.name as ts.Identifier)?.text ?? 'namespace';
+
+      for (const s of stmt.body.statements) {
+        if (ts.isFunctionDeclaration(s) && isExport(s) && s.body) {
+          pushFn(`${ns}.${s.name?.text ?? 'default'}`, s.parameters, s.body.getText(sf), leadingComment(sf, s));
+        }
+
+        if (ts.isVariableStatement(s) && isExport(s)) {
+          for (const d of s.declarationList.declarations) {
+            if (
+              ts.isIdentifier(d.name) &&
+              d.initializer &&
+              (ts.isArrowFunction(d.initializer) || ts.isFunctionExpression(d.initializer))
+            ) {
+              pushFn(
+                `${ns}.${d.name.text}`,
+                d.initializer.parameters,
+                d.initializer.body?.getText(sf) ?? '',
+                leadingComment(sf, s),
+              );
+            }
+          }
         }
       }
     }
   }
 
   return out;
+}
+
+/** All callable members of a class — methods, constructors, and getters/setters (R8 §4). */
+function pushClassMembers(
+  sf: ts.SourceFile,
+  stmt: ts.ClassDeclaration,
+  pushFn: (name: string, params: readonly ts.ParameterDeclaration[], body: string, comment: string) => void,
+): void {
+  const cname = stmt.name?.text ?? 'default';
+
+  for (const m of stmt.members) {
+    if (
+      (ts.isMethodDeclaration(m) ||
+        ts.isConstructorDeclaration(m) ||
+        ts.isGetAccessorDeclaration(m) ||
+        ts.isSetAccessorDeclaration(m)) &&
+      m.body
+    ) {
+      const mname = ts.isConstructorDeclaration(m)
+        ? 'constructor'
+        : ts.isGetAccessorDeclaration(m)
+          ? `get_${(m.name as ts.Identifier)?.text ?? 'accessor'}`
+          : ts.isSetAccessorDeclaration(m)
+            ? `set_${(m.name as ts.Identifier)?.text ?? 'accessor'}`
+            : ((m.name as ts.Identifier)?.text ?? 'method');
+      pushFn(`${cname}.${mname}`, m.parameters, m.body.getText(sf), leadingComment(sf, m));
+    }
+  }
 }
 
 function moduleClassification(sf: ts.SourceFile): string | 'MISSING' | 'DYNAMIC' {
@@ -378,6 +472,15 @@ function checkRouteFile(name: string, src: string): string[] {
     violations.push(`${name} PUBLIC_SAFE route performs protected I/O`);
   }
 
+  // R8 §1: a PUBLIC_SAFE route must never read a server secret from the environment.
+  if (cls === 'PUBLIC_SAFE') {
+    const secrets = serverSecretEnvReads(src);
+
+    if (secrets.length > 0) {
+      violations.push(`${name} PUBLIC_SAFE route reads a server secret from env (${secrets.join(', ')})`);
+    }
+  }
+
   if (cls === 'STAFF_ONLY' && !/requireStaff\s*\(/.test(src)) {
     violations.push(`${name} STAFF_ONLY route does not use requireStaff`);
   }
@@ -480,8 +583,27 @@ function checkRouteFile(name: string, src: string): string[] {
 // ─── discovery ──────────────────────────────────────────────────────────────────
 
 const allRoutes = walk(`${APP}routes/`);
-const allServerModules = walk(`${APP}lib/`).filter((f) => f.endsWith('.server.ts'));
+
+/*
+ * R8 §4: server-module discovery covers BOTH the *.server.ts naming convention AND the
+ * app/lib/.server/** shared server-only directory (whose files do NOT end in .server.ts). A
+ * new module in either place enters the inventory automatically.
+ */
+const allServerModules = (() => {
+  const set = new Set<string>();
+
+  for (const f of walk(`${APP}lib/`)) {
+    if (f.endsWith('.server.ts') || f.endsWith('.server.tsx') || /\/\.server\//.test(f)) {
+      set.add(f);
+    }
+  }
+
+  return [...set];
+})();
 const commercialServiceModules = allServerModules.filter((f) => f.includes('/qhub/commercial/'));
+
+// Every discovered source that the architecture inventory parses (for the parse-diagnostic gate).
+const allInventorySources = [...allRoutes, ...allServerModules];
 
 // ─── real-source assertions ─────────────────────────────────────────────────────
 
@@ -501,8 +623,35 @@ describe('repository-wide route inventory (AST)', () => {
   }
 });
 
+describe('repository-wide parse-diagnostic gate (R8 §4)', () => {
+  it('every discovered route + server module parses with ZERO parse diagnostics', () => {
+    const offenders: string[] = [];
+
+    for (const f of allInventorySources) {
+      const diags = parseDiagnostics(f.slice(APP.length), readFileSync(f, 'utf8'));
+
+      if (diags.length > 0) {
+        offenders.push(`${f.slice(APP.length)} (${diags.length} parse diagnostics)`);
+      }
+    }
+
+    expect(offenders, offenders.join('\n')).toEqual([]);
+  });
+
+  it('the parse-diagnostic gate actually catches a malformed source (fixture)', () => {
+    expect(parseDiagnostics('bad.ts', 'export function (').length).toBeGreaterThan(0);
+  });
+
+  it('the app/lib/.server shared server-only directory is discovered', () => {
+    expect(
+      allServerModules.some((f) => /\/\.server\//.test(f)),
+      'no app/lib/.server module discovered',
+    ).toBe(true);
+  });
+});
+
 describe('repository-wide service inventory (AST)', () => {
-  it('every *.server.ts under app/lib is discovered + classified (count from filesystem)', () => {
+  it('every *.server.ts + app/lib/.server module is discovered + classified (count from filesystem)', () => {
     expect(allServerModules.length).toBeGreaterThanOrEqual(20);
 
     for (const f of allServerModules) {
@@ -733,5 +882,57 @@ describe('fixtures: the AST checker rejects violations', () => {
   it('export-star barrel from a non-internal module → rejected', () => {
     const src = svc(`export * from './secret-impl';`);
     expect(checkCommercialServiceModule('f.ts', src).join()).toMatch(/re-exports through a barrel/);
+  });
+
+  // ── R8 additions ────────────────────────────────────────────────────────────────
+
+  it('PUBLIC_SAFE route that READS a server secret from env → rejected (R8 §1)', () => {
+    for (const read of [
+      'const t = process.env.GITHUB_TOKEN;',
+      'const t = context?.cloudflare?.env?.VITE_SUPABASE_ACCESS_TOKEN;',
+      'const t = (context.cloudflare.env as any).STRIPE_SECRET_KEY;',
+      'const t = context.env?.NETLIFY_TOKEN;',
+    ]) {
+      const src = `// @qhub-route: PUBLIC_SAFE\nexport async function loader({ context }) { ${read} return t; }`;
+      expect(checkRouteFile('f.ts', src).join(), read).toMatch(/reads a server secret from env/);
+    }
+  });
+
+  it('a generic diagnostic route that serializes an env secret must not be PUBLIC_SAFE (R8 §1)', () => {
+    const src = `// @qhub-route: PUBLIC_SAFE\nexport async function loader() { return { key: process.env.SUPABASE_SERVICE_ROLE_KEY }; }`;
+    expect(checkRouteFile('f.ts', src).join()).toMatch(/reads a server secret from env/);
+  });
+
+  it('the public anon key + non-secret operational env vars are NOT flagged as secrets (R8 §1)', () => {
+    const src = `// @qhub-route: PUBLIC_SAFE\nexport async function loader({ context }) { const a = context.cloudflare.env.SUPABASE_ANON_KEY; const b = process.env.QHUB_BUILD_ARTIFACT_HASH; const c = process.env.CF_PAGES_URL; const d = process.env.STRIPE_ACCOUNT_ID; return [a,b,c,d]; }`;
+    expect(checkRouteFile('f.ts', src)).toEqual([]);
+  });
+
+  it('GETTER performing I/O under a PURE_NO_IO class is discovered + rejected (R8 §4)', () => {
+    const src = svc(
+      `/** @qhub-service: PURE_NO_IO */\nexport class C {\n /** @qhub-service: PURE_NO_IO */\n get thing() { return admin(this.env).from('x'); }\n}`,
+    );
+    expect(checkCommercialServiceModule('f.ts', src).join()).toMatch(/PURE_NO_IO but performs I\/O/);
+  });
+
+  it('SETTER performing a DB mutation without a token is discovered + rejected (R8 §4)', () => {
+    const src = svc(
+      `/** @qhub-service: INTERNAL_SERVER_ONLY */\nexport class C {\n /** @qhub-service: INTERNAL_SERVER_ONLY */\n set val(v) { admin(this.env).from('x').insert({ v }); }\n}`,
+    );
+    expect(checkCommercialServiceModule('f.ts', src).join()).toMatch(/not a token-guarded export/);
+  });
+
+  it('NAMESPACE-exported DB mutation without a token is discovered + rejected (R8 §4)', () => {
+    const src = svc(
+      `/** @qhub-service: INTERNAL_SERVER_ONLY */\nexport namespace N {\n /** @qhub-service: INTERNAL_SERVER_ONLY */\n export function w(env) { admin(env).from('x').insert({}); }\n}`,
+    );
+    expect(checkCommercialServiceModule('f.ts', src).join()).toMatch(/not a token-guarded export/);
+  });
+
+  it('DEFAULT-CLASS token method not validated is discovered + rejected (R8 §4)', () => {
+    const src = svc(
+      `/** @qhub-service: REQUIRES_COMMERCIAL_READY_TOKEN */\nexport default class {\n /** @qhub-service: REQUIRES_COMMERCIAL_READY_TOKEN */\n async run(token: CommercialReadyToken, env) { return 1; }\n}`,
+    );
+    expect(checkCommercialServiceModule('f.ts', src).join()).toMatch(/accepts a token but never validates it/);
   });
 });

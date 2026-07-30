@@ -17,6 +17,8 @@
  * Bump EXPECTED_SCHEMA_VERSION whenever a new required object is added.
  */
 
+import { parseDeployEnv } from '~/lib/qhub/deploy-env';
+
 // ─── Expected schema version ──────────────────────────────────────────────────
 
 /**
@@ -234,16 +236,25 @@ export function isDeployBypassAuthorized(env: DeployBypassEnv): DeployBypassDeci
     return { allowed: false, reason: 'no-skip-flag' };
   }
 
-  const deployEnv = (env.QHUB_DEPLOY_ENV ?? '').toLowerCase();
+  /*
+   * Canonical parser is the ONLY authority for the deploy-env string — no manual
+   * lowercase/trim/default/compare here. FLY_APP_NAME is a separate marker (not the
+   * deploy-env value) and is matched by substring.
+   */
+  const parsed = parseDeployEnv(env.QHUB_DEPLOY_ENV);
   const flyApp = (env.FLY_APP_NAME ?? '').toLowerCase();
 
-  const isProduction = deployEnv === 'production' || deployEnv === 'prod' || flyApp.includes('prod');
+  const isProduction = parsed.env === 'production' || flyApp.includes('prod');
 
   if (isProduction) {
     return { allowed: false, reason: 'production-never-bypasses' };
   }
 
-  const isStaging = deployEnv === 'staging' || deployEnv === 'preview' || flyApp.includes('staging');
+  /*
+   * ONLY an exact `staging` deploy env (or a staging Fly app) may bypass; an INVALID
+   * or missing deploy env is not a staging marker and refuses (fail closed).
+   */
+  const isStaging = parsed.env === 'staging' || flyApp.includes('staging');
 
   if (!isStaging) {
     return { allowed: false, reason: 'no-staging-marker' };

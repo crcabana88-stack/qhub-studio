@@ -1,6 +1,11 @@
-// @qhub-route: PUBLIC_SAFE
+/*
+ * @qhub-route: PUBLIC_SAFE
+ * @qhub-boundary: PUBLIC_SAFE — fetches PUBLIC template repos using ONLY the caller's OWN cookie
+ * token (optional, rate-limit only); no server secret, self-scoped.
+ */
 import { json } from '@remix-run/cloudflare';
 import JSZip from 'jszip';
+import { getApiKeysFromCookie } from '~/lib/api/cookies';
 
 // Function to detect if we're running in Cloudflare
 function isCloudflareEnvironment(context: any): boolean {
@@ -211,9 +216,13 @@ export async function loader({ request, context }: { request: Request; context: 
   }
 
   try {
-    // Access environment variables from Cloudflare context or process.env
-    const githubToken =
-      context?.cloudflare?.env?.GITHUB_TOKEN || process.env.GITHUB_TOKEN || process.env.VITE_GITHUB_ACCESS_TOKEN;
+    /*
+     * Template repos are PUBLIC; a token is optional and only raises the caller's GitHub rate
+     * limit. Use ONLY the caller's OWN cookie token — never a server env credential (R8 §1).
+     * When absent, the public unauthenticated fetch still succeeds.
+     */
+    const apiKeys = getApiKeysFromCookie(request.headers.get('Cookie'));
+    const githubToken = apiKeys.GITHUB_API_KEY || apiKeys.VITE_GITHUB_ACCESS_TOKEN || undefined;
 
     let fileList;
 

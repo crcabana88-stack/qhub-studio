@@ -89,7 +89,7 @@ describe('commercial-launch R3 migration', () => {
       await db.exec(sql);
 
       const v = await verify(db);
-      expect(v.expected_version).toBe('2026-07-30.commercial-launch-r4');
+      expect(v.expected_version).toBe('2026-07-30.commercial-launch-r5');
       expect(v.failed).toEqual([]);
       expect(v.ready).toBe(true);
     } finally {

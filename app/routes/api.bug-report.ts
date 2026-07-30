@@ -1,7 +1,13 @@
-// @qhub-route: PUBLIC_SAFE
+/*
+ * @qhub-route: INTERNAL_SERVER_ONLY
+ * @qhub-boundary: INTERNAL_SERVER_ONLY — reads a SERVER bot credential (GITHUB_BUG_REPORT_TOKEN)
+ * to file an issue on the app's own repo. The token is used only server-side and is NEVER
+ * returned. Requires an authenticated session before any I/O (a strong internal boundary).
+ */
 import { json, type ActionFunctionArgs } from '@remix-run/cloudflare';
 import { Octokit } from '@octokit/rest';
 import { z } from 'zod';
+import { getVerifiedUser } from '~/lib/auth/session';
 
 // Rate limiting store (in production, use Redis or similar)
 const rateLimitStore = new Map<string, { count: number; resetTime: number }>();
@@ -146,6 +152,15 @@ export async function action({ request, context }: ActionFunctionArgs) {
   // Only allow POST requests
   if (request.method !== 'POST') {
     return json({ error: 'Method not allowed' }, { status: 405 });
+  }
+
+  // INTERNAL_SERVER_ONLY: require an authenticated session before touching the bot credential.
+  const guardEnv =
+    ((context as { cloudflare?: { env?: unknown } })?.cloudflare?.env as Record<string, string | undefined>) ?? {};
+  const user = await getVerifiedUser(request, guardEnv);
+
+  if (user === null || user === 'missing_config') {
+    return json({ error: 'unauthenticated' }, { status: 401 });
   }
 
   try {
