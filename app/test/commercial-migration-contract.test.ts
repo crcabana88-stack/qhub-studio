@@ -18,6 +18,11 @@ const MIG = fileURLToPath(
 );
 const sql = readFileSync(MIG, 'utf8');
 
+// R11: the DB-authoritative current versions (seeded into qhub_commercial_authority).
+const POL = '2026-07-30.governance-essentials.v1';
+const ACK = '2026-07-30.acceptable-use.v1';
+const CARD = '2026-07-30.policy-card.v1';
+
 const TABLES = [
   'qhub_commercial_plans',
   'qhub_org_members',
@@ -89,7 +94,7 @@ describe('commercial-launch R3 migration', () => {
       await db.exec(sql);
 
       const v = await verify(db);
-      expect(v.expected_version).toBe('2026-07-30.commercial-launch-r6');
+      expect(v.expected_version).toBe('2026-07-30.commercial-launch-r7');
       expect(v.failed).toEqual([]);
       expect(v.ready).toBe(true);
     } finally {
@@ -517,29 +522,30 @@ describe('commercial-launch R3 migration', () => {
       const gid = '60000000-0000-0000-0000-000000000001';
       const aid = '70000000-0000-0000-0000-000000000001';
       await db.exec(`
+        insert into public.qhub_org_members (org_id, user_id, role, status) values ('o1','u1','builder','active');
         insert into public.qhub_project_entitlements (project_id, org_id, plan_id, active) values ('${pid}','o1','builder_beta', true);
         insert into public.qhub_acknowledgments (id, org_id, user_id, ack_type, ack_version, project_id, required_version, status)
-          values ('${aid}','o1','u1','acceptable_use','ack1','${pid}','ack1','ACTIVE');
+          values ('${aid}','o1','u1','acceptable_use','${ACK}','${pid}','${ACK}','ACTIVE');
         insert into public.qhub_governance_essentials
-          (id, project_id, org_id, disposition, review_state, record_version, declaration_identity_hash, acknowledged, acknowledgment_version, acknowledgment_record_id)
-          values ('${gid}','${pid}','o1','manual_review','requested', 4, '${HASH}', true, 'ack1', '${aid}');
+          (id, project_id, org_id, disposition, review_state, record_version, declaration_identity_hash, policy_card_version, acknowledged, acknowledgment_version, acknowledgment_record_id)
+          values ('${gid}','${pid}','o1','manual_review','requested', 4, '${HASH}', '${CARD}', true, '${ACK}', '${aid}');
         insert into public.qhub_quantex_staff (user_id, staff_role, active) values ('staff1','reviewer', true), ('staff2','reviewer', true);
         insert into public.qhub_manual_review_requests
           (id, org_id, project_id, request_type, category, reason, request_hash, status,
            governance_record_id, governance_record_version, declaration_identity_hash, policy_version,
            required_acknowledgment_version, acknowledgment_record_id, acknowledgment_version, requester_user_id)
           values ('${rid}','o1','${pid}','data_review','personal','sensitive','h','pending',
-           '${gid}', 4, '${HASH}', 'pol1', 'ack1', '${aid}', 'ack1', 'u1');
+           '${gid}', 4, '${HASH}', '${POL}', '${ACK}', '${aid}', '${ACK}', 'u1');
       `);
 
       // A caller-supplied is-staff flag is not enough — the actor must be an active staff row.
       const nonStaff = await db.query<{ v: { ok: boolean; reason: string } }>(
-        `select public.qhub_decide_review('${rid}','u1',true,'approved','ok','pol1') v`,
+        `select public.qhub_decide_review('${rid}','u1',true,'approved','ok','${POL}') v`,
       );
       expect(nonStaff.rows[0].v.reason).toBe('staff_required');
 
       const ok = await db.query<{ v: { ok: boolean } }>(
-        `select public.qhub_decide_review('${rid}','staff1',true,'approved','looks fine','pol1') v`,
+        `select public.qhub_decide_review('${rid}','staff1',true,'approved','looks fine','${POL}') v`,
       );
       expect(ok.rows[0].v.ok).toBe(true);
 
@@ -558,34 +564,35 @@ describe('commercial-launch R3 migration', () => {
       );
       expect(aud.rows[0].n).toBe(1);
 
-      // EXACT repeat (every material field matches) is idempotent — no second audit row.
+      // R11: EXACT repeat re-validates current authority FIRST, then returns idempotent (no 2nd audit).
       const rep = await db.query<{ v: { idempotent: boolean } }>(
-        `select public.qhub_decide_review('${rid}','staff1',true,'approved','looks fine','pol1') v`,
+        `select public.qhub_decide_review('${rid}','staff1',true,'approved','looks fine','${POL}') v`,
       );
       expect(rep.rows[0].v.idempotent).toBe(true);
 
       /*
        * MATERIALLY-changed repeats on a terminal request are deterministic conflicts, never
-       * idempotent: changed reason / policy version / decision / reviewer each reject.
+       * idempotent: changed reason / decision / reviewer each reject.
        */
       const changedReason = await db.query<{ v: { ok: boolean; reason: string } }>(
-        `select public.qhub_decide_review('${rid}','staff1',true,'approved','DIFFERENT reason','pol1') v`,
+        `select public.qhub_decide_review('${rid}','staff1',true,'approved','DIFFERENT reason','${POL}') v`,
       );
       expect(changedReason.rows[0].v.ok).toBe(false);
       expect(changedReason.rows[0].v.reason).toBe('decision_conflict');
 
+      // R11: a wrong/stale policy version is rejected by revalidation BEFORE the terminal branch.
       const changedPolicy = await db.query<{ v: { reason: string } }>(
-        `select public.qhub_decide_review('${rid}','staff1',true,'approved','looks fine','pol2') v`,
+        `select public.qhub_decide_review('${rid}','staff1',true,'approved','looks fine','some-other-policy') v`,
       );
-      expect(changedPolicy.rows[0].v.reason).toBe('decision_conflict');
+      expect(changedPolicy.rows[0].v.reason).toBe('policy_stale');
 
       const changedDecision = await db.query<{ v: { reason: string } }>(
-        `select public.qhub_decide_review('${rid}','staff1',true,'rejected','looks fine','pol1') v`,
+        `select public.qhub_decide_review('${rid}','staff1',true,'rejected','looks fine','${POL}') v`,
       );
       expect(changedDecision.rows[0].v.reason).toBe('decision_conflict');
 
       const changedReviewer = await db.query<{ v: { reason: string } }>(
-        `select public.qhub_decide_review('${rid}','staff2',true,'approved','looks fine','pol1') v`,
+        `select public.qhub_decide_review('${rid}','staff2',true,'approved','looks fine','${POL}') v`,
       );
       expect(changedReviewer.rows[0].v.reason).toBe('decision_conflict');
 
@@ -769,10 +776,10 @@ async function seedReviewRequired(db: PGlite) {
     insert into public.qhub_org_members (org_id, user_id, role, status) values ('o1','u1','builder','active');
     insert into public.qhub_project_entitlements (project_id, org_id, plan_id, active) values ('${pid}','o1','builder_beta', true);
     insert into public.qhub_acknowledgments (id, org_id, user_id, ack_type, ack_version, project_id, required_version, status)
-      values ('${aid}','o1','u1','acceptable_use','ackv1','${pid}','ackv1','ACTIVE');
+      values ('${aid}','o1','u1','acceptable_use','${ACK}','${pid}','${ACK}','ACTIVE');
     insert into public.qhub_governance_essentials
-      (id, project_id, org_id, disposition, review_state, record_version, declaration_identity_hash, data_classes, declaration_complete, acknowledged, acknowledgment_version, acknowledgment_record_id)
-      values ('${gid}','${pid}','o1','manual_review','requested', 4, '${H64}', '["personal"]'::jsonb, true, true, 'ackv1', '${aid}');
+      (id, project_id, org_id, disposition, review_state, record_version, declaration_identity_hash, policy_card_version, data_classes, declaration_complete, acknowledged, acknowledgment_version, acknowledgment_record_id)
+      values ('${gid}','${pid}','o1','manual_review','requested', 4, '${H64}', '${CARD}', '["personal"]'::jsonb, true, true, '${ACK}', '${aid}');
   `);
 
   return { pid, gid, aid };
@@ -788,40 +795,40 @@ describe('commercial-launch R10 atomic review creation', () => {
       const { pid } = await seedReviewRequired(db);
 
       const c1 = await db.query<{ v: { ok: boolean; idempotent: boolean; request_id: string } }>(
-        `select public.qhub_create_review_request('o1','${pid}','u1','sensitive data','k1','polv1','ackv1') v`,
+        `select public.qhub_create_review_request('o1','${pid}','u1','sensitive data','k1') v`,
       );
       expect(c1.rows[0].v.ok).toBe(true);
       expect(c1.rows[0].v.idempotent).toBe(false);
 
       const rid = c1.rows[0].v.request_id;
 
-      // The inserted review is FULLY bound (no NULL binding fields) + derived category.
+      // The inserted review is FULLY bound (no NULL binding fields) with DB-resolved versions + category.
       const row = await db.query<{ n: number }>(
         `select count(*)::int n from public.qhub_manual_review_requests where id='${rid}'
            and governance_record_id is not null and governance_record_version is not null
-           and declaration_identity_hash='${H64}' and policy_version='polv1'
-           and required_acknowledgment_version='ackv1' and acknowledgment_record_id is not null
-           and acknowledgment_version='ackv1' and requester_user_id='u1' and category='personal'`,
+           and declaration_identity_hash='${H64}' and policy_version='${POL}'
+           and required_acknowledgment_version='${ACK}' and acknowledgment_record_id is not null
+           and acknowledgment_version='${ACK}' and requester_user_id='u1' and category='personal'`,
       );
       expect(row.rows[0].n).toBe(1);
 
       // Exact identical retry → the SAME request (idempotent), no second row.
       const c2 = await db.query<{ v: { idempotent: boolean; request_id: string } }>(
-        `select public.qhub_create_review_request('o1','${pid}','u1','sensitive data','k1','polv1','ackv1') v`,
+        `select public.qhub_create_review_request('o1','${pid}','u1','sensitive data','k1') v`,
       );
       expect(c2.rows[0].v.idempotent).toBe(true);
       expect(c2.rows[0].v.request_id).toBe(rid);
 
-      // Same idempotency key + a DIFFERENT reason (material change) → deterministic conflict.
+      // Same idempotency key + a DIFFERENT (material) reason → deterministic conflict.
       const c3 = await db.query<{ v: { ok: boolean; reason: string } }>(
-        `select public.qhub_create_review_request('o1','${pid}','u1','DIFFERENT reason','k1','polv1','ackv1') v`,
+        `select public.qhub_create_review_request('o1','${pid}','u1','DIFFERENT reason','k1') v`,
       );
       expect(c3.rows[0].v.ok).toBe(false);
       expect(c3.rows[0].v.reason).toBe('idempotency_conflict');
 
-      // A NEW policy version (different key) → a DISTINCT request identity (prior preserved).
+      // A materially-different reason under a NEW key → a DISTINCT request identity (prior preserved).
       const c4 = await db.query<{ v: { ok: boolean; request_id: string } }>(
-        `select public.qhub_create_review_request('o1','${pid}','u1','sensitive data','k2','polv2','ackv1') v`,
+        `select public.qhub_create_review_request('o1','${pid}','u1','another distinct reason','k2') v`,
       );
       expect(c4.rows[0].v.ok).toBe(true);
       expect(c4.rows[0].v.request_id).not.toBe(rid);
@@ -843,7 +850,7 @@ describe('commercial-launch R10 atomic review creation', () => {
 
       // Not a member (different requester).
       const nm = await db.query<{ v: { reason: string } }>(
-        `select public.qhub_create_review_request('o1','${pid}','other','r','k','polv1','ackv1') v`,
+        `select public.qhub_create_review_request('o1','${pid}','other','r','k') v`,
       );
       expect(nm.rows[0].v.reason).toBe('not_a_member');
 
@@ -851,7 +858,7 @@ describe('commercial-launch R10 atomic review creation', () => {
       await db.exec(`update public.qhub_acknowledgments set status='REVOKED', revoked_at=now() where id='${aid}'`);
 
       const rk = await db.query<{ v: { reason: string } }>(
-        `select public.qhub_create_review_request('o1','${pid}','u1','r','k','polv1','ackv1') v`,
+        `select public.qhub_create_review_request('o1','${pid}','u1','r','k') v`,
       );
       expect(rk.rows[0].v.reason).toBe('acknowledgment_not_active');
 
@@ -862,7 +869,7 @@ describe('commercial-launch R10 atomic review creation', () => {
       await db.exec(`update public.qhub_governance_essentials set disposition='proceed' where id='${gid}'`);
 
       const nr = await db.query<{ v: { reason: string } }>(
-        `select public.qhub_create_review_request('o1','${pid}','u1','r','k','polv1','ackv1') v`,
+        `select public.qhub_create_review_request('o1','${pid}','u1','r','k') v`,
       );
       expect(nr.rows[0].v.reason).toBe('review_not_required');
     } finally {
@@ -882,7 +889,7 @@ describe('commercial-launch R10 verifier exact-semantic drift', () => {
 
     try {
       const v = await ready(db);
-      expect(v.expected_version).toBe('2026-07-30.commercial-launch-r6');
+      expect(v.expected_version).toBe('2026-07-30.commercial-launch-r7');
       expect(v.ready).toBe(true);
     } finally {
       await db.close();

@@ -29,7 +29,7 @@ vi.mock('~/lib/qhub/commercial/commercial-schema-check.server', () => ({
 }));
 
 // A stand-in token — its shape is irrelevant because assertReadyToken is mocked.
-const TOKEN = { schemaVersion: '2026-07-30.commercial-launch-r6', targetKey: 't', checkedAt: '0' } as never;
+const TOKEN = { schemaVersion: '2026-07-30.commercial-launch-r7', targetKey: 't', checkedAt: '0' } as never;
 
 function makeNotReady() {
   H.assert.mockImplementation(() => {

@@ -216,8 +216,9 @@ describe('submitCustomerReview delegates to the atomic qhub_create_review_reques
     expect(call.name).toBe('qhub_create_review_request');
 
     /*
-     * The browser supplies only project/reason/idempotency-key; policy + required-ack versions are
-     * SERVER-derived; and NO authoritative identity field is accepted from the caller.
+     * R11: the caller supplies ONLY org/project/requester/reason/idempotency-key — NO policy,
+     * required-ack, classification, Governance, or acknowledgment authority parameter is passed
+     * (the RPC resolves all authority from the DB config inside the locked transaction).
      */
     expect(call.args).toEqual({
       p_org_id: 'o1',
@@ -225,8 +226,6 @@ describe('submitCustomerReview delegates to the atomic qhub_create_review_reques
       p_requester: 'u1',
       p_reason: 'sensitive data',
       p_idempotency_key: 'k1',
-      p_policy_version: currentReviewPolicyVersion(),
-      p_required_ack_version: currentRequiredAcknowledgmentVersion(),
     });
   });
 
@@ -263,22 +262,26 @@ async function freshDb(): Promise<PGlite> {
 }
 
 const HASH_B = 'b'.repeat(64);
+const POL = currentReviewPolicyVersion();
+const ACK = currentRequiredAcknowledgmentVersion();
+const CARD = '2026-07-30.policy-card.v1';
 
 async function seedBoundReview(db: PGlite, ids: { pid: string; gid: string; aid: string; rid: string }) {
   await db.exec(`
+    insert into public.qhub_org_members (org_id, user_id, role, status) values ('o1','u1','builder','active');
     insert into public.qhub_project_entitlements (project_id, org_id, plan_id, active) values ('${ids.pid}','o1','builder_beta', true);
     insert into public.qhub_acknowledgments (id, org_id, user_id, ack_type, ack_version, project_id, required_version, status)
-      values ('${ids.aid}','o1','u1','acceptable_use','ack1','${ids.pid}','ack1','ACTIVE');
+      values ('${ids.aid}','o1','u1','acceptable_use','${ACK}','${ids.pid}','${ACK}','ACTIVE');
     insert into public.qhub_governance_essentials
-      (id, project_id, org_id, disposition, review_state, record_version, declaration_identity_hash, acknowledged, acknowledgment_version, acknowledgment_record_id)
-      values ('${ids.gid}','${ids.pid}','o1','manual_review','requested', 4, '${HASH}', true, 'ack1', '${ids.aid}');
+      (id, project_id, org_id, disposition, review_state, record_version, declaration_identity_hash, policy_card_version, acknowledged, acknowledgment_version, acknowledgment_record_id)
+      values ('${ids.gid}','${ids.pid}','o1','manual_review','requested', 4, '${HASH}', '${CARD}', true, '${ACK}', '${ids.aid}');
     insert into public.qhub_quantex_staff (user_id, staff_role, active) values ('staff1','reviewer', true);
     insert into public.qhub_manual_review_requests
       (id, org_id, project_id, request_type, category, reason, request_hash, status,
        governance_record_id, governance_record_version, declaration_identity_hash, policy_version,
        required_acknowledgment_version, acknowledgment_record_id, acknowledgment_version, requester_user_id)
       values ('${ids.rid}','o1','${ids.pid}','data_review','personal','sensitive','h','pending',
-       '${ids.gid}', 4, '${HASH}', 'pol1', 'ack1', '${ids.aid}', 'ack1', 'u1');
+       '${ids.gid}', 4, '${HASH}', '${POL}', '${ACK}', '${ids.aid}', '${ACK}', 'u1');
   `);
 }
 
@@ -301,7 +304,7 @@ describe('atomic decision approves a fully-bound review and refuses a drifted on
       );
 
       const drift = await db.query<{ v: { ok: boolean; reason: string } }>(
-        `select public.qhub_decide_review('${ids.rid}','staff1',true,'approved','looks fine','pol1') v`,
+        `select public.qhub_decide_review('${ids.rid}','staff1',true,'approved','looks fine','${POL}') v`,
       );
       expect(drift.rows[0].v.ok).toBe(false);
       expect(drift.rows[0].v.reason).toBe('governance_changed');
@@ -317,7 +320,7 @@ describe('atomic decision approves a fully-bound review and refuses a drifted on
       );
 
       const ok = await db.query<{ v: { ok: boolean } }>(
-        `select public.qhub_decide_review('${ids.rid}','staff1',true,'approved','looks fine','pol1') v`,
+        `select public.qhub_decide_review('${ids.rid}','staff1',true,'approved','looks fine','${POL}') v`,
       );
       expect(ok.rows[0].v.ok).toBe(true);
 
@@ -348,7 +351,7 @@ describe('atomic decision approves a fully-bound review and refuses a drifted on
       await db.exec(`update public.qhub_governance_essentials set acknowledged=false where id='${ids.gid}'`);
 
       const r = await db.query<{ v: { ok: boolean; reason: string } }>(
-        `select public.qhub_decide_review('${ids.rid}','staff1',true,'approved','looks fine','pol1') v`,
+        `select public.qhub_decide_review('${ids.rid}','staff1',true,'approved','looks fine','${POL}') v`,
       );
       expect(r.rows[0].v.ok).toBe(false);
       expect(r.rows[0].v.reason).toBe('acknowledgment_stale');

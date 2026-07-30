@@ -256,91 +256,44 @@ export async function upsertDeclaration(
 
 /**
  * @qhub-service: REQUIRES_COMMERCIAL_READY_TOKEN
- * Record the human acknowledgment for a project. Only valid once declaration-complete.
+ * Record (or revoke) the human acknowledgment for a project.
  *
- * R9 §4: the acknowledgment version is SERVER-derived (currentRequiredAcknowledgmentVersion) —
- * the browser has NO authority over it. The inserted acknowledgment row's id is bound onto the
- * Governance record (acknowledgment_record_id) so every later authorization/decision resolves the
- * authoritative acknowledgment identity rather than trusting a client-supplied version.
+ * R11 §1/§3: this is a THIN wrapper over the ONE atomic server-only RPC qhub_record_acknowledgment.
+ * The application service performs NO direct acknowledgment table writes — the RPC resolves the
+ * required version + Governance identity from the DB config INSIDE the locked transaction, supersedes
+ * any prior ACTIVE ack, inserts one ACTIVE ack, and binds it onto the Governance record atomically
+ * (or, for REVOKE, transitions the ACTIVE ack → REVOKED and unbinds it). Every DB error is surfaced.
  */
 export async function acknowledgeProject(
   ctx: CommercialContext,
-  input: { projectId: string },
+  input: { projectId: string; action?: 'ACKNOWLEDGE' | 'REVOKE' },
   token: CommercialReadyToken,
   env: Record<string, string | undefined>,
-): Promise<{ ok: true } | { ok: false; error: string }> {
+): Promise<{ ok: true; recordId?: string; status?: string } | { ok: false; error: string }> {
+  const sb = mutator(token, env);
+
   if (!ctx.orgId) {
     return { ok: false, error: 'no_org_context' };
   }
 
-  const sb = mutator(token, env);
-  const { data: rec } = await sb
-    .from('qhub_governance_essentials')
-    .select('id,record_version,declaration_complete,disposition')
-    .eq('project_id', input.projectId)
-    .eq('org_id', ctx.orgId)
-    .maybeSingle();
+  const { data, error } = await sb.rpc('qhub_record_acknowledgment', {
+    p_org_id: ctx.orgId,
+    p_project_id: input.projectId,
+    p_user_id: ctx.userId,
+    p_action: input.action ?? 'ACKNOWLEDGE',
+  });
 
-  if (!rec) {
-    return { ok: false, error: 'not_found' };
+  if (error || !data) {
+    return { ok: false, error: 'acknowledgment_write_failed' };
   }
 
-  if (!rec.declaration_complete) {
-    return { ok: false, error: 'declaration_incomplete' };
+  const result = data as { ok: boolean; reason?: string; record_id?: string; status?: string };
+
+  if (!result.ok) {
+    return { ok: false, error: result.reason ?? 'acknowledgment_write_failed' };
   }
 
-  if (rec.disposition === 'prohibited' || rec.disposition === 'blocked') {
-    return { ok: false, error: 'not_acknowledgeable' };
-  }
-
-  // SERVER-derived required version — never taken from the browser.
-  const ackVersion = currentRequiredAcknowledgmentVersion();
-
-  /*
-   * R10 §2: SUPERSEDE any prior ACTIVE acknowledgment for this scope (a controlled ACTIVE→SUPERSEDED
-   * lifecycle transition), then insert ONE new ACTIVE acknowledgment carrying the full project +
-   * Governance scope. The partial unique index guarantees at most one ACTIVE per scope.
-   */
-  await sb
-    .from('qhub_acknowledgments')
-    .update({ status: 'SUPERSEDED', superseded_at: new Date().toISOString(), updated_at: new Date().toISOString() })
-    .eq('org_id', ctx.orgId)
-    .eq('user_id', ctx.userId)
-    .eq('ack_type', 'acceptable_use')
-    .eq('project_id', input.projectId)
-    .eq('status', 'ACTIVE');
-
-  const { data: ack } = await sb
-    .from('qhub_acknowledgments')
-    .insert({
-      org_id: ctx.orgId,
-      user_id: ctx.userId,
-      ack_type: 'acceptable_use',
-      ack_version: ackVersion,
-      project_id: input.projectId,
-      governance_record_id: rec.id as string,
-      governance_record_version: rec.record_version as number,
-      required_version: ackVersion,
-      policy_version: currentReviewPolicyVersion(),
-      status: 'ACTIVE',
-    })
-    .select('id')
-    .maybeSingle();
-
-  const acknowledgmentRecordId = (ack?.id as string) ?? null;
-
-  await sb
-    .from('qhub_governance_essentials')
-    .update({
-      acknowledged: true,
-      acknowledgment_version: ackVersion,
-      acknowledgment_record_id: acknowledgmentRecordId,
-      updated_at: new Date().toISOString(),
-    })
-    .eq('project_id', input.projectId)
-    .eq('org_id', ctx.orgId);
-
-  return { ok: true };
+  return { ok: true, recordId: result.record_id, status: result.status };
 }
 
 /** R10 §2: the resolved authoritative acknowledgment identity + lifecycle state. */
@@ -653,8 +606,6 @@ export async function submitCustomerReview(
     p_requester: ctx.userId,
     p_reason: input.reason,
     p_idempotency_key: input.idempotencyKey ?? null,
-    p_policy_version: currentReviewPolicyVersion(),
-    p_required_ack_version: currentRequiredAcknowledgmentVersion(),
   });
 
   if (error || !data) {

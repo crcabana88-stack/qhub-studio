@@ -10,7 +10,7 @@
 
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 
-const EXPECTED = '2026-07-30.commercial-launch-r6';
+const EXPECTED = '2026-07-30.commercial-launch-r7';
 const S = vi.hoisted(() => ({ rpc: vi.fn() }));
 
 vi.mock('@supabase/supabase-js', () => ({ createClient: () => ({ rpc: S.rpc }) }));

@@ -98,6 +98,14 @@ function resolveSpec(fromFile: string, spec: string): { path?: string; unresolve
     return {}; // bare specifier
   }
 
+  /*
+   * The Remix server build output (functions/[[path]].ts → `../build/server`) is a reviewed,
+   * generated bundle, not app source — it is not present in the test tree and is not app code.
+   */
+  if (/[/\\]build[/\\]/.test(base)) {
+    return {};
+  }
+
   // A `.js`/`.jsx` specifier maps to the `.ts`/`.tsx` source (TS module-resolution convention).
   const noExt = base.replace(/\.(jsx?|tsx?)$/, '');
   const candidates = [
@@ -180,11 +188,42 @@ function detectEffects(src: string): string[] {
   return EFFECT_CATEGORIES.filter(({ re }) => re.test(src)).map(({ label }) => label);
 }
 
-// ─── traverse the import graph from every route ─────────────────────────────────
+/*
+ * ─── seed from EVERY server entry point (R11 §7) ────────────────────────────────
+ * Discovery must not start only from routes. A worker/function request entry, the Remix server
+ * entry, a *.server module, a `.server/**` module, or a deploy script can each pull server-only
+ * code into a deployed surface. Seed the graph from all of them so nothing escapes the traversal.
+ */
 
-const routes = walkAll(`${APP}routes/`).filter(
-  (f) => (f.endsWith('.ts') || f.endsWith('.tsx')) && !f.endsWith('.d.ts'),
+const REPO = `${resolvePath(APP, '..')}/`;
+const IS_TS = (f: string) => (f.endsWith('.ts') || f.endsWith('.tsx')) && !f.endsWith('.d.ts');
+const IS_SERVER_ENTRY_SCRIPT = (f: string) => f.endsWith('.mjs') || f.endsWith('.js') || IS_TS(f);
+
+function filesUnder(dir: string, pred: (f: string) => boolean): string[] {
+  return existsSync(dir) ? walkAll(dir).filter(pred) : [];
+}
+
+const routeEntries = filesUnder(`${APP}routes/`, IS_TS);
+
+/*
+ * *.server.ts(x) and anything under a `.server/` directory, anywhere in app/ — seeded directly so a
+ * server module that is not reachable from a route is still parsed, classified and effect-analysed.
+ */
+const serverModuleEntries = filesUnder(
+  APP,
+  (f) => IS_TS(f) && (/\.server\.tsx?$/.test(f) || /[/\\]\.server[/\\]/.test(f)),
 );
+const entryServer = existsSync(`${APP}entry.server.tsx`) ? [`${APP}entry.server.tsx`] : [];
+
+// Cloudflare Pages Functions / workers — the actual request entry of the deployed app.
+const functionEntries = filesUnder(`${REPO}functions/`, IS_SERVER_ENTRY_SCRIPT);
+
+// Deploy / build / preflight scripts run with full host privilege during release.
+const scriptEntries = filesUnder(`${REPO}scripts/`, IS_SERVER_ENTRY_SCRIPT);
+
+const ENTRY_POINTS = [
+  ...new Set([...routeEntries, ...serverModuleEntries, ...entryServer, ...functionEntries, ...scriptEntries]),
+];
 
 interface GraphResult {
   visited: Set<string>;
@@ -192,6 +231,7 @@ interface GraphResult {
   unresolved: string[];
   undiscoveredProtected: string[];
   nonLiteralDynamic: string[];
+  effects: Map<string, string[]>;
 }
 
 function traverse(entryPoints: string[]): GraphResult {
@@ -200,7 +240,13 @@ function traverse(entryPoints: string[]): GraphResult {
   const unresolved: string[] = [];
   const undiscoveredProtected: string[] = [];
   const nonLiteralDynamic: string[] = [];
-  const queue = [...entryPoints];
+
+  // R11 §8 — effect analysis is applied to EVERY visited module, not a sampled subset.
+  const effects = new Map<string, string[]>();
+
+  // Canonicalize separators so the same module reached via two path spellings is one visited node.
+  const canon = (f: string) => f.replace(/\\/g, '/');
+  const queue = entryPoints.map(canon);
 
   while (queue.length) {
     const file = queue.pop() as string;
@@ -212,11 +258,14 @@ function traverse(entryPoints: string[]): GraphResult {
     visited.add(file);
 
     const src = readFileSync(file, 'utf8');
-    const rel = file.slice(APP.length).replace(/\\/g, '/');
+    const rel = canon(file).slice(canon(REPO).length);
 
     if (parseDiagnostics(rel, src).length > 0) {
       parseFailures.push(rel);
     }
+
+    // Effect analysis runs on every module the moment it is visited — no module is skipped.
+    effects.set(rel, detectEffects(src));
 
     /*
      * R10 §7: a non-literal dynamic import in server-reachable code is fail-closed (unresolvable
@@ -236,19 +285,19 @@ function traverse(entryPoints: string[]): GraphResult {
 
       if (r.unresolved) {
         unresolved.push(`${rel} → ${spec}`);
-      } else if (r.path && !visited.has(r.path)) {
-        queue.push(r.path);
+      } else if (r.path && !visited.has(canon(r.path))) {
+        queue.push(canon(r.path));
       }
     }
   }
 
-  return { visited, parseFailures, unresolved, undiscoveredProtected, nonLiteralDynamic };
+  return { visited, parseFailures, unresolved, undiscoveredProtected, nonLiteralDynamic, effects };
 }
 
-const graph = traverse(routes);
+const graph = traverse(ENTRY_POINTS);
 
-describe('import-graph server-module discovery (R9 §8/§9)', () => {
-  it('reaches a meaningful slice of the app/lib server layer from the routes', () => {
+describe('import-graph server-module discovery (R9 §8/§9, R11 §7/§8)', () => {
+  it('reaches a meaningful slice of the app/lib server layer from the entry points', () => {
     const libModules = [...graph.visited].filter((f) => /[/\\]lib[/\\]/.test(f));
     expect(libModules.length).toBeGreaterThan(30);
   });
@@ -267,6 +316,49 @@ describe('import-graph server-module discovery (R9 §8/§9)', () => {
 
   it('NO server-reachable module uses a non-literal dynamic import (fail closed, R10 §7)', () => {
     expect(graph.nonLiteralDynamic, graph.nonLiteralDynamic.join('\n')).toEqual([]);
+  });
+
+  // R11 §7 — the graph is seeded from EVERY server entry point, not only routes.
+  it('seeds from the Cloudflare Pages Function / worker request entry', () => {
+    const rels = [...graph.visited].map((f) => f.slice(REPO.length).replace(/\\/g, '/'));
+    expect(rels).toContain('functions/[[path]].ts');
+  });
+
+  it('seeds from the Remix server entry (app/entry.server.tsx)', () => {
+    const rels = [...graph.visited].map((f) => f.slice(REPO.length).replace(/\\/g, '/'));
+    expect(rels).toContain('app/entry.server.tsx');
+  });
+
+  it('seeds from deploy/build/preflight scripts (full-privilege release surface)', () => {
+    const rels = [...graph.visited].map((f) => f.slice(REPO.length).replace(/\\/g, '/'));
+
+    for (const s of ['scripts/build-with-identity.mjs', 'scripts/startup-preflight.mjs', 'scripts/deploy-env.mjs']) {
+      expect(rels, `missing seed: ${s}`).toContain(s);
+    }
+  });
+
+  // R11 §8 — effect analysis is applied to EVERY visited module (no sampled subset).
+  it('applies effect analysis to every single visited module', () => {
+    const missing = [...graph.visited]
+      .map((f) => f.slice(REPO.length).replace(/\\/g, '/'))
+      .filter((rel) => !graph.effects.has(rel));
+    expect(missing, missing.join('\n')).toEqual([]);
+    expect(graph.effects.size).toBe(graph.visited.size);
+  });
+
+  /*
+   * R11 §2/§9 — the sole authoritative acknowledgment resolver is reachable, classified, and its
+   * effects are surfaced by the analysis (it is not an unclassified silent side-effect module).
+   */
+  it('reaches and classifies the sole authoritative ack/review resolver module', () => {
+    const resolver = [...graph.visited].find((f) =>
+      f.replace(/\\/g, '/').endsWith('lib/qhub/commercial/governance-essentials.server.ts'),
+    );
+    expect(resolver, 'governance-essentials.server.ts not reached from any entry point').toBeTruthy();
+
+    const src = readFileSync(resolver as string, 'utf8');
+    expect(hasModuleClassification(src)).toBe(true);
+    expect(HARD_SERVER_IO.test(src)).toBe(true);
   });
 });
 
@@ -308,6 +400,34 @@ describe('R10 §7/§8: dynamic-import + effect-category detection (fixtures)', (
 
   it('a pure module with no protected effect yields no categories', () => {
     expect(detectEffects(`export function add(a: number, b: number) { return a + b; }`)).toEqual([]);
+  });
+
+  /*
+   * R11 §7 — a worker/function request entry that pulls server code through a literal dynamic import
+   * is discoverable; a non-literal dynamic import in that same shape fails closed.
+   */
+  it('a worker/function entry with a literal dynamic import is traversable; a non-literal one fails closed', () => {
+    const literalEntry = `export const onRequest = async (c) => { const b = await import('../build/server'); return b; };`;
+    expect(hasNonLiteralDynamicImport(literalEntry)).toBe(false);
+    expect(importSpecifiers(literalEntry)).toContain('../build/server');
+
+    const dynamicEntry = `export const onRequest = async (c) => { const m = await import(c.env.HANDLER); return m; };`;
+    expect(hasNonLiteralDynamicImport(dynamicEntry)).toBe(true);
+  });
+
+  // R11 §8 — a renamed HTTP/provider/connector/deploy wrapper still carries its underlying effect.
+  it('renamed HTTP / provider / connector / deploy / agent wrappers inherit their effects', () => {
+    const renamed: Array<[string, string]> = [
+      ['generic external HTTP', `export const callGateway = (u) => fetch(u, { method: 'POST' });`],
+      ['model/provider client', `export const runModel = (p) => invokeCommercialModel(p);`],
+      ['MCP/connector mutation', `export const syncConnector = () => new MCPService().connectorMutate();`],
+      ['deployment/publication', `export const ship = () => freezeReleaseCandidate();`],
+      ['agent/enforcement/approval mutation', `export const proceed = (r) => resumeAgentRun(r);`],
+    ];
+
+    for (const [label, src] of renamed) {
+      expect(detectEffects(src), `${label}: ${src}`).toContain(label);
+    }
   });
 });
 

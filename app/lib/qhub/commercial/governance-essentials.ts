@@ -224,6 +224,14 @@ export const REQUIRED_ACKNOWLEDGMENT_VERSION = '2026-07-30.acceptable-use.v1';
  */
 export const GOVERNANCE_POLICY_CARD_VERSION = '2026-07-30.policy-card.v1';
 
+/**
+ * R11: the classification SCHEME identity + version bound into the review request hash. These MUST
+ * match the qhub_commercial_authority config row seeded by the migration (a parity test enforces it);
+ * the database is the authority — these constants mirror it for the app + parity fixtures.
+ */
+export const GOVERNANCE_CLASSIFICATION_SCHEME_ID = 'qhub-governance-essentials';
+export const GOVERNANCE_CLASSIFICATION_SCHEME_VERSION = '2026-07-30.classification.v1';
+
 /** The current applicable review policy version (server-derived, project-scoped). */
 export function currentReviewPolicyVersion(): string {
   return REVIEW_POLICY_VERSION;
