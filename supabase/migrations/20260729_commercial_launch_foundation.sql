@@ -1,8 +1,9 @@
 -- ============================================================================
--- QHUB Commercial Launch Foundation — R11 FINAL AUTHORITY CLOSURE
+-- QHUB Commercial Launch Foundation — R12 FINAL TWO-BLOCKER CLOSURE
+--   (persisted + revalidated classification authority on review requests)
 -- Migration: 20260729_commercial_launch_foundation  (replaces the rejected
 --            4b42555a… contents IN PLACE — one authoritative commercial migration)
--- Schema version: 2026-07-30.commercial-launch-r7
+-- Schema version: 2026-07-30.commercial-launch-r8
 --
 -- Central commercial security boundary: authoritative membership/staff, real
 -- project ownership, checkout-intent binding (metadata is never tenant authority),
@@ -342,6 +343,17 @@ ALTER TABLE public.qhub_manual_review_requests
   ADD COLUMN IF NOT EXISTS idempotency_key                TEXT,
   ADD COLUMN IF NOT EXISTS requester_user_id              TEXT;
 
+-- ─── R8 (R12): PERSISTED CLASSIFICATION AUTHORITY on review requests ─────────
+-- Additive only — nullable columns so legacy rows stay readable/non-authorizing. A new review binds
+-- the authoritative classification scheme id/version (from qhub_commercial_authority) + the risk tier
+-- (from the Governance record) as INDEPENDENTLY REVALIDATABLE columns, so qhub_decide_review can reload
+-- and compare current classification authority before ANY approval or terminal-repeat success — closing
+-- the reproduced stale-classification false-approval (approved after the scheme advanced to v999).
+ALTER TABLE public.qhub_manual_review_requests
+  ADD COLUMN IF NOT EXISTS classification_scheme_id       TEXT,
+  ADD COLUMN IF NOT EXISTS classification_scheme_version  TEXT,
+  ADD COLUMN IF NOT EXISTS classification_risk_tier       TEXT;
+
 -- ─── R6 (R10): AUTHORITATIVE ACKNOWLEDGMENT MODEL ────────────────────────────
 -- Additive only. An acknowledgment gains a project/Governance scope, a required version, a
 -- lifecycle status (ACTIVE / REVOKED / SUPERSEDED), and timestamps. Legacy rows keep NULL scope
@@ -436,6 +448,27 @@ BEGIN
           AND acknowledgment_version IS NOT NULL
           AND requester_user_id IS NOT NULL
           AND request_hash IS NOT NULL
+        )
+      ) NOT VALID;
+  END IF;
+
+  /*
+   * R12 (R8) — TERMINAL CLASSIFICATION BINDING. A terminal (approved/rejected) review must also
+   * carry the persisted classification authority (scheme id + version + risk tier). Added NOT VALID
+   * so pre-existing legacy rows are readable but can never terminalize (qhub_decide_review refuses a
+   * classification-unbound review as non_authorizing_legacy_review); every new terminal row IS checked.
+   */
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_constraint
+    WHERE conrelid = 'public.qhub_manual_review_requests'::regclass AND conname = 'chk_qhub_review_classification_binding'
+  ) THEN
+    ALTER TABLE public.qhub_manual_review_requests
+      ADD CONSTRAINT chk_qhub_review_classification_binding
+      CHECK (
+        status = 'pending' OR (
+          classification_scheme_id IS NOT NULL
+          AND classification_scheme_version IS NOT NULL
+          AND classification_risk_tier IS NOT NULL
         )
       ) NOT VALID;
   END IF;
@@ -1227,11 +1260,13 @@ BEGIN
   INSERT INTO public.qhub_manual_review_requests (
     id, org_id, project_id, request_type, category, reason, request_hash, status,
     governance_record_id, governance_record_version, declaration_identity_hash, policy_version,
-    required_acknowledgment_version, acknowledgment_record_id, acknowledgment_version, requester_user_id, idempotency_key
+    required_acknowledgment_version, acknowledgment_record_id, acknowledgment_version, requester_user_id, idempotency_key,
+    classification_scheme_id, classification_scheme_version, classification_risk_tier
   ) VALUES (
     v_id, p_org_id, p_project_id, 'data_review', v_category, p_reason, v_hash, 'pending',
     g.id, g.record_version, g.declaration_identity_hash, cfg.review_policy_version,
-    cfg.required_acknowledgment_version, a.id, a.ack_version, p_requester, p_idempotency_key
+    cfg.required_acknowledgment_version, a.id, a.ack_version, p_requester, p_idempotency_key,
+    cfg.classification_scheme_id, cfg.classification_scheme_version, g.risk_tier
   );
 
   RETURN jsonb_build_object('ok', true, 'idempotent', false, 'request_id', v_id::text);
@@ -1261,8 +1296,13 @@ BEGIN
     RETURN jsonb_build_object('ok', false, 'reason', 'invalid_decision');
   END IF;
 
-  -- DB-authoritative current versions.
-  SELECT * INTO cfg FROM public.qhub_commercial_authority WHERE id = 1;
+  /*
+   * DB-authoritative current versions. R12 §3 — LOCK the authoritative config row FOR SHARE so the
+   * classification/policy/ack authority it carries CANNOT change between revalidation and mutation
+   * (a concurrent config UPDATE blocks until this decision commits). This is the first lock in the
+   * deterministic order (config → review → Governance → ack → membership → staff).
+   */
+  SELECT * INTO cfg FROM public.qhub_commercial_authority WHERE id = 1 FOR SHARE;
   IF NOT FOUND THEN RETURN jsonb_build_object('ok', false, 'reason', 'authority_config_missing'); END IF;
 
   /*
@@ -1287,7 +1327,10 @@ BEGIN
      OR r.acknowledgment_record_id IS NULL
      OR r.acknowledgment_version IS NULL
      OR r.requester_user_id IS NULL
-     OR r.request_hash IS NULL THEN
+     OR r.request_hash IS NULL
+     OR r.classification_scheme_id IS NULL
+     OR r.classification_scheme_version IS NULL
+     OR r.classification_risk_tier IS NULL THEN
     RETURN jsonb_build_object('ok', false, 'reason', 'non_authorizing_legacy_review');
   END IF;
 
@@ -1320,6 +1363,19 @@ BEGIN
   IF r.policy_version IS DISTINCT FROM cfg.review_policy_version
      OR p_policy_version IS DISTINCT FROM cfg.review_policy_version THEN
     RETURN jsonb_build_object('ok', false, 'reason', 'policy_stale');
+  END IF;
+
+  /*
+   * R12 §2 — CLASSIFICATION authority must be current, revalidated on EVERY invocation (incl. an exact
+   * terminal repeat) BEFORE the terminal-repeat/first-decision branch. The persisted binding (scheme
+   * id/version from config, risk tier from Governance) must exactly equal current authority; a changed
+   * scheme/version/risk tier returns classification_changed with ZERO side effect — never approve, never
+   * idempotent terminal success, no Governance/audit mutation, no downstream authorization.
+   */
+  IF r.classification_scheme_id IS DISTINCT FROM cfg.classification_scheme_id
+     OR r.classification_scheme_version IS DISTINCT FROM cfg.classification_scheme_version
+     OR r.classification_risk_tier IS DISTINCT FROM g.risk_tier THEN
+    RETURN jsonb_build_object('ok', false, 'reason', 'classification_changed');
   END IF;
 
   -- Acknowledgment: ACTIVE, correct scope, current version, and the record's binding.
@@ -1771,6 +1827,23 @@ BEGIN
     END IF;
   END LOOP;
 
+  -- R8 (R12): the review request persists the classification authority binding (scheme id/version +
+  -- risk tier) as independently revalidatable columns. Each must exist with the exact type; all are
+  -- NULLABLE (legacy rows readable) but required for terminal rows by chk_qhub_review_classification_binding.
+  FOR t IN SELECT unnest(ARRAY[
+    'classification_scheme_id:text','classification_scheme_version:text','classification_risk_tier:text'
+  ]) LOOP
+    IF NOT EXISTS (
+      SELECT 1 FROM pg_attribute
+      WHERE attrelid='public.qhub_manual_review_requests'::regclass
+        AND attname = split_part(t, ':', 1)
+        AND atttypid = (split_part(t, ':', 2))::regtype
+        AND NOT attisdropped
+    ) THEN
+      v_failed := v_failed || ('r8_review_classification_column:'||split_part(t, ':', 1))::text;
+    END IF;
+  END LOOP;
+
   -- R5 (R8): declaration_identity_hash hex-64 format checks on BOTH tables.
   IF NOT EXISTS (
     SELECT 1 FROM pg_constraint WHERE conrelid='public.qhub_governance_essentials'::regclass
@@ -1892,7 +1965,7 @@ BEGIN
   IF (SELECT md5(p.prosrc) FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace
         WHERE n.nspname='public' AND p.proname='qhub_decide_review'
           AND pg_get_function_identity_arguments(p.oid) = 'p_request_id uuid, p_actor text, p_is_staff boolean, p_decision text, p_reason text, p_policy_version text')
-     IS DISTINCT FROM '085699a2ef377b2c46a65a1ed3251797' THEN
+     IS DISTINCT FROM '7e678f1e4bba0c540507cfe3743fbe54' THEN
     v_failed := v_failed || 'decide_review_body_drift'::text;
   END IF;
 
@@ -1917,7 +1990,7 @@ BEGIN
   IF (SELECT md5(p.prosrc) FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace
         WHERE n.nspname='public' AND p.proname='qhub_create_review_request'
           AND pg_get_function_identity_arguments(p.oid) = 'p_org_id text, p_project_id uuid, p_requester text, p_reason text, p_idempotency_key text')
-     IS DISTINCT FROM '22780eeb465d5d3274ce4b737b73626b' THEN
+     IS DISTINCT FROM '6b46c3d75636fd0c8b628b34a86f4084' THEN
     v_failed := v_failed || 'r7_create_review_body_drift'::text;
   END IF;
 
@@ -1994,6 +2067,7 @@ BEGIN
    */
   FOR t IN SELECT unnest(ARRAY[
     'public.qhub_manual_review_requests:chk_qhub_review_terminal_binding:96d317cd52870705f9f7defbdfec7326:f',
+    'public.qhub_manual_review_requests:chk_qhub_review_classification_binding:6f804edb46b8ba63b345937c5b7a1d95:f',
     'public.qhub_manual_review_requests:chk_qhub_review_decl_hash_hex:6dfbd27d094d1fc5a4a4d0f11639d1ff:t',
     'public.qhub_governance_essentials:chk_qhub_gov_decl_hash_hex:6dfbd27d094d1fc5a4a4d0f11639d1ff:t',
     'public.qhub_acknowledgments:chk_qhub_ack_status:d02eacc726094f0045ad16688f9516c7:t',
@@ -2069,7 +2143,7 @@ BEGIN
   END IF;
 
   RETURN jsonb_build_object(
-    'expected_version', '2026-07-30.commercial-launch-r7',
+    'expected_version', '2026-07-30.commercial-launch-r8',
     'ready', (cardinality(v_failed) = 0),
     'failed', to_jsonb(v_failed)
   );

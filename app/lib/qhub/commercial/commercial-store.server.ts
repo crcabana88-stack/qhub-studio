@@ -558,23 +558,13 @@ export async function upsertOnboardingState(
   );
 }
 
-/**
- * @qhub-service: REQUIRES_COMMERCIAL_READY_TOKEN
+/*
+ * R12 P2 cleanup: the legacy non-atomic recordAcknowledgment() store writer (a direct
+ * qhub_acknowledgments INSERT that bypassed the lifecycle/scope/supersede rules) has been REMOVED.
+ * Acknowledgments are written ONLY through the atomic server-only RPC qhub_record_acknowledgment
+ * (governance-essentials.server.acknowledgeProject), and the sole authoritative reader is
+ * resolveCurrentAuthoritativeAcknowledgment. No store method performs a non-atomic acknowledgment write.
  */
-export async function recordAcknowledgment(
-  token: CommercialReadyToken,
-  input: { orgId: string; userId: string; ackType: string; ackVersion: string },
-  env: Record<string, string | undefined>,
-): Promise<void> {
-  const sb = mutator(token, env);
-  await sb.from('qhub_acknowledgments').insert({
-    org_id: input.orgId,
-    user_id: input.userId,
-    ack_type: input.ackType,
-    ack_version: input.ackVersion,
-    acknowledged_at: new Date().toISOString(),
-  });
-}
 
 /*
  * ─── Manual review queue ─────────────────────────────────────────────────────────

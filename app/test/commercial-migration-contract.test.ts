@@ -94,7 +94,7 @@ describe('commercial-launch R3 migration', () => {
       await db.exec(sql);
 
       const v = await verify(db);
-      expect(v.expected_version).toBe('2026-07-30.commercial-launch-r7');
+      expect(v.expected_version).toBe('2026-07-30.commercial-launch-r8');
       expect(v.failed).toEqual([]);
       expect(v.ready).toBe(true);
     } finally {
@@ -533,9 +533,11 @@ describe('commercial-launch R3 migration', () => {
         insert into public.qhub_manual_review_requests
           (id, org_id, project_id, request_type, category, reason, request_hash, status,
            governance_record_id, governance_record_version, declaration_identity_hash, policy_version,
-           required_acknowledgment_version, acknowledgment_record_id, acknowledgment_version, requester_user_id)
+           required_acknowledgment_version, acknowledgment_record_id, acknowledgment_version, requester_user_id,
+           classification_scheme_id, classification_scheme_version, classification_risk_tier)
           values ('${rid}','o1','${pid}','data_review','personal','sensitive','h','pending',
-           '${gid}', 4, '${HASH}', '${POL}', '${ACK}', '${aid}', '${ACK}', 'u1');
+           '${gid}', 4, '${HASH}', '${POL}', '${ACK}', '${aid}', '${ACK}', 'u1',
+           'qhub-governance-essentials', '2026-07-30.classification.v1', 'UNCLASSIFIED');
       `);
 
       // A caller-supplied is-staff flag is not enough — the actor must be an active staff row.
@@ -889,7 +891,7 @@ describe('commercial-launch R10 verifier exact-semantic drift', () => {
 
     try {
       const v = await ready(db);
-      expect(v.expected_version).toBe('2026-07-30.commercial-launch-r7');
+      expect(v.expected_version).toBe('2026-07-30.commercial-launch-r8');
       expect(v.ready).toBe(true);
     } finally {
       await db.close();

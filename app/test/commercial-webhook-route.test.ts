@@ -41,7 +41,7 @@ vi.mock('~/lib/qhub/commercial/commercial-schema-check.server', () => ({
 
 const READY_GATE = {
   ok: true,
-  token: { schemaVersion: '2026-07-30.commercial-launch-r7', targetKey: 't', checkedAt: '0' },
+  token: { schemaVersion: '2026-07-30.commercial-launch-r8', targetKey: 't', checkedAt: '0' },
 } as const;
 const NOT_READY_GATE = {
   ok: false,

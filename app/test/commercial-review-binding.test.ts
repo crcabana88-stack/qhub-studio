@@ -279,9 +279,11 @@ async function seedBoundReview(db: PGlite, ids: { pid: string; gid: string; aid:
     insert into public.qhub_manual_review_requests
       (id, org_id, project_id, request_type, category, reason, request_hash, status,
        governance_record_id, governance_record_version, declaration_identity_hash, policy_version,
-       required_acknowledgment_version, acknowledgment_record_id, acknowledgment_version, requester_user_id)
+       required_acknowledgment_version, acknowledgment_record_id, acknowledgment_version, requester_user_id,
+       classification_scheme_id, classification_scheme_version, classification_risk_tier)
       values ('${ids.rid}','o1','${ids.pid}','data_review','personal','sensitive','h','pending',
-       '${ids.gid}', 4, '${HASH}', '${POL}', '${ACK}', '${ids.aid}', '${ACK}', 'u1');
+       '${ids.gid}', 4, '${HASH}', '${POL}', '${ACK}', '${ids.aid}', '${ACK}', 'u1',
+       'qhub-governance-essentials', '2026-07-30.classification.v1', 'UNCLASSIFIED');
   `);
 }
 

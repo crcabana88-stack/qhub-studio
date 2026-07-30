@@ -12,7 +12,7 @@ import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 
-const EXPECTED = '2026-07-30.commercial-launch-r7';
+const EXPECTED = '2026-07-30.commercial-launch-r8';
 
 // ─── Supabase createClient injection (the ONLY external dependency) ─────────────
 const S = vi.hoisted(() => ({ rpc: vi.fn() }));

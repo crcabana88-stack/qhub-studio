@@ -454,7 +454,7 @@ describe('R11 §6 — verifier R7 fails closed on material authority drift', () 
       await db.exec(sql); // healthy second run
 
       const v = await verify(db);
-      expect(v.expected_version).toBe('2026-07-30.commercial-launch-r7');
+      expect(v.expected_version).toBe('2026-07-30.commercial-launch-r8');
       expect(v.ready, v.failed.join('\n')).toBe(true);
     } finally {
       await db.close();

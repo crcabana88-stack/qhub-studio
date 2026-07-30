@@ -3,7 +3,7 @@
  * app/lib/qhub/commercial/commercial-schema-check.server.ts
  *
  * The ONE place that calls qhub_verify_commercial_schema(). It requires the exact
- * version 2026-07-30.commercial-launch-r7, ready=true, and an empty failed[]; it fails
+ * version 2026-07-30.commercial-launch-r8, ready=true, and an empty failed[]; it fails
  * closed for every non-READY state and exposes only ALLOWLISTED, compact reason codes —
  * never SQL, secrets, Stripe payloads, tenant data, project URLs, or exception text.
  *
@@ -22,7 +22,7 @@ import { json } from '@remix-run/cloudflare';
 import { createClient } from '@supabase/supabase-js';
 import { parseDeployEnv } from '~/lib/qhub/deploy-env';
 
-export const EXPECTED_COMMERCIAL_SCHEMA_VERSION = '2026-07-30.commercial-launch-r7';
+export const EXPECTED_COMMERCIAL_SCHEMA_VERSION = '2026-07-30.commercial-launch-r8';
 
 const VERIFIER_RPC = 'qhub_verify_commercial_schema';
 const VERIFIER_IDENTITY = `${VERIFIER_RPC}@${EXPECTED_COMMERCIAL_SCHEMA_VERSION}`;
