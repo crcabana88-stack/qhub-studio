@@ -166,22 +166,37 @@ evaluated AS (
     -- bodies; either being non-NULL means the body lives somewhere the digest cannot see.
     (v.oid IS NOT NULL AND v.probin IS NULL)                                         AS no_c_binary_link,
     (v.oid IS NOT NULL AND v.prosqlbody IS NULL)                                     AS no_sql_standard_body,
-    -- DIRECT ACL — the two contracts differ by design (see the runbook).
-    CASE WHEN v.expect_default_acl
-      THEN (v.oid IS NOT NULL AND v.proacl IS NULL)
-      ELSE coalesce((SELECT count(*) = 1 FROM aclexplode(v.proacl) ae
-                      WHERE ae.privilege_type = 'EXECUTE'
-                        AND pg_get_userbyid(ae.grantee) = 'service_role'
-                        AND NOT ae.is_grantable), FALSE)
-           AND coalesce((SELECT NOT EXISTS (SELECT 1 FROM aclexplode(v.proacl) ae
-                      WHERE ae.privilege_type = 'EXECUTE'
-                        AND (ae.grantee = 0
-                             OR pg_get_userbyid(ae.grantee) IN ('anon','authenticated')
-                             OR (ae.grantee <> v.proowner
-                                 AND pg_get_userbyid(ae.grantee) <> 'service_role')))), FALSE)
-           AND coalesce((SELECT NOT EXISTS (SELECT 1 FROM aclexplode(v.proacl) ae
-                      WHERE ae.is_grantable AND ae.grantee <> v.proowner)), FALSE)
-    END                                                                              AS acl_ok,
+    -- DIRECT ACL — R15.3C EXACT SET EQUALITY. The two contracts differ by design.
+    --   qhub_decide_review : EXACTLY two rows, both EXECUTE, both granted BY the owner,
+    --                        neither grantable — the owner's own entry AND service_role.
+    --                        The owner row is part of the reviewed contract: PostgreSQL
+    --                        writes it when any explicit grant is made, and its absence
+    --                        means someone revoked from the owner. (The owner still holds
+    --                        EXECUTE by inherent ownership, so this is contract-integrity
+    --                        drift rather than immediate escalation — but it is drift, and
+    --                        it must not be silently accepted or silently repaired.)
+    --   qhub_row_immutable : proacl IS NULL — the migration grants it nothing.
+    CASE WHEN v.expect_default_acl THEN (v.oid IS NOT NULL AND v.proacl IS NULL)
+         ELSE coalesce((SELECT count(*) FROM aclexplode(v.proacl)) = 2, FALSE) END    AS acl_cardinality_exact,
+    CASE WHEN v.expect_default_acl THEN (v.oid IS NOT NULL)
+         ELSE coalesce((SELECT EXISTS (SELECT 1 FROM aclexplode(v.proacl) ae
+                         WHERE ae.grantee = v.proowner AND ae.privilege_type = 'EXECUTE'
+                           AND ae.grantor = v.proowner AND NOT ae.is_grantable)), FALSE) END
+                                                                                     AS acl_owner_entry_exact,
+    CASE WHEN v.expect_default_acl THEN (v.oid IS NOT NULL)
+         ELSE coalesce((SELECT EXISTS (SELECT 1 FROM aclexplode(v.proacl) ae
+                         WHERE pg_get_userbyid(ae.grantee) = 'service_role'
+                           AND ae.privilege_type = 'EXECUTE'
+                           AND ae.grantor = v.proowner AND NOT ae.is_grantable)), FALSE) END
+                                                                                     AS acl_service_role_entry_exact,
+    CASE WHEN v.expect_default_acl THEN (v.oid IS NOT NULL AND v.proacl IS NULL)
+         ELSE coalesce((SELECT NOT EXISTS (SELECT 1 FROM aclexplode(v.proacl) ae
+                         WHERE NOT (ae.privilege_type = 'EXECUTE'
+                                    AND ae.grantor = v.proowner
+                                    AND NOT ae.is_grantable
+                                    AND (ae.grantee = v.proowner
+                                         OR pg_get_userbyid(ae.grantee) = 'service_role')))), FALSE) END
+                                                                                     AS acl_no_unexpected_entry,
     -- BODY
     coalesce(md5(v.prosrc) = v.mojibake_digest, FALSE)                               AS is_known_mojibake,
     coalesce(md5(v.prosrc) IN (v.lf_digest, v.crlf_digest), FALSE)                    AS already_reviewed
@@ -200,7 +215,8 @@ scored AS (
      AND e.retset_ok AND e.cost_ok AND e.rows_ok AND e.variadic_ok
      AND e.no_support_function AND e.no_transforms
      AND e.no_c_binary_link AND e.no_sql_standard_body
-     AND e.acl_ok)                                                                   AS attributes_ok
+     AND e.acl_cardinality_exact AND e.acl_owner_entry_exact
+     AND e.acl_service_role_entry_exact AND e.acl_no_unexpected_entry)               AS attributes_ok
   FROM evaluated e
 )
 -- ---------------------------------------------------------------------------
@@ -212,8 +228,9 @@ SELECT
   -- callable interface (R15.3B)
   full_arguments_ok, nargs_ok, no_arg_defaults, no_default_expressions,
   argnames_ok, argmodes_plain_in, no_out_or_table_args, argtypes_ok, no_alternate_arity,
-  -- authority
-  owner_ok, security_ok, search_path_ok, acl_ok,
+  -- authority (R15.3C: exact direct-ACL set equality)
+  owner_ok, security_ok, search_path_ok,
+  acl_cardinality_exact, acl_owner_entry_exact, acl_service_role_entry_exact, acl_no_unexpected_entry,
   -- identity / type
   language_ok, prokind_ok, rettype_ok,
   -- semantic attributes (R15.3A)
@@ -347,20 +364,23 @@ evaluated AS (
      AND (v.oid IS NOT NULL AND v.protrftypes IS NULL)
      AND (v.oid IS NOT NULL AND v.probin IS NULL)
      AND (v.oid IS NOT NULL AND v.prosqlbody IS NULL)
+     -- DIRECT ACL — R15.3C exact set equality (see QUERY 1 for the per-flag breakdown).
      AND CASE WHEN v.expect_default_acl
            THEN (v.oid IS NOT NULL AND v.proacl IS NULL)
-           ELSE coalesce((SELECT count(*) = 1 FROM aclexplode(v.proacl) ae
-                           WHERE ae.privilege_type = 'EXECUTE'
-                             AND pg_get_userbyid(ae.grantee) = 'service_role'
-                             AND NOT ae.is_grantable), FALSE)
+           ELSE coalesce((SELECT count(*) FROM aclexplode(v.proacl)) = 2, FALSE)
+                AND coalesce((SELECT EXISTS (SELECT 1 FROM aclexplode(v.proacl) ae
+                           WHERE ae.grantee = v.proowner AND ae.privilege_type = 'EXECUTE'
+                             AND ae.grantor = v.proowner AND NOT ae.is_grantable)), FALSE)
+                AND coalesce((SELECT EXISTS (SELECT 1 FROM aclexplode(v.proacl) ae
+                           WHERE pg_get_userbyid(ae.grantee) = 'service_role'
+                             AND ae.privilege_type = 'EXECUTE'
+                             AND ae.grantor = v.proowner AND NOT ae.is_grantable)), FALSE)
                 AND coalesce((SELECT NOT EXISTS (SELECT 1 FROM aclexplode(v.proacl) ae
-                           WHERE ae.privilege_type = 'EXECUTE'
-                             AND (ae.grantee = 0
-                                  OR pg_get_userbyid(ae.grantee) IN ('anon','authenticated')
-                                  OR (ae.grantee <> v.proowner
-                                      AND pg_get_userbyid(ae.grantee) <> 'service_role')))), FALSE)
-                AND coalesce((SELECT NOT EXISTS (SELECT 1 FROM aclexplode(v.proacl) ae
-                           WHERE ae.is_grantable AND ae.grantee <> v.proowner)), FALSE)
+                           WHERE NOT (ae.privilege_type = 'EXECUTE'
+                                      AND ae.grantor = v.proowner
+                                      AND NOT ae.is_grantable
+                                      AND (ae.grantee = v.proowner
+                                           OR pg_get_userbyid(ae.grantee) = 'service_role')))), FALSE)
          END)                                                                        AS attributes_ok,
     coalesce(md5(v.prosrc) = v.mojibake_digest, FALSE)                               AS is_known_mojibake,
     coalesce(md5(v.prosrc) IN (v.lf_digest, v.crlf_digest), FALSE)                    AS already_reviewed

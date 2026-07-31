@@ -76,7 +76,44 @@ and erase the evidence. `10`, `11` and `12` therefore bind the **complete** cont
 | security mode | `SECURITY DEFINER` | `SECURITY INVOKER` |
 | `search_path` | `pg_catalog, public` | none |
 | owner | owner of `qhub_manual_review_requests` | owner of `qhub_acknowledgments` |
-| ACL | service_role `EXECUTE`, no grant option; PUBLIC/anon/authenticated denied | **`proacl IS NULL`** — the migration grants it nothing |
+| ACL | **exactly** the owner and service_role `EXECUTE` entries (see below) | **`proacl IS NULL`** — the migration grants it nothing |
+
+## Exact direct-ACL contract (R15.3C)
+
+**`service_role` being present is not sufficient.** The reviewed ACL for `qhub_decide_review` is exactly
+`{postgres=X/postgres,service_role=X/postgres}` — **two** rows. Revoking the *owner's own* entry leaves
+`{service_role=X/postgres}`, which still has service_role present and still has no unexpected grantee, so
+every weaker formulation accepts it. The package therefore compares the **normalized `aclexplode()` set**,
+not the textual array:
+
+| function | required direct ACL |
+|---|---|
+| `qhub_decide_review` | exactly 2 rows: `(owner, EXECUTE, granted-by owner, not grantable)` **and** `(service_role, EXECUTE, granted-by owner, not grantable)` — nothing else |
+| `qhub_row_immutable` | **`proacl IS NULL`** — zero ACL rows |
+
+Four flags are reported and all four feed the verdict: `acl_cardinality_exact`,
+`acl_owner_entry_exact`, `acl_service_role_entry_exact`, `acl_no_unexpected_entry`. Comparison is
+set-based, so re-issuing an identical grant (which rewrites the array) is **not** drift.
+
+> **Severity, stated precisely.** The owner keeps `EXECUTE` through *inherent ownership rights* even
+> without the ACL row, so a missing owner entry is **contract-integrity drift, not an immediate privilege
+> escalation**. It still means someone revoked from the owner, and it must be escalated rather than
+> accepted or silently repaired.
+
+### Who owns which privilege question
+
+Five distinct things, deliberately not conflated:
+
+| concern | owned by |
+|---|---|
+| exact **direct ACL** of the two restored functions | **R15.3** (this package) |
+| the **verifier's own** direct ACL reset | R15.2C (`08`) |
+| **inherited/effective** privilege via role membership on the verifier | R15.2C (`07`/`09`) |
+| **owner inherent execution** (ownership rights, not an ACL row) | neither — a PostgreSQL property, documented above |
+| **superuser inherent** privilege | R15.2C, reported separately as platform administrators |
+
+`11` **never repairs ACL drift.** It raises `unexpected_function_acl_state` before touching anything, and
+the drift survives as escalation evidence.
 
 **Any** strictness, parallel-safety, volatility, leakproof, cost, rows, owner, security-mode,
 `search_path`, ACL or signature drift is a **STOP** at `10` and a **NOT READY** at `12`.
@@ -161,7 +198,8 @@ Three distinct STOP causes, and they are not interchangeable:
 - `already_reviewed_count > 0` — the restoration has already run. Skip to Step 4 (`12`).
 - `attributes_ok_count < 2` — an **attribute, authority or callable-interface drift** (strictness,
   parallel safety, volatility, leakproof, cost, rows, owner, security mode, `search_path`, ACL,
-  signature, overload, **any argument default**, argument names/modes/types, `probin`/`prosqlbody`).
+  signature, overload, **any argument default**, argument names/modes/types, `probin`/`prosqlbody`,
+  **any direct-ACL difference including a missing owner EXECUTE entry**).
   **STOP and escalate. Do not run `11`** — it will refuse anyway, and running it is not a fix.
   QUERY 1 shows exactly which flag failed and the live value beside it; for a default, look at
   `no_arg_defaults`, `live_nargdefaults` and `live_full_arguments`.
@@ -260,10 +298,11 @@ founder UUID, email, org ID and roles before any seed.
 - Migration SHA-256 is not `b5f0a466f293212812a8ea3d71d6c650ca7af30255275ef248cb420910a0d1cf`
 - `10` returns `UNEXPECTED_LIVE_BODY_STOP` for any reason other than "already restored"
 - `10` reports any attribute/authority drift (`attributes_ok = false`) — escalate; **do not run `11`**
-- `11` raises — `unexpected_function_default_argument_state` (an argument default or callable-interface
-  drift; escalate, and note the package will never remove a default), `R15.3 PRE: ... drifted`
-  (attribute drift; escalate) or `R15.3 POST: ... STILL the mojibake body` (bad transfer channel;
-  re-copy with `-Encoding UTF8`)
+- `11` raises — `unexpected_function_acl_state` (direct-ACL drift, including a missing **owner** EXECUTE
+  entry; escalate, the package never repairs ACLs), `unexpected_function_default_argument_state` (an
+  argument default or callable-interface drift; escalate, the package will never remove a default),
+  `R15.3 PRE: ... drifted` (attribute drift; escalate) or `R15.3 POST: ... STILL the mojibake body`
+  (bad transfer channel; re-copy with `-Encoding UTF8`)
 - `12` is not exactly `R15_3_REVIEWED_BODIES_RESTORED`
 - `07` is not `SAFE_TO_APPLY_EXACT_DUAL_DIGEST_PATCH`, or `09` is not `R15_2_VERIFIER_READY`
 - Any SQL error while running any file — do not retry fragments

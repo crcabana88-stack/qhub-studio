@@ -197,19 +197,29 @@ BEGIN
     -- ACL: the two contracts differ by design (see the runbook).
     IF r.default_acl THEN
       IF p.proacl IS NOT NULL THEN
-        RAISE EXCEPTION 'R15.3 PRE: % ACL drifted; the reviewed contract grants it nothing', r.sig; END IF;
+        RAISE EXCEPTION 'unexpected_function_acl_state: % has an explicit direct ACL (live=%). The reviewed contract grants it NOTHING (proacl IS NULL). No change was made - STOP and escalate. This script never repairs ACL drift.',
+          r.sig, p.proacl::text; END IF;
     ELSE
-      IF NOT (SELECT count(*) = 1 FROM aclexplode(p.proacl) ae
-               WHERE ae.privilege_type = 'EXECUTE'
-                 AND pg_get_userbyid(ae.grantee) = 'service_role' AND NOT ae.is_grantable)
+      -- R15.3C — EXACT SET EQUALITY, not "service_role is present". The reviewed ACL is
+      -- exactly two rows: the OWNER's own EXECUTE entry and service_role's, both granted
+      -- by the owner, neither grantable. Requiring the owner row matters because
+      -- revoking it leaves {service_role=X/postgres}, which every weaker check accepts.
+      IF NOT (SELECT count(*) FROM aclexplode(p.proacl)) = 2
+         OR NOT EXISTS (SELECT 1 FROM aclexplode(p.proacl) ae
+                         WHERE ae.grantee = p.proowner AND ae.privilege_type = 'EXECUTE'
+                           AND ae.grantor = p.proowner AND NOT ae.is_grantable)
+         OR NOT EXISTS (SELECT 1 FROM aclexplode(p.proacl) ae
+                         WHERE pg_get_userbyid(ae.grantee) = 'service_role'
+                           AND ae.privilege_type = 'EXECUTE'
+                           AND ae.grantor = p.proowner AND NOT ae.is_grantable)
          OR EXISTS (SELECT 1 FROM aclexplode(p.proacl) ae
-                     WHERE ae.privilege_type = 'EXECUTE'
-                       AND (ae.grantee = 0
-                            OR pg_get_userbyid(ae.grantee) IN ('anon','authenticated')
-                            OR (ae.grantee <> p.proowner AND pg_get_userbyid(ae.grantee) <> 'service_role')))
-         OR EXISTS (SELECT 1 FROM aclexplode(p.proacl) ae
-                     WHERE ae.is_grantable AND ae.grantee <> p.proowner) THEN
-        RAISE EXCEPTION 'R15.3 PRE: % ACL drifted from the reviewed contract', r.sig; END IF;
+                     WHERE NOT (ae.privilege_type = 'EXECUTE'
+                                AND ae.grantor = p.proowner
+                                AND NOT ae.is_grantable
+                                AND (ae.grantee = p.proowner
+                                     OR pg_get_userbyid(ae.grantee) = 'service_role'))) THEN
+        RAISE EXCEPTION 'unexpected_function_acl_state: % direct ACL is not the exact reviewed set (live=%). Reviewed: exactly the owner EXECUTE entry and service_role EXECUTE, both granted by the owner, neither grantable. No change was made - STOP and escalate. This script never repairs ACL drift.',
+          r.sig, coalesce(p.proacl::text, '(NULL)'); END IF;
     END IF;
 
     -- BODY: the known mojibake (what this script repairs) or an already-reviewed body
@@ -612,19 +622,26 @@ BEGIN
     -- ACL: the two contracts differ by design (see the runbook).
     IF r.default_acl THEN
       IF p.proacl IS NOT NULL THEN
-        RAISE EXCEPTION 'R15.3 POST: % ACL drifted; the reviewed contract grants it nothing', r.sig; END IF;
+        RAISE EXCEPTION 'unexpected_function_acl_state: % has an explicit direct ACL after restoration (live=%). The reviewed contract grants it NOTHING. Rolling back.',
+          r.sig, p.proacl::text; END IF;
     ELSE
-      IF NOT (SELECT count(*) = 1 FROM aclexplode(p.proacl) ae
-               WHERE ae.privilege_type = 'EXECUTE'
-                 AND pg_get_userbyid(ae.grantee) = 'service_role' AND NOT ae.is_grantable)
+      -- R15.3C — EXACT SET EQUALITY (see GATE 1 for the rationale).
+      IF NOT (SELECT count(*) FROM aclexplode(p.proacl)) = 2
+         OR NOT EXISTS (SELECT 1 FROM aclexplode(p.proacl) ae
+                         WHERE ae.grantee = p.proowner AND ae.privilege_type = 'EXECUTE'
+                           AND ae.grantor = p.proowner AND NOT ae.is_grantable)
+         OR NOT EXISTS (SELECT 1 FROM aclexplode(p.proacl) ae
+                         WHERE pg_get_userbyid(ae.grantee) = 'service_role'
+                           AND ae.privilege_type = 'EXECUTE'
+                           AND ae.grantor = p.proowner AND NOT ae.is_grantable)
          OR EXISTS (SELECT 1 FROM aclexplode(p.proacl) ae
-                     WHERE ae.privilege_type = 'EXECUTE'
-                       AND (ae.grantee = 0
-                            OR pg_get_userbyid(ae.grantee) IN ('anon','authenticated')
-                            OR (ae.grantee <> p.proowner AND pg_get_userbyid(ae.grantee) <> 'service_role')))
-         OR EXISTS (SELECT 1 FROM aclexplode(p.proacl) ae
-                     WHERE ae.is_grantable AND ae.grantee <> p.proowner) THEN
-        RAISE EXCEPTION 'R15.3 POST: % ACL drifted from the reviewed contract', r.sig; END IF;
+                     WHERE NOT (ae.privilege_type = 'EXECUTE'
+                                AND ae.grantor = p.proowner
+                                AND NOT ae.is_grantable
+                                AND (ae.grantee = p.proowner
+                                     OR pg_get_userbyid(ae.grantee) = 'service_role'))) THEN
+        RAISE EXCEPTION 'unexpected_function_acl_state: % direct ACL is not the exact reviewed set after restoration (live=%). Rolling back.',
+          r.sig, coalesce(p.proacl::text, '(NULL)'); END IF;
     END IF;
 
     -- BODY: must now be a reviewed encoding and must no longer be the mojibake.

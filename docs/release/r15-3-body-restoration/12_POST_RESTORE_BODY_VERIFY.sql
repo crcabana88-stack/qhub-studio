@@ -144,22 +144,28 @@ checks AS (
     -- BODY: raw digest, dual reviewed encodings, NO normalization
     coalesce(md5(b.prosrc) IN (b.lf_digest, b.crlf_digest), FALSE)               AS body_reviewed,
     coalesce(md5(b.prosrc) <> b.mojibake_digest, FALSE)                          AS mojibake_cleared,
-    -- DIRECT ACL — contract differs per function (see header).
-    CASE WHEN b.expect_default_acl
-      THEN (b.oid IS NOT NULL AND b.proacl IS NULL)
-      ELSE coalesce((SELECT count(*) = 1 FROM aclexplode(b.proacl) ae
-                      WHERE ae.privilege_type = 'EXECUTE'
-                        AND pg_get_userbyid(ae.grantee) = 'service_role'
-                        AND NOT ae.is_grantable), FALSE)
-           AND coalesce((SELECT NOT EXISTS (SELECT 1 FROM aclexplode(b.proacl) ae
-                      WHERE ae.privilege_type = 'EXECUTE'
-                        AND (ae.grantee = 0
-                             OR pg_get_userbyid(ae.grantee) IN ('anon','authenticated')
-                             OR (ae.grantee <> b.proowner
-                                 AND pg_get_userbyid(ae.grantee) <> 'service_role')))), FALSE)
-           AND coalesce((SELECT NOT EXISTS (SELECT 1 FROM aclexplode(b.proacl) ae
-                      WHERE ae.is_grantable AND ae.grantee <> b.proowner)), FALSE)
-    END                                                                          AS acl_exact,
+    -- DIRECT ACL — R15.3C EXACT SET EQUALITY. Contracts differ per function (see header).
+    CASE WHEN b.expect_default_acl THEN (b.oid IS NOT NULL AND b.proacl IS NULL)
+         ELSE coalesce((SELECT count(*) FROM aclexplode(b.proacl)) = 2, FALSE) END AS acl_cardinality_exact,
+    CASE WHEN b.expect_default_acl THEN (b.oid IS NOT NULL)
+         ELSE coalesce((SELECT EXISTS (SELECT 1 FROM aclexplode(b.proacl) ae
+                         WHERE ae.grantee = b.proowner AND ae.privilege_type = 'EXECUTE'
+                           AND ae.grantor = b.proowner AND NOT ae.is_grantable)), FALSE) END
+                                                                                 AS acl_owner_entry_exact,
+    CASE WHEN b.expect_default_acl THEN (b.oid IS NOT NULL)
+         ELSE coalesce((SELECT EXISTS (SELECT 1 FROM aclexplode(b.proacl) ae
+                         WHERE pg_get_userbyid(ae.grantee) = 'service_role'
+                           AND ae.privilege_type = 'EXECUTE'
+                           AND ae.grantor = b.proowner AND NOT ae.is_grantable)), FALSE) END
+                                                                                 AS acl_service_role_entry_exact,
+    CASE WHEN b.expect_default_acl THEN (b.oid IS NOT NULL AND b.proacl IS NULL)
+         ELSE coalesce((SELECT NOT EXISTS (SELECT 1 FROM aclexplode(b.proacl) ae
+                         WHERE NOT (ae.privilege_type = 'EXECUTE'
+                                    AND ae.grantor = b.proowner
+                                    AND NOT ae.is_grantable
+                                    AND (ae.grantee = b.proowner
+                                         OR pg_get_userbyid(ae.grantee) = 'service_role')))), FALSE) END
+                                                                                 AS acl_no_unexpected_entry,
     -- EFFECTIVE ACL — applicable ONLY where the reviewed contract restricts EXECUTE.
     -- qhub_row_immutable is intentionally PUBLIC-executable, so it is reported as
     -- not-applicable (TRUE) rather than failed.
@@ -187,7 +193,9 @@ verdict AS (
      AND c.variadic_exact AND c.no_support_function AND c.no_transforms
      AND c.no_c_binary_link AND c.no_sql_standard_body
      AND c.body_reviewed AND c.mojibake_cleared
-     AND c.acl_exact AND c.effective_acl_ok)                                     AS function_ok
+     AND c.acl_cardinality_exact AND c.acl_owner_entry_exact
+     AND c.acl_service_role_entry_exact AND c.acl_no_unexpected_entry
+     AND c.effective_acl_ok)                                                     AS function_ok
   FROM checks c
 )
 SELECT
@@ -213,7 +221,10 @@ SELECT
   owner_exact,
   security_mode_exact,
   search_path_exact,
-  acl_exact,
+  acl_cardinality_exact,
+  acl_owner_entry_exact,
+  acl_service_role_entry_exact,
+  acl_no_unexpected_entry,
   effective_acl_ok,
   -- semantic / execution attributes
   volatility_exact,

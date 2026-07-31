@@ -242,13 +242,13 @@ const ATTRIBUTE_DRIFT: Array<[string, string, string]> = [
   ['a17 — search_path changed', `ALTER FUNCTION ${DR} SET search_path = public;`, 'search_path_ok'],
   ['a18 — search_path removed', `ALTER FUNCTION ${DR} RESET search_path;`, 'search_path_ok'],
   ['a19 — owner changed', `CREATE ROLE r15_3a_wrong NOLOGIN; ALTER FUNCTION ${DR} OWNER TO r15_3a_wrong;`, 'owner_ok'],
-  ['a20 — anon granted EXECUTE', `GRANT EXECUTE ON FUNCTION ${DR} TO anon;`, 'acl_ok'],
+  ['a20 — anon granted EXECUTE', `GRANT EXECUTE ON FUNCTION ${DR} TO anon;`, 'acl_no_unexpected_entry'],
   [
     'a21 — service_role WITH GRANT OPTION',
     `GRANT EXECUTE ON FUNCTION ${DR} TO service_role WITH GRANT OPTION;`,
-    'acl_ok',
+    'acl_service_role_entry_exact',
   ],
-  ['a22 — a grant applied to row_immutable', `REVOKE ALL ON FUNCTION ${RI} FROM PUBLIC;`, 'acl_ok'],
+  ['a22 — a grant applied to row_immutable', `REVOKE ALL ON FUNCTION ${RI} FROM PUBLIC;`, 'acl_cardinality_exact'],
 ];
 
 describe('R15.3A — 10 STOPs on every semantic attribute drift', () => {
@@ -487,7 +487,10 @@ describe('R15.3A — 12 refuses a correct body with drifted attributes', () => {
         'owner_exact',
         'security_mode_exact',
         'search_path_exact',
-        'acl_exact',
+        'acl_cardinality_exact',
+        'acl_owner_entry_exact',
+        'acl_service_role_entry_exact',
+        'acl_no_unexpected_entry',
         'effective_acl_ok',
         'body_reviewed',
         'mojibake_cleared',
