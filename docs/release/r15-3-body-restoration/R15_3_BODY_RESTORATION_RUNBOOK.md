@@ -54,6 +54,38 @@ Authorization is by **exact raw `md5(prosrc)`** only — no `replace`, `regexp_r
 **The mojibake digests are accepted only by `10` (as proof of the state being repaired) and are rejected
 by `12`.** They must never be added to any accepted-body allowlist.
 
+## Semantic attribute contract (R15.3A)
+
+**`CREATE OR REPLACE FUNCTION` does not preserve omitted attribute clauses — it RESETS them to
+defaults.** Independently verified: `IMMUTABLE STRICT PARALLEL SAFE COST 42` became
+`VOLATILE / CALLED ON NULL INPUT / PARALLEL UNSAFE / COST 100`. Both targets' reviewed values *are*
+those defaults, so a restoration that only fixed the body would silently normalise a tampered function
+and erase the evidence. `10`, `11` and `12` therefore bind the **complete** contract:
+
+| attribute | `qhub_decide_review` | `qhub_row_immutable` |
+|---|---|---|
+| language / prokind | `plpgsql` / `f` | `plpgsql` / `f` |
+| return type | `jsonb` | `trigger` |
+| volatility | `VOLATILE` | `VOLATILE` |
+| strictness | `CALLED ON NULL INPUT` | `CALLED ON NULL INPUT` |
+| parallel safety | `PARALLEL UNSAFE` | `PARALLEL UNSAFE` |
+| leakproof | `NOT LEAKPROOF` | `NOT LEAKPROOF` |
+| set-returning / rows | `false` / `0` | `false` / `0` |
+| cost | `100` | `100` |
+| variadic / support / transforms | none | none |
+| security mode | `SECURITY DEFINER` | `SECURITY INVOKER` |
+| `search_path` | `pg_catalog, public` | none |
+| owner | owner of `qhub_manual_review_requests` | owner of `qhub_acknowledgments` |
+| ACL | service_role `EXECUTE`, no grant option; PUBLIC/anon/authenticated denied | **`proacl IS NULL`** — the migration grants it nothing |
+
+**Any** strictness, parallel-safety, volatility, leakproof, cost, rows, owner, security-mode,
+`search_path`, ACL or signature drift is a **STOP** at `10` and a **NOT READY** at `12`.
+
+> **`11` refuses; it does not repair.** If `10` reports attribute drift, `11` raises before touching
+> anything and the drift is left in place as escalation evidence. Do not "fix" it by running `11`
+> anyway — that would destroy the only record that a `SECURITY DEFINER` decision function had been
+> altered. Escalate instead.
+
 ## ⚠ Encoding rules — the whole point of this package
 
 - **Always** copy with:
@@ -93,23 +125,33 @@ The **last** result is the verdict:
 | `SAFE_TO_RESTORE_REVIEWED_BODIES` | Continue to Step 3. |
 | `UNEXPECTED_LIVE_BODY_STOP` | **STOP.** Capture QUERY 1 and escalate. |
 
-Two distinct STOP causes, and they are not interchangeable:
+Three distinct STOP causes, and they are not interchangeable:
 - `already_reviewed_count > 0` — the restoration has already run. Skip to Step 4 (`12`).
+- `attributes_ok_count < 2` — an **attribute or authority drift** (strictness, parallel safety,
+  volatility, leakproof, cost, rows, owner, security mode, `search_path`, ACL, signature, overload).
+  **STOP and escalate. Do not run `11`** — it will refuse anyway, and running it is not a fix.
+  QUERY 1 shows exactly which flag failed and the live value beside it.
 - a body is some **third** unknown value — unexplained drift that this package is not authorised to
   repair. Escalate; do **not** restore.
 
-`10` reads `pg_catalog` only and never invokes a function, so running it in full is safe in any state and
-cannot raise 42883.
+`10` reads `pg_catalog` only and never invokes either target function, so running it in full is safe in
+any state and cannot raise 42883 or a permission error.
 
 ## Step 3 — Restore (one transaction, once)
 
 Copy `11_RESTORE_REVIEWED_PROTECTED_BODIES.sql` with the encoding-safe command → new query named
 `QHub R15.3 Restore Reviewed Bodies` → confirm it begins with `BEGIN;` and ends with `COMMIT;` → **Run once**.
 
-It replaces only the two function bodies using text extracted **verbatim** from the reviewed migration,
-restates `qhub_decide_review`'s exact owner and ACL, and issues **no** grant, revoke or owner change for
+It replaces only the two function bodies using text extracted **verbatim** from the reviewed migration
+(everything from `AS $$` onward is byte-for-byte; the headers additionally state the reviewed attribute
+contract explicitly, which does not affect `prosrc` and so does not affect the digest). It restates
+`qhub_decide_review`'s exact owner and ACL, and issues **no** grant, revoke or owner change for
 `qhub_row_immutable` (whose reviewed contract is "no grants"). It creates no overload, alters no other
 object, mutates no data, and never touches cluster role memberships. It is idempotent.
+
+**Gate 1** re-asserts the complete identity + attribute + authority contract before any change and
+raises on the first mismatch. **Gate 2** re-asserts all of it again *before* `COMMIT`, so a single
+attribute mismatch rolls **both** functions back together.
 
 Record start/finish time, the success or full error text, and the query name. **On any error: STOP**,
 preserve the error, do not repair by hand. A `R15.3 POST: ... STILL the mojibake body` error means the
@@ -121,8 +163,12 @@ Copy `12_POST_RESTORE_BODY_VERIFY.sql` → new query → Run in full. It is one 
 transaction producing one authoritative statement (two rows, one per function).
 
 Require **`final_status = R15_3_REVIEWED_BODIES_RESTORED`** and `function_ok = true` on both rows. Every
-displayed column feeds that verdict: identity, no overload, owner, security mode, `search_path`,
-volatility, reviewed body digest, mojibake cleared, ACL, and effective ACL.
+displayed check feeds that verdict: identity, no overload, language, prokind, return type, owner,
+security mode, `search_path`, ACL, effective ACL, volatility, strictness, parallel safety, leakproof,
+set-returning flag, cost, rows estimate, variadic, support function, transforms, the reviewed body
+digest, and mojibake cleared. A **correct body with a drifted attribute is NOT READY** — that is the
+R15.3A closure, and `body_reviewed` will read `true` beside the failing attribute flag so the cause is
+unambiguous.
 
 The two ACL contracts differ **by design**: `qhub_decide_review` requires service_role EXECUTE without
 grant option with PUBLIC/anon/authenticated denied and no unexpected direct or effective executor;
@@ -176,7 +222,9 @@ founder UUID, email, org ID and roles before any seed.
 - HEAD does not equal the commit in the final review report
 - Migration SHA-256 is not `b5f0a466f293212812a8ea3d71d6c650ca7af30255275ef248cb420910a0d1cf`
 - `10` returns `UNEXPECTED_LIVE_BODY_STOP` for any reason other than "already restored"
-- `11` raises — especially `R15.3 POST: ... STILL the mojibake body` (bad transfer channel)
+- `10` reports any attribute/authority drift (`attributes_ok = false`) — escalate; **do not run `11`**
+- `11` raises — `R15.3 PRE: ... drifted` (attribute drift; escalate) or
+  `R15.3 POST: ... STILL the mojibake body` (bad transfer channel; re-copy with `-Encoding UTF8`)
 - `12` is not exactly `R15_3_REVIEWED_BODIES_RESTORED`
 - `07` is not `SAFE_TO_APPLY_EXACT_DUAL_DIGEST_PATCH`, or `09` is not `R15_2_VERIFIER_READY`
 - Any SQL error while running any file — do not retry fragments

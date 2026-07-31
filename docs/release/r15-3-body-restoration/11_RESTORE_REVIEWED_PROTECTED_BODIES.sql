@@ -1,33 +1,44 @@
 -- ============================================================================
--- QHUB R15.3 — 11 RESTORE REVIEWED PROTECTED BODIES
+-- QHUB R15.3 — 11 RESTORE REVIEWED PROTECTED BODIES + ATTRIBUTE CONTRACT
 -- Schema version: 2026-07-30.commercial-launch-r8 (UNCHANGED)
 --
--- Restores ONLY these two function bodies to their exact reviewed text:
+-- Restores ONLY these two functions to their exact reviewed body AND their exact
+-- reviewed semantic attribute contract:
 --   public.qhub_decide_review(uuid,text,boolean,text,text,text)
 --   public.qhub_row_immutable()
 --
--- The two CREATE OR REPLACE statements below are VERBATIM extracts from
--- supabase/migrations/20260729_commercial_launch_foundation.sql at the reviewed
--- commit (migration SHA-256 b5f0a466f293212812a8ea3d71d6c650ca7af30255275ef248cb420910a0d1cf).
--- They were copied byte-for-byte, never retyped or reformatted, and a build-time
--- check proves that applying them alone reproduces the approved reviewed LF digests.
+-- THE BODY IS VERBATIM. Everything from `AS $$` onward in each definition below is a
+-- byte-for-byte extract of supabase/migrations/20260729_commercial_launch_foundation.sql
+-- at the reviewed commit (migration SHA-256
+-- b5f0a466f293212812a8ea3d71d6c650ca7af30255275ef248cb420910a0d1cf) — copied, never
+-- retyped. A build-time check proves these statements reproduce the approved reviewed
+-- LF digests and the exact reviewed attribute values.
 --
--- WHAT THIS FIXES. The 2026-07-30 apply passed the migration through a Windows
--- PowerShell clipboard command lacking -Encoding UTF8, so PowerShell 5.1 decoded
--- the BOM-less UTF-8 file as Windows-1252 and re-encoded it mangled (§ -> Â§,
--- — -> â€", → -> â†'). Only these two protected functions contain non-ASCII, and
--- only inside comments — executable text was byte-identical, but the raw digests
--- were not, which is why R15.2C's precheck correctly stopped.
+-- R15.3A — WHY THE HEADERS NOW STATE EVERY ATTRIBUTE EXPLICITLY.
+-- CREATE OR REPLACE FUNCTION does NOT preserve omitted attribute clauses; it RESETS
+-- volatility, strictness, parallel safety, leakproof and cost to their defaults.
+-- The reviewed values happen to BE those defaults, which is precisely why a drifted
+-- live function (e.g. altered to STRICT PARALLEL SAFE) was previously repaired
+-- silently and invisibly. Two changes close that:
+--   * every reviewed attribute is now stated explicitly in the header, so the
+--     restored state is asserted rather than inherited from PostgreSQL defaults;
+--   * GATE 1 REFUSES to run at all when any live attribute differs from the reviewed
+--     contract, so an altered function is ESCALATED, never quietly normalised.
+-- Only the raw prosrc digest is repaired by this script. Nothing else is "fixed".
 --
--- THIS SCRIPT CHANGES NOTHING ELSE. No other function, no table, policy, RLS
--- setting, constraint, index, trigger, configuration row or data. It creates no
--- overload, mutates no data, contains no destructive statement, and never touches
--- cluster role memberships.
+-- NOT LEAKPROOF is safe to state: only setting LEAKPROOF requires superuser.
+-- ROWS is deliberately absent — it is valid only for set-returning functions, and
+-- both targets are proretset = false with prorows = 0.
+--
+-- THIS SCRIPT CHANGES NOTHING ELSE. No other function, table, policy, RLS setting,
+-- constraint, index, trigger, configuration row or data. It creates no overload,
+-- mutates no data, contains no destructive statement, and never touches cluster role
+-- memberships.
 --
 -- ACL / OWNER SCOPE:
 --   * qhub_decide_review — the migration's exact ACL contract is restated verbatim
---     below, and the owner is restored from the owner of the migration-created
---     table public.qhub_manual_review_requests (derived, never guessed).
+--     below, and the owner is restored from the owner of the migration-created table
+--     public.qhub_manual_review_requests (derived, never guessed).
 --   * qhub_row_immutable — the reviewed migration grants it NOTHING (proacl stays
 --     NULL) and sets no owner explicitly. CREATE OR REPLACE preserves both, so this
 --     script deliberately issues NO grant, revoke or owner change for it.
@@ -38,8 +49,8 @@
 --
 -- TRANSFER SAFELY OR NOT AT ALL:
 --   Get-Content -Raw -Encoding UTF8 <file> | Set-Clipboard
--- Never PowerShell 5.1 Get-Content without -Encoding UTF8 — that is the exact
--- defect being repaired here, and it would silently reintroduce it.
+-- Never PowerShell 5.1 Get-Content without -Encoding UTF8 — that is the exact defect
+-- being repaired here, and it would silently reintroduce it.
 -- ============================================================================
 
 BEGIN;
@@ -47,74 +58,136 @@ BEGIN;
 -- ---------------------------------------------------------------------------
 -- GATE 1 — FAIL-CLOSED PRECONDITION (runs BEFORE any change).
 --
--- Both functions must exist at their exact reviewed identity, owner, security mode
--- and search_path, and each body must be EITHER the known mojibake digest (the
--- state this script repairs) OR already a reviewed digest (idempotent re-run).
--- Any third value is unexplained drift: raise and change nothing.
+-- Both functions must already carry the exact reviewed identity, authority AND
+-- complete semantic attribute contract, and each body must be EITHER the known
+-- mojibake digest (the state this script repairs) OR already reviewed (idempotent
+-- re-run). Any attribute drift or any third body value raises and changes nothing —
+-- this script never repairs an unreviewed attribute as a side effect of repairing a
+-- body.
 -- ---------------------------------------------------------------------------
 DO $r15_3_pre$
 DECLARE
-  r          record;
-  v_oid      oid;
-  v_owner    oid;
-  v_md5      text;
+  r     record;
+  v_oid oid;
+  v_own oid;
+  p     record;
 BEGIN
   FOR r IN
     SELECT * FROM (VALUES
       ('public.qhub_decide_review(uuid,text,boolean,text,text,text)',
        'p_request_id uuid, p_actor text, p_is_staff boolean, p_decision text, p_reason text, p_policy_version text',
-       'public.qhub_manual_review_requests', TRUE,  ARRAY['search_path=pg_catalog, public'],
+       'public.qhub_manual_review_requests', 'plpgsql', 'f', 'jsonb', TRUE,
+       ARRAY['search_path=pg_catalog, public'], 'v', FALSE, 'u', FALSE, FALSE, 100::real, 0::real, 0::oid, FALSE,
        '7e678f1e4bba0c540507cfe3743fbe54', 'dac8abcd56d7fc804baac660059c14bf', '9bc91d1671c5f65241ea22538c00d703'),
       ('public.qhub_row_immutable()',
        '',
-       'public.qhub_acknowledgments',        FALSE, NULL::text[],
+       'public.qhub_acknowledgments',        'plpgsql', 'f', 'trigger', FALSE,
+       NULL::text[],                          'v', FALSE, 'u', FALSE, FALSE, 100::real, 0::real, 0::oid, TRUE,
        '41ae59dde9a471b580d28e2cb45984f5', '4936e3f58627dde5abc10d2b0ecf5b4f', '583882c1a9b203e278b27d1080065c9e')
-    ) AS t(sig, args, owner_table, secdef, cfg, lf, crlf, moji)
+    ) AS t(sig, args, owner_table, lang, kind, rettype, secdef, cfg,
+             vol, strictv, par, leakv, retset, costv, rws, varia, default_acl, lf, crlf, moji)
   LOOP
     v_oid := to_regprocedure(r.sig);
     IF v_oid IS NULL THEN
       RAISE EXCEPTION 'R15.3 PRE: % is missing or not at its exact reviewed signature', r.sig;
     END IF;
 
-    IF (SELECT count(*) FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
-         WHERE n.nspname = 'public' AND p.proname = split_part(split_part(r.sig, '(', 1), '.', 2)) <> 1 THEN
+    IF (SELECT count(*) FROM pg_proc pp JOIN pg_namespace nn ON nn.oid = pp.pronamespace
+         WHERE nn.nspname = 'public'
+           AND pp.proname = split_part(split_part(r.sig, '(', 1), '.', 2)) <> 1 THEN
       RAISE EXCEPTION 'R15.3 PRE: % has an unexpected overload', r.sig;
     END IF;
 
-    IF pg_get_function_identity_arguments(v_oid) IS DISTINCT FROM r.args THEN
-      RAISE EXCEPTION 'R15.3 PRE: % identity arguments differ from the reviewed signature', r.sig;
-    END IF;
+    SELECT pp.*, l.lanname INTO p
+      FROM pg_proc pp JOIN pg_language l ON l.oid = pp.prolang
+     WHERE pp.oid = v_oid;
 
-    SELECT c.relowner INTO v_owner FROM pg_class c WHERE c.oid = to_regclass(r.owner_table);
-    IF v_owner IS NULL THEN
+    SELECT c.relowner INTO v_own FROM pg_class c WHERE c.oid = to_regclass(r.owner_table);
+    IF v_own IS NULL THEN
       RAISE EXCEPTION 'R15.3 PRE: cannot resolve the contract owner from %', r.owner_table;
     END IF;
-    IF (SELECT p.proowner FROM pg_proc p WHERE p.oid = v_oid) IS DISTINCT FROM v_owner THEN
-      RAISE EXCEPTION 'R15.3 PRE: % owner drifted from the contract owner of %', r.sig, r.owner_table;
+
+    -- Identity, authority and EVERY semantic attribute that can alter execution,
+    -- planner behaviour or authority. CREATE OR REPLACE resets omitted attributes to
+    -- defaults, so each one is asserted explicitly rather than assumed.
+    IF pg_get_function_identity_arguments(v_oid) IS DISTINCT FROM r.args THEN
+      RAISE EXCEPTION 'R15.3 PRE: % identity arguments drifted', r.sig; END IF;
+    IF p.proowner    IS DISTINCT FROM v_own          THEN
+      RAISE EXCEPTION 'R15.3 PRE: % owner drifted', r.sig; END IF;
+    IF p.prosecdef   IS DISTINCT FROM r.secdef       THEN
+      RAISE EXCEPTION 'R15.3 PRE: % security mode drifted', r.sig; END IF;
+    IF p.proconfig   IS DISTINCT FROM r.cfg          THEN
+      RAISE EXCEPTION 'R15.3 PRE: % search_path drifted', r.sig; END IF;
+    IF p.lanname     IS DISTINCT FROM r.lang         THEN
+      RAISE EXCEPTION 'R15.3 PRE: % language drifted', r.sig; END IF;
+    IF p.prokind     IS DISTINCT FROM r.kind         THEN
+      RAISE EXCEPTION 'R15.3 PRE: % prokind drifted', r.sig; END IF;
+    IF p.prorettype  IS DISTINCT FROM r.rettype::regtype THEN
+      RAISE EXCEPTION 'R15.3 PRE: % return type drifted', r.sig; END IF;
+    IF p.provolatile IS DISTINCT FROM r.vol          THEN
+      RAISE EXCEPTION 'R15.3 PRE: % volatility drifted (live=%, reviewed=%)', r.sig, p.provolatile, r.vol; END IF;
+    IF p.proisstrict IS DISTINCT FROM r.strictv       THEN
+      RAISE EXCEPTION 'R15.3 PRE: % strictness drifted (live=%, reviewed=%)', r.sig, p.proisstrict, r.strictv; END IF;
+    IF p.proparallel IS DISTINCT FROM r.par          THEN
+      RAISE EXCEPTION 'R15.3 PRE: % parallel safety drifted (live=%, reviewed=%)', r.sig, p.proparallel, r.par; END IF;
+    IF p.proleakproof IS DISTINCT FROM r.leakv        THEN
+      RAISE EXCEPTION 'R15.3 PRE: % leakproof drifted', r.sig; END IF;
+    IF p.proretset   IS DISTINCT FROM r.retset       THEN
+      RAISE EXCEPTION 'R15.3 PRE: % set-returning flag drifted', r.sig; END IF;
+    IF p.procost     IS DISTINCT FROM r.costv         THEN
+      RAISE EXCEPTION 'R15.3 PRE: % cost drifted (live=%, reviewed=%)', r.sig, p.procost, r.costv; END IF;
+    IF p.prorows     IS DISTINCT FROM r.rws          THEN
+      RAISE EXCEPTION 'R15.3 PRE: % rows estimate drifted', r.sig; END IF;
+    IF p.provariadic IS DISTINCT FROM r.varia     THEN
+      RAISE EXCEPTION 'R15.3 PRE: % variadic drifted', r.sig; END IF;
+    IF p.prosupport  IS DISTINCT FROM 0::oid         THEN
+      RAISE EXCEPTION 'R15.3 PRE: % has an unexpected support function', r.sig; END IF;
+    IF p.protrftypes IS NOT NULL                     THEN
+      RAISE EXCEPTION 'R15.3 PRE: % has unexpected transforms', r.sig; END IF;
+
+    -- ACL: the two contracts differ by design (see the runbook).
+    IF r.default_acl THEN
+      IF p.proacl IS NOT NULL THEN
+        RAISE EXCEPTION 'R15.3 PRE: % ACL drifted; the reviewed contract grants it nothing', r.sig; END IF;
+    ELSE
+      IF NOT (SELECT count(*) = 1 FROM aclexplode(p.proacl) ae
+               WHERE ae.privilege_type = 'EXECUTE'
+                 AND pg_get_userbyid(ae.grantee) = 'service_role' AND NOT ae.is_grantable)
+         OR EXISTS (SELECT 1 FROM aclexplode(p.proacl) ae
+                     WHERE ae.privilege_type = 'EXECUTE'
+                       AND (ae.grantee = 0
+                            OR pg_get_userbyid(ae.grantee) IN ('anon','authenticated')
+                            OR (ae.grantee <> p.proowner AND pg_get_userbyid(ae.grantee) <> 'service_role')))
+         OR EXISTS (SELECT 1 FROM aclexplode(p.proacl) ae
+                     WHERE ae.is_grantable AND ae.grantee <> p.proowner) THEN
+        RAISE EXCEPTION 'R15.3 PRE: % ACL drifted from the reviewed contract', r.sig; END IF;
     END IF;
 
-    IF (SELECT p.prosecdef FROM pg_proc p WHERE p.oid = v_oid) IS DISTINCT FROM r.secdef THEN
-      RAISE EXCEPTION 'R15.3 PRE: % security mode drifted', r.sig;
-    END IF;
-    IF (SELECT p.proconfig FROM pg_proc p WHERE p.oid = v_oid) IS DISTINCT FROM r.cfg THEN
-      RAISE EXCEPTION 'R15.3 PRE: % search_path drifted', r.sig;
-    END IF;
-
-    SELECT md5(p.prosrc) INTO v_md5 FROM pg_proc p WHERE p.oid = v_oid;
-    IF v_md5 NOT IN (r.moji, r.lf, r.crlf) THEN
-      RAISE EXCEPTION 'R15.3 PRE: % carries an UNKNOWN body (md5=%). This is not the diagnosed mojibake and not a reviewed body. STOP and escalate — do not restore.', r.sig, v_md5;
+    -- BODY: the known mojibake (what this script repairs) or an already-reviewed body
+    -- (idempotent re-run). Any third value is unexplained drift.
+    IF md5(p.prosrc) NOT IN (r.moji, r.lf, r.crlf) THEN
+      RAISE EXCEPTION 'R15.3 PRE: % carries an UNKNOWN body (md5=%). Not the diagnosed mojibake and not a reviewed body. STOP and escalate - do not restore.', r.sig, md5(p.prosrc);
     END IF;
   END LOOP;
 END;
 $r15_3_pre$;
 
 -- ---------------------------------------------------------------------------
--- VERBATIM REVIEWED DEFINITION 1 of 2 — public.qhub_decide_review
+-- VERBATIM REVIEWED BODY 1 of 2 — public.qhub_decide_review
+-- (header states the reviewed attribute contract explicitly; body is verbatim)
 -- ---------------------------------------------------------------------------
 CREATE OR REPLACE FUNCTION public.qhub_decide_review(
   p_request_id UUID, p_actor TEXT, p_is_staff BOOLEAN, p_decision TEXT, p_reason TEXT, p_policy_version TEXT
 ) RETURNS JSONB
-LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, public AS $$
+LANGUAGE plpgsql
+VOLATILE
+CALLED ON NULL INPUT
+PARALLEL UNSAFE
+NOT LEAKPROOF
+COST 100
+SECURITY DEFINER
+SET search_path = pg_catalog, public
+AS $$
 DECLARE
   cfg RECORD;
   r RECORD;
@@ -287,10 +360,18 @@ END;
 $$;
 
 -- ---------------------------------------------------------------------------
--- VERBATIM REVIEWED DEFINITION 2 of 2 — public.qhub_row_immutable
+-- VERBATIM REVIEWED BODY 2 of 2 — public.qhub_row_immutable
+-- (header states the reviewed attribute contract explicitly; body is verbatim)
 -- ---------------------------------------------------------------------------
 CREATE OR REPLACE FUNCTION public.qhub_row_immutable()
-RETURNS TRIGGER LANGUAGE plpgsql AS $$
+RETURNS TRIGGER
+LANGUAGE plpgsql
+VOLATILE
+CALLED ON NULL INPUT
+PARALLEL UNSAFE
+NOT LEAKPROOF
+COST 100
+AS $$
 BEGIN
   IF TG_OP = 'UPDATE' AND TG_TABLE_NAME = 'qhub_acknowledgments' THEN
     -- ALL authority/identity/scope fields are immutable after insert.
@@ -330,10 +411,10 @@ $$;
 -- ---------------------------------------------------------------------------
 -- EXACT OWNER + ACL for qhub_decide_review.
 --
--- CREATE OR REPLACE preserves owner and ACL, so these are normally no-ops; they
--- are restated so the reviewed authority state is asserted rather than assumed.
--- The owner is derived from the migration-created table, never guessed. Nothing
--- here applies to qhub_row_immutable, whose reviewed contract is "no grants".
+-- CREATE OR REPLACE preserves owner and ACL, so these are normally no-ops; they are
+-- restated so the reviewed authority state is asserted rather than assumed. The owner
+-- is derived from the migration-created table, never guessed. Nothing here applies to
+-- qhub_row_immutable, whose reviewed contract is "no grants".
 -- ---------------------------------------------------------------------------
 DO $r15_3_owner$
 DECLARE
@@ -353,40 +434,119 @@ REVOKE ALL ON FUNCTION public.qhub_decide_review(UUID, TEXT, BOOLEAN, TEXT, TEXT
 GRANT EXECUTE ON FUNCTION public.qhub_decide_review(UUID, TEXT, BOOLEAN, TEXT, TEXT, TEXT) TO service_role;
 
 -- ---------------------------------------------------------------------------
--- GATE 2 — FAIL-CLOSED VERIFICATION BEFORE COMMIT.
+-- GATE 2 — FAIL-CLOSED CERTIFICATION BEFORE COMMIT.
 --
--- Both bodies must now hash to exactly one approved reviewed digest (LF or CRLF),
--- and must no longer hash to the mojibake value. If the transfer channel mangled
--- THIS file too, the restored body is not a reviewed body, this raises, and the
--- ENTIRE transaction rolls back leaving the database exactly as it was.
+-- Re-asserts the COMPLETE contract — identity, authority, every semantic attribute,
+-- ACL — and requires both bodies to hash to an approved reviewed digest and no longer
+-- to the mojibake. Any single mismatch raises, and the ENTIRE transaction rolls back:
+-- both functions revert together, leaving the database exactly as it was. If this file
+-- was itself transferred through a mangling channel, the restored body is not a
+-- reviewed body and this gate catches it.
 -- ---------------------------------------------------------------------------
 DO $r15_3_post$
 DECLARE
   r     record;
   v_oid oid;
-  v_md5 text;
+  v_own oid;
+  p     record;
 BEGIN
   FOR r IN
     SELECT * FROM (VALUES
       ('public.qhub_decide_review(uuid,text,boolean,text,text,text)',
+       'p_request_id uuid, p_actor text, p_is_staff boolean, p_decision text, p_reason text, p_policy_version text',
+       'public.qhub_manual_review_requests', 'plpgsql', 'f', 'jsonb', TRUE,
+       ARRAY['search_path=pg_catalog, public'], 'v', FALSE, 'u', FALSE, FALSE, 100::real, 0::real, 0::oid, FALSE,
        '7e678f1e4bba0c540507cfe3743fbe54', 'dac8abcd56d7fc804baac660059c14bf', '9bc91d1671c5f65241ea22538c00d703'),
       ('public.qhub_row_immutable()',
+       '',
+       'public.qhub_acknowledgments',        'plpgsql', 'f', 'trigger', FALSE,
+       NULL::text[],                          'v', FALSE, 'u', FALSE, FALSE, 100::real, 0::real, 0::oid, TRUE,
        '41ae59dde9a471b580d28e2cb45984f5', '4936e3f58627dde5abc10d2b0ecf5b4f', '583882c1a9b203e278b27d1080065c9e')
-    ) AS t(sig, lf, crlf, moji)
+    ) AS t(sig, args, owner_table, lang, kind, rettype, secdef, cfg,
+             vol, strictv, par, leakv, retset, costv, rws, varia, default_acl, lf, crlf, moji)
   LOOP
     v_oid := to_regprocedure(r.sig);
     IF v_oid IS NULL THEN
-      RAISE EXCEPTION 'R15.3 POST: % vanished during restoration', r.sig;
+      RAISE EXCEPTION 'R15.3 POST: % is missing or not at its exact reviewed signature', r.sig;
     END IF;
 
-    SELECT md5(p.prosrc) INTO v_md5 FROM pg_proc p WHERE p.oid = v_oid;
-
-    IF v_md5 = r.moji THEN
-      RAISE EXCEPTION 'R15.3 POST: % is STILL the mojibake body (md5=%). The SQL was transferred through a non-UTF-8 channel. Rolling back. Re-copy with: Get-Content -Raw -Encoding UTF8 <file> | Set-Clipboard', r.sig, v_md5;
+    IF (SELECT count(*) FROM pg_proc pp JOIN pg_namespace nn ON nn.oid = pp.pronamespace
+         WHERE nn.nspname = 'public'
+           AND pp.proname = split_part(split_part(r.sig, '(', 1), '.', 2)) <> 1 THEN
+      RAISE EXCEPTION 'R15.3 POST: % has an unexpected overload', r.sig;
     END IF;
 
-    IF v_md5 NOT IN (r.lf, r.crlf) THEN
-      RAISE EXCEPTION 'R15.3 POST: % does not match either reviewed digest (md5=%). Rolling back.', r.sig, v_md5;
+    SELECT pp.*, l.lanname INTO p
+      FROM pg_proc pp JOIN pg_language l ON l.oid = pp.prolang
+     WHERE pp.oid = v_oid;
+
+    SELECT c.relowner INTO v_own FROM pg_class c WHERE c.oid = to_regclass(r.owner_table);
+    IF v_own IS NULL THEN
+      RAISE EXCEPTION 'R15.3 POST: cannot resolve the contract owner from %', r.owner_table;
+    END IF;
+
+    -- Identity, authority and EVERY semantic attribute that can alter execution,
+    -- planner behaviour or authority. CREATE OR REPLACE resets omitted attributes to
+    -- defaults, so each one is asserted explicitly rather than assumed.
+    IF pg_get_function_identity_arguments(v_oid) IS DISTINCT FROM r.args THEN
+      RAISE EXCEPTION 'R15.3 POST: % identity arguments drifted', r.sig; END IF;
+    IF p.proowner    IS DISTINCT FROM v_own          THEN
+      RAISE EXCEPTION 'R15.3 POST: % owner drifted', r.sig; END IF;
+    IF p.prosecdef   IS DISTINCT FROM r.secdef       THEN
+      RAISE EXCEPTION 'R15.3 POST: % security mode drifted', r.sig; END IF;
+    IF p.proconfig   IS DISTINCT FROM r.cfg          THEN
+      RAISE EXCEPTION 'R15.3 POST: % search_path drifted', r.sig; END IF;
+    IF p.lanname     IS DISTINCT FROM r.lang         THEN
+      RAISE EXCEPTION 'R15.3 POST: % language drifted', r.sig; END IF;
+    IF p.prokind     IS DISTINCT FROM r.kind         THEN
+      RAISE EXCEPTION 'R15.3 POST: % prokind drifted', r.sig; END IF;
+    IF p.prorettype  IS DISTINCT FROM r.rettype::regtype THEN
+      RAISE EXCEPTION 'R15.3 POST: % return type drifted', r.sig; END IF;
+    IF p.provolatile IS DISTINCT FROM r.vol          THEN
+      RAISE EXCEPTION 'R15.3 POST: % volatility drifted (live=%, reviewed=%)', r.sig, p.provolatile, r.vol; END IF;
+    IF p.proisstrict IS DISTINCT FROM r.strictv       THEN
+      RAISE EXCEPTION 'R15.3 POST: % strictness drifted (live=%, reviewed=%)', r.sig, p.proisstrict, r.strictv; END IF;
+    IF p.proparallel IS DISTINCT FROM r.par          THEN
+      RAISE EXCEPTION 'R15.3 POST: % parallel safety drifted (live=%, reviewed=%)', r.sig, p.proparallel, r.par; END IF;
+    IF p.proleakproof IS DISTINCT FROM r.leakv        THEN
+      RAISE EXCEPTION 'R15.3 POST: % leakproof drifted', r.sig; END IF;
+    IF p.proretset   IS DISTINCT FROM r.retset       THEN
+      RAISE EXCEPTION 'R15.3 POST: % set-returning flag drifted', r.sig; END IF;
+    IF p.procost     IS DISTINCT FROM r.costv         THEN
+      RAISE EXCEPTION 'R15.3 POST: % cost drifted (live=%, reviewed=%)', r.sig, p.procost, r.costv; END IF;
+    IF p.prorows     IS DISTINCT FROM r.rws          THEN
+      RAISE EXCEPTION 'R15.3 POST: % rows estimate drifted', r.sig; END IF;
+    IF p.provariadic IS DISTINCT FROM r.varia     THEN
+      RAISE EXCEPTION 'R15.3 POST: % variadic drifted', r.sig; END IF;
+    IF p.prosupport  IS DISTINCT FROM 0::oid         THEN
+      RAISE EXCEPTION 'R15.3 POST: % has an unexpected support function', r.sig; END IF;
+    IF p.protrftypes IS NOT NULL                     THEN
+      RAISE EXCEPTION 'R15.3 POST: % has unexpected transforms', r.sig; END IF;
+
+    -- ACL: the two contracts differ by design (see the runbook).
+    IF r.default_acl THEN
+      IF p.proacl IS NOT NULL THEN
+        RAISE EXCEPTION 'R15.3 POST: % ACL drifted; the reviewed contract grants it nothing', r.sig; END IF;
+    ELSE
+      IF NOT (SELECT count(*) = 1 FROM aclexplode(p.proacl) ae
+               WHERE ae.privilege_type = 'EXECUTE'
+                 AND pg_get_userbyid(ae.grantee) = 'service_role' AND NOT ae.is_grantable)
+         OR EXISTS (SELECT 1 FROM aclexplode(p.proacl) ae
+                     WHERE ae.privilege_type = 'EXECUTE'
+                       AND (ae.grantee = 0
+                            OR pg_get_userbyid(ae.grantee) IN ('anon','authenticated')
+                            OR (ae.grantee <> p.proowner AND pg_get_userbyid(ae.grantee) <> 'service_role')))
+         OR EXISTS (SELECT 1 FROM aclexplode(p.proacl) ae
+                     WHERE ae.is_grantable AND ae.grantee <> p.proowner) THEN
+        RAISE EXCEPTION 'R15.3 POST: % ACL drifted from the reviewed contract', r.sig; END IF;
+    END IF;
+
+    -- BODY: must now be a reviewed encoding and must no longer be the mojibake.
+    IF md5(p.prosrc) = r.moji THEN
+      RAISE EXCEPTION 'R15.3 POST: % is STILL the mojibake body (md5=%). This file was transferred through a non-UTF-8 channel. Rolling back. Re-copy with: Get-Content -Raw -Encoding UTF8 <file> | Set-Clipboard', r.sig, md5(p.prosrc);
+    END IF;
+    IF md5(p.prosrc) NOT IN (r.lf, r.crlf) THEN
+      RAISE EXCEPTION 'R15.3 POST: % does not match either reviewed digest (md5=%). Rolling back.', r.sig, md5(p.prosrc);
     END IF;
   END LOOP;
 END;
