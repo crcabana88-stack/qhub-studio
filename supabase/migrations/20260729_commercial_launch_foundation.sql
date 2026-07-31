@@ -620,6 +620,61 @@ BEGIN
 END;
 $$;
 
+/*
+ * R15.4 — EXPLICIT, PORTABLE, LEAST-PRIVILEGE ACL FOR THE TRIGGER HELPER.
+ *
+ * qhub_row_immutable() is an INTERNAL immutability trigger helper. It is never an
+ * application-facing RPC: PostgreSQL refuses to invoke a trigger function directly
+ * ("trigger functions can only be called as triggers") regardless of privilege.
+ *
+ * Stating no ACL is NOT portable. With no explicit statement the resulting ACL is
+ * whatever the platform's default privileges produce, and the two environments this
+ * project uses disagree:
+ *   * plain PostgreSQL / PGlite      -> proacl IS NULL (owner + PUBLIC by default)
+ *   * Supabase (ALTER DEFAULT PRIVILEGES ... GRANT EXECUTE ON FUNCTIONS TO
+ *     anon, authenticated, service_role) -> five rows: PUBLIC, anon, authenticated,
+ *     service_role and the owner
+ * Both were reproduced from this exact migration. The Supabase result is the
+ * platform's default, not a reviewed decision, and it is not the contract we want.
+ *
+ * The reviewed contract is therefore stated explicitly and is identical in both
+ * environments: exactly ONE ACL row — the owner's own EXECUTE, not grantable.
+ *
+ * SAFETY OF THE REVOKES — verified, not assumed. PostgreSQL checks EXECUTE on a
+ * trigger function at CREATE TRIGGER time, NOT at trigger fire time. With EXECUTE
+ * revoked from service_role, anon, authenticated and PUBLIC, the triggers below
+ * still fire correctly: a protected-field UPDATE is still rejected by the trigger,
+ * the allowed ACTIVE->REVOKED lifecycle transition still succeeds, and DELETE is
+ * still blocked. No application path depends on direct EXECUTE, so no service_role
+ * or browser-role grant is required.
+ *
+ * The four REVOKEs alone already yield exactly {owner=X/owner}, because REVOKE
+ * materializes proacl with the owner's default rights retained. The owner GRANT is
+ * restated anyway so the reviewed contract is explicit for a reader rather than
+ * implied by PostgreSQL's materialization behaviour. It derives the owner from the
+ * catalog instead of naming a role, so it stays correct wherever this migration is
+ * applied.
+ */
+REVOKE ALL PRIVILEGES ON FUNCTION public.qhub_row_immutable() FROM PUBLIC;
+REVOKE ALL PRIVILEGES ON FUNCTION public.qhub_row_immutable() FROM anon;
+REVOKE ALL PRIVILEGES ON FUNCTION public.qhub_row_immutable() FROM authenticated;
+REVOKE ALL PRIVILEGES ON FUNCTION public.qhub_row_immutable() FROM service_role;
+
+DO $qhub_row_immutable_owner_grant$
+DECLARE
+  v_owner name;
+BEGIN
+  SELECT pg_get_userbyid(p.proowner) INTO v_owner
+    FROM pg_proc p WHERE p.oid = to_regprocedure('public.qhub_row_immutable()');
+
+  IF v_owner IS NULL THEN
+    RAISE EXCEPTION 'R15.4: cannot resolve the owner of public.qhub_row_immutable()';
+  END IF;
+
+  EXECUTE format('GRANT EXECUTE ON FUNCTION public.qhub_row_immutable() TO %I', v_owner);
+END;
+$qhub_row_immutable_owner_grant$;
+
 DO $$
 DECLARE
   t TEXT;

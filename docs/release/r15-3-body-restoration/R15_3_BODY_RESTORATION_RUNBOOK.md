@@ -33,7 +33,7 @@ reviewed migration is correct and is **not** changed by this package.
 | Branch | `commercial-launch-foundation` |
 | Base main | `6ab2c2bc82dc67a3073de1eb457583773cab0ac6` |
 | Migration | `supabase/migrations/20260729_commercial_launch_foundation.sql` |
-| Migration SHA-256 | `b5f0a466f293212812a8ea3d71d6c650ca7af30255275ef248cb420910a0d1cf` |
+| Migration SHA-256 | `17f6ee4d014979f5459fc6c553219a162a2ed7e9fdc3d97de855c90aa978d70f` |
 | Schema version | `2026-07-30.commercial-launch-r8` |
 | Live project reference | `jsjsanmaahvmynblmzkq` |
 | This package | `docs/release/r15-3-body-restoration/` |
@@ -76,7 +76,44 @@ and erase the evidence. `10`, `11` and `12` therefore bind the **complete** cont
 | security mode | `SECURITY DEFINER` | `SECURITY INVOKER` |
 | `search_path` | `pg_catalog, public` | none |
 | owner | owner of `qhub_manual_review_requests` | owner of `qhub_acknowledgments` |
-| ACL | **exactly** the owner and service_role `EXECUTE` entries (see below) | **`proacl IS NULL`** — the migration grants it nothing |
+| ACL | **exactly** the owner and service_role `EXECUTE` entries (see below) | **exactly the owner's `EXECUTE`** (R15.4 — see below) |
+
+## The trigger-helper ACL, and why it changed (R15.4)
+
+**PGlite and Supabase produced different ACLs from the same migration.** The migration
+originally stated no ACL for `qhub_row_immutable()`, so the result was whatever the platform's
+default privileges produced:
+
+| environment | resulting `proacl` |
+|---|---|
+| plain PostgreSQL / PGlite | **`NULL`** (owner + PUBLIC by default) |
+| Supabase (`ALTER DEFAULT PRIVILEGES … GRANT EXECUTE ON FUNCTIONS TO anon, authenticated, service_role`) | **five rows** — PUBLIC, `anon`, `authenticated`, owner, `service_role` |
+
+Both were reproduced from this exact migration. R15.3C's precheck **correctly STOPPED** live on
+the five-row set, because the reviewed contract had been derived under PGlite. That was an
+**environment-contract defect, not tampering**.
+
+**Supabase's defaults are not the desired contract.** `qhub_row_immutable()` is an internal
+immutability trigger helper, never an application-facing RPC — PostgreSQL refuses to invoke a
+trigger function directly regardless of privilege. R15.4 therefore states the contract
+explicitly in the migration so both environments converge:
+
+| | exact known live start | exact reviewed target |
+|---|---|---|
+| `qhub_row_immutable` | 5 rows: PUBLIC, `anon`, `authenticated`, owner, `service_role` | **1 row: the owner's EXECUTE only** |
+| `qhub_decide_review` | 2 rows: owner + `service_role` | unchanged — 2 rows |
+
+**Revoking is safe, and this was verified before the contract was adopted.** PostgreSQL checks
+`EXECUTE` on a trigger function at `CREATE TRIGGER` time, **not at fire time**. With EXECUTE
+revoked from PUBLIC, `anon`, `authenticated` and `service_role`, the triggers still fire: a
+protected-field UPDATE is still rejected, the allowed `ACTIVE→REVOKED` transition still
+succeeds, and direct invocation stays impossible for every role. **No `service_role` grant is
+required. No browser-role grant is required.**
+
+> `10` authorizes **only** this documented transition. A sixth row, a missing expected row, a
+> grant option, a different grantor or a different owner all STOP. `11` normalizes **only**
+> `qhub_row_immutable`, and only from that exact five-row set — it still never repairs unknown
+> ACL drift on anything.
 
 ## Exact direct-ACL contract (R15.3C)
 
@@ -89,11 +126,12 @@ not the textual array:
 | function | required direct ACL |
 |---|---|
 | `qhub_decide_review` | exactly 2 rows: `(owner, EXECUTE, granted-by owner, not grantable)` **and** `(service_role, EXECUTE, granted-by owner, not grantable)` — nothing else |
-| `qhub_row_immutable` | **`proacl IS NULL`** — zero ACL rows |
+| `qhub_row_immutable` | **exactly 1 row** after restoration: `(owner, EXECUTE, granted-by owner, not grantable)`. Before restoration, exactly the documented 5-row Supabase-default set — see the R15.4 section above. |
 
-Four flags are reported and all four feed the verdict: `acl_cardinality_exact`,
-`acl_owner_entry_exact`, `acl_service_role_entry_exact`, `acl_no_unexpected_entry`. Comparison is
-set-based, so re-issuing an identical grant (which rewrites the array) is **not** drift.
+Three flags are reported and all three feed the verdict: `acl_cardinality_exact`,
+`acl_expected_rows_present`, `acl_no_unexpected_entry`. Comparison is set-based on
+`(grantee, privilege, grantor, is_grantable)`, so re-issuing an identical grant (which rewrites
+the array) is **not** drift.
 
 > **Severity, stated precisely.** The owner keeps `EXECUTE` through *inherent ownership rights* even
 > without the ACL row, so a missing owner entry is **contract-integrity drift, not an immediate privilege
@@ -176,7 +214,7 @@ git -C "C:\Users\ccaba\qhub-studio\.claude\worktrees\commercial-launch-foundatio
 
 Require, in order: branch is `commercial-launch-foundation`; `HEAD` **equals** `origin/...`; both equal the
 commit in the final review report; migration SHA-256 is exactly
-`b5f0a466f293212812a8ea3d71d6c650ca7af30255275ef248cb420910a0d1cf`. **STOP** on any mismatch — and never
+`17f6ee4d014979f5459fc6c553219a162a2ed7e9fdc3d97de855c90aa978d70f`. **STOP** on any mismatch — and never
 edit a file to make a hash match.
 
 > **Run each file IN FULL, as one unit.** Each opens and closes its own transaction. On any SQL error,
@@ -295,7 +333,7 @@ founder UUID, email, org ID and roles before any seed.
 
 - Branch is not `commercial-launch-foundation`, or local and origin HEAD differ
 - HEAD does not equal the commit in the final review report
-- Migration SHA-256 is not `b5f0a466f293212812a8ea3d71d6c650ca7af30255275ef248cb420910a0d1cf`
+- Migration SHA-256 is not `17f6ee4d014979f5459fc6c553219a162a2ed7e9fdc3d97de855c90aa978d70f`
 - `10` returns `UNEXPECTED_LIVE_BODY_STOP` for any reason other than "already restored"
 - `10` reports any attribute/authority drift (`attributes_ok = false`) — escalate; **do not run `11`**
 - `11` raises — `unexpected_function_acl_state` (direct-ACL drift, including a missing **owner** EXECUTE

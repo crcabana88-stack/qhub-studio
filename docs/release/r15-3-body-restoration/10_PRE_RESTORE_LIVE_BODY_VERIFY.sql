@@ -1,51 +1,38 @@
 -- ============================================================================
--- QHUB R15.3 — 10 PRE-RESTORE LIVE BODY + ATTRIBUTE + CALLABLE-INTERFACE VERIFY
--- (READ-ONLY)
+-- QHUB R15.3/R15.4 — 10 PRE-RESTORE LIVE STATE VERIFY (READ-ONLY)
 --
--- Authorizes 11_RESTORE_REVIEWED_PROTECTED_BODIES.sql ONLY if BOTH protected
--- functions carry their exact reviewed identity, their exact reviewed CALLABLE
--- INTERFACE (arguments, names, modes, types and — critically — no argument
--- defaults), their exact reviewed SEMANTIC ATTRIBUTE contract, their exact reviewed
--- authority (owner / security mode / search_path / ACL), AND a raw body
--- byte-identical to the KNOWN mojibake digest that is not already reviewed.
--- Performs NO writes.
+-- Authorizes 11_RESTORE_REVIEWED_PROTECTED_BODIES.sql ONLY if the live database is
+-- in the EXACT documented starting state: both protected functions carry their exact
+-- reviewed identity, callable interface, semantic attributes and owner/security mode,
+-- both bodies are byte-identical to the KNOWN live mojibake digest, and the direct
+-- ACLs are exactly the documented live sets. Performs NO writes.
 --
--- WHY THIS EXISTS. The 2026-07-30 manual apply moved the migration through a Windows
--- PowerShell clipboard command that read the BOM-less UTF-8 file WITHOUT
--- -Encoding UTF8. PowerShell 5.1 Get-Content then decodes as the system ANSI code
--- page (Windows-1252) and re-encodes mangled:
---     §  ->  Â§        —  ->  â€"        →  ->  â†'
--- Both affected functions carry non-ASCII ONLY inside comments, so the executable
--- text is byte-identical while the raw digest is not. Restoring the reviewed bytes
--- is the fix; the reviewed migration is correct and is NOT changed.
+-- WHY THE TWO ACL EXPECTATIONS DIFFER (R15.4).
+-- The reviewed migration states an explicit ACL for qhub_decide_review, so every
+-- environment agrees: exactly the owner's own EXECUTE plus service_role's.
+-- It did NOT state one for qhub_row_immutable, so the result was whatever the
+-- platform's default privileges produced — and the two environments disagreed:
+--   * plain PostgreSQL / PGlite -> proacl IS NULL
+--   * Supabase (ALTER DEFAULT PRIVILEGES ... GRANT EXECUTE ON FUNCTIONS TO
+--     anon, authenticated, service_role) -> five rows: PUBLIC, anon, authenticated,
+--     the owner and service_role
+-- Both were reproduced from this exact migration. R15.3C's precheck correctly STOPPED
+-- on the live five-row set because the reviewed contract (derived under PGlite) said
+-- proacl IS NULL. That was a contract defect, not tampering.
 --
--- R15.3A — SEMANTIC ATTRIBUTES ARE PART OF AUTHORIZATION. CREATE OR REPLACE FUNCTION
--- does NOT preserve omitted attribute clauses: it RESETS volatility, strictness,
--- parallel safety, leakproof and cost to their defaults (independently verified:
--- IMMUTABLE/STRICT/PARALLEL SAFE/COST 42 became VOLATILE/CALLED ON NULL INPUT/
--- PARALLEL UNSAFE/COST 100). The reviewed values ARE those defaults, so an altered
--- function would have been silently normalised and the tampering erased.
+-- R15.4 fixes the contract at source: the migration now states the ACL explicitly, and
+-- this file authorizes the DELIBERATE, DOCUMENTED transition
+--     five-row Supabase-default ACL  ->  owner-only reviewed ACL
+-- for qhub_row_immutable, while requiring qhub_decide_review's ACL to be exactly the
+-- reviewed set already verified live.
 --
--- R15.3B — ARGUMENT DEFAULTS ARE PART OF AUTHORIZATION, AND IDENTITY ARGUMENTS ARE
--- NOT ENOUGH. pg_get_function_identity_arguments() deliberately EXCLUDES defaults,
--- so `p_policy_version TEXT DEFAULT NULL` leaves BOTH the identity arguments AND the
--- raw prosrc digest completely unchanged — while creating a NEW callable arity.
--- Independently verified: after adding that one default, the reviewed digest was
--- still 7e678f1e..., identity arguments were still exact, and
---     SELECT public.qhub_decide_review(uuid, text, boolean, text, text)
--- SUCCEEDED — a five-argument call into a SECURITY DEFINER decision RPC with
--- p_policy_version silently NULL. This file therefore pins the FULL callable
--- interface: pronargs, pronargdefaults, proargdefaults, pg_get_function_arguments(),
--- proargnames, proargmodes, proallargtypes, proargtypes and provariadic.
---
--- AUTHORIZATION IS BY EXACT RAW DIGEST AND EXACT CATALOG VALUES ONLY. No
--- replace/regexp_replace/translate/trim participates in any verdict — accepting a
--- "normalized" match is exactly the withdrawn-R15.1 mistake.
+-- This is the ONLY ACL transition the package authorizes. Any other difference —
+-- a sixth row, a missing expected row, a grant option, a different grantor, a
+-- different owner — is drift and STOPs. 11 never repairs unknown ACL drift.
 --
 -- Safety: identities resolve through to_regprocedure(), which returns NULL for a
--- missing function rather than raising 42883. There is no text::regprocedure cast
--- and neither target function is ever invoked, so running this file IN FULL is safe
--- in any state and cannot raise a permission error.
+-- missing function rather than raising 42883. Neither target function is invoked, so
+-- running this file IN FULL is safe in any state.
 --
 -- QUERY 1 is per-function detail. QUERY 2 — the LAST statement — is the verdict.
 -- ============================================================================
@@ -54,268 +41,39 @@ BEGIN;
 SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY;
 
 -- ---------------------------------------------------------------------------
--- The complete reviewed contract for both targets, derived from the reviewed
--- migration against a disposable database — never guessed.
---
---   qhub_decide_review : plpgsql, prokind 'f', RETURNS jsonb, SECURITY DEFINER,
---                        search_path {pg_catalog, public}, VOLATILE,
---                        CALLED ON NULL INPUT, PARALLEL UNSAFE, NOT LEAKPROOF,
---                        not set-returning, cost 100, rows 0, no variadic,
---                        no support function, no transforms,
---                        6 arguments, 0 defaults, proargdefaults NULL,
---                        argtypes '2950 25 16 25 25 25' (uuid,text,bool,text,text,text),
---                        ACL: owner + service_role EXECUTE (no grant option)
---   qhub_row_immutable : plpgsql, prokind 'f', RETURNS trigger, SECURITY INVOKER,
---                        no proconfig, VOLATILE, CALLED ON NULL INPUT,
---                        PARALLEL UNSAFE, NOT LEAKPROOF, not set-returning,
---                        cost 100, rows 0, no variadic, no support function,
---                        no transforms, 0 arguments, 0 defaults,
---                        ACL: NULL (the migration grants nothing)
---
--- proargmodes and proallargtypes are NULL for both: every argument is plain IN, so
--- PostgreSQL stores no mode/all-type arrays. A non-NULL value in either means an
--- OUT/INOUT/VARIADIC/TABLE argument appeared — a callable-interface change.
--- ---------------------------------------------------------------------------
-WITH target(signature, proname, identity_arguments, full_arguments, owner_table,
-            expect_lang, expect_kind, expect_rettype, expect_secdef, expect_config,
-            expect_volatile, expect_strict, expect_parallel, expect_leakproof,
-            expect_retset, expect_cost, expect_rows, expect_variadic, expect_default_acl,
-            expect_nargs, expect_argnames, expect_argtypes,
-            lf_digest, crlf_digest, mojibake_digest) AS (
-  VALUES
-    ('public.qhub_decide_review(uuid,text,boolean,text,text,text)', 'qhub_decide_review',
-     'p_request_id uuid, p_actor text, p_is_staff boolean, p_decision text, p_reason text, p_policy_version text',
-     'p_request_id uuid, p_actor text, p_is_staff boolean, p_decision text, p_reason text, p_policy_version text',
-     'public.qhub_manual_review_requests',
-     'plpgsql', 'f', 'jsonb', TRUE, ARRAY['search_path=pg_catalog, public'],
-     'v', FALSE, 'u', FALSE,
-     FALSE, 100::real, 0::real, 0::oid, FALSE,
-     6, ARRAY['p_request_id','p_actor','p_is_staff','p_decision','p_reason','p_policy_version'], '2950 25 16 25 25 25',
-     '7e678f1e4bba0c540507cfe3743fbe54', 'dac8abcd56d7fc804baac660059c14bf',
-     '9bc91d1671c5f65241ea22538c00d703'),
-    ('public.qhub_row_immutable()', 'qhub_row_immutable',
-     '',
-     '',
-     'public.qhub_acknowledgments',
-     'plpgsql', 'f', 'trigger', FALSE, NULL::text[],
-     'v', FALSE, 'u', FALSE,
-     FALSE, 100::real, 0::real, 0::oid, TRUE,
-     0, NULL::text[], '',
-     '41ae59dde9a471b580d28e2cb45984f5', '4936e3f58627dde5abc10d2b0ecf5b4f',
-     '583882c1a9b203e278b27d1080065c9e')
-),
-resolved AS (
-  SELECT
-    k.*,
-    to_regprocedure(k.signature) AS resolved_regproc,
-    (SELECT count(*) FROM pg_proc p2 JOIN pg_namespace n2 ON n2.oid = p2.pronamespace
-      WHERE n2.nspname = 'public' AND p2.proname = k.proname) AS overload_count
-  FROM target k
-),
-live AS (
-  SELECT r.*, p.oid, p.proowner, p.prosecdef, p.proconfig, p.prosrc, p.proacl,
-         p.provolatile, p.proisstrict, p.proparallel, p.proleakproof, p.proretset,
-         p.procost, p.prorows, p.provariadic, p.prosupport, p.protrftypes,
-         p.prokind, p.prorettype, p.pronargs, p.pronargdefaults, p.proargdefaults,
-         p.proargnames, p.proargmodes, p.proallargtypes, p.proargtypes,
-         p.probin, p.prosqlbody, l.lanname
-    FROM resolved r
-    LEFT JOIN pg_proc p ON p.oid = r.resolved_regproc
-    LEFT JOIN pg_language l ON l.oid = p.prolang
-),
-evaluated AS (
-  SELECT
-    v.*,
-    (v.oid IS NOT NULL)                                                             AS function_present,
-    (v.overload_count = 1)                                                          AS single_overload,
-    coalesce(pg_get_function_identity_arguments(v.oid) = v.identity_arguments, FALSE) AS signature_ok,
-    -- CALLABLE INTERFACE (R15.3B)
-    coalesce(pg_get_function_arguments(v.oid) = v.full_arguments, FALSE)             AS full_arguments_ok,
-    coalesce(v.pronargs = v.expect_nargs, FALSE)                                     AS nargs_ok,
-    coalesce(v.pronargdefaults = 0, FALSE)                                           AS no_arg_defaults,
-    (v.oid IS NOT NULL AND v.proargdefaults IS NULL)                                 AS no_default_expressions,
-    coalesce(v.proargnames IS NOT DISTINCT FROM v.expect_argnames, FALSE)            AS argnames_ok,
-    (v.oid IS NOT NULL AND v.proargmodes IS NULL)                                    AS argmodes_plain_in,
-    (v.oid IS NOT NULL AND v.proallargtypes IS NULL)                                 AS no_out_or_table_args,
-    coalesce(v.proargtypes::text = v.expect_argtypes, FALSE)                         AS argtypes_ok,
-    -- With zero defaults the ONLY callable arity is pronargs; any default would add
-    -- shorter callable arities without changing identity arguments or prosrc.
-    coalesce(v.pronargdefaults = 0 AND v.provariadic = 0::oid, FALSE)                AS no_alternate_arity,
-    -- AUTHORITY
-    coalesce(v.proowner = (SELECT c.relowner FROM pg_class c WHERE c.oid = to_regclass(v.owner_table)), FALSE)
-                                                                                    AS owner_ok,
-    coalesce(v.prosecdef = v.expect_secdef, FALSE)                                  AS security_ok,
-    coalesce(v.proconfig IS NOT DISTINCT FROM v.expect_config, FALSE)                AS search_path_ok,
-    -- IDENTITY / TYPE
-    coalesce(v.lanname = v.expect_lang, FALSE)                                       AS language_ok,
-    coalesce(v.prokind = v.expect_kind, FALSE)                                       AS prokind_ok,
-    coalesce(v.prorettype = v.expect_rettype::regtype, FALSE)                        AS rettype_ok,
-    -- SEMANTIC / EXECUTION ATTRIBUTES (R15.3A)
-    coalesce(v.provolatile = v.expect_volatile, FALSE)                               AS volatility_ok,
-    coalesce(v.proisstrict = v.expect_strict, FALSE)                                 AS strictness_ok,
-    coalesce(v.proparallel = v.expect_parallel, FALSE)                               AS parallel_ok,
-    coalesce(v.proleakproof = v.expect_leakproof, FALSE)                             AS leakproof_ok,
-    coalesce(v.proretset = v.expect_retset, FALSE)                                   AS retset_ok,
-    coalesce(v.procost = v.expect_cost, FALSE)                                       AS cost_ok,
-    coalesce(v.prorows = v.expect_rows, FALSE)                                       AS rows_ok,
-    coalesce(v.provariadic = v.expect_variadic, FALSE)                               AS variadic_ok,
-    coalesce(v.prosupport = 0::oid, FALSE)                                           AS no_support_function,
-    (v.oid IS NOT NULL AND v.protrftypes IS NULL)                                    AS no_transforms,
-    -- BODY CARRIER: a plpgsql function stores its source in prosrc alone. probin is set
-    -- only for C-language functions and prosqlbody only for SQL-standard BEGIN ATOMIC
-    -- bodies; either being non-NULL means the body lives somewhere the digest cannot see.
-    (v.oid IS NOT NULL AND v.probin IS NULL)                                         AS no_c_binary_link,
-    (v.oid IS NOT NULL AND v.prosqlbody IS NULL)                                     AS no_sql_standard_body,
-    -- DIRECT ACL — R15.3C EXACT SET EQUALITY. The two contracts differ by design.
-    --   qhub_decide_review : EXACTLY two rows, both EXECUTE, both granted BY the owner,
-    --                        neither grantable — the owner's own entry AND service_role.
-    --                        The owner row is part of the reviewed contract: PostgreSQL
-    --                        writes it when any explicit grant is made, and its absence
-    --                        means someone revoked from the owner. (The owner still holds
-    --                        EXECUTE by inherent ownership, so this is contract-integrity
-    --                        drift rather than immediate escalation — but it is drift, and
-    --                        it must not be silently accepted or silently repaired.)
-    --   qhub_row_immutable : proacl IS NULL — the migration grants it nothing.
-    CASE WHEN v.expect_default_acl THEN (v.oid IS NOT NULL AND v.proacl IS NULL)
-         ELSE coalesce((SELECT count(*) FROM aclexplode(v.proacl)) = 2, FALSE) END    AS acl_cardinality_exact,
-    CASE WHEN v.expect_default_acl THEN (v.oid IS NOT NULL)
-         ELSE coalesce((SELECT EXISTS (SELECT 1 FROM aclexplode(v.proacl) ae
-                         WHERE ae.grantee = v.proowner AND ae.privilege_type = 'EXECUTE'
-                           AND ae.grantor = v.proowner AND NOT ae.is_grantable)), FALSE) END
-                                                                                     AS acl_owner_entry_exact,
-    CASE WHEN v.expect_default_acl THEN (v.oid IS NOT NULL)
-         ELSE coalesce((SELECT EXISTS (SELECT 1 FROM aclexplode(v.proacl) ae
-                         WHERE pg_get_userbyid(ae.grantee) = 'service_role'
-                           AND ae.privilege_type = 'EXECUTE'
-                           AND ae.grantor = v.proowner AND NOT ae.is_grantable)), FALSE) END
-                                                                                     AS acl_service_role_entry_exact,
-    CASE WHEN v.expect_default_acl THEN (v.oid IS NOT NULL AND v.proacl IS NULL)
-         ELSE coalesce((SELECT NOT EXISTS (SELECT 1 FROM aclexplode(v.proacl) ae
-                         WHERE NOT (ae.privilege_type = 'EXECUTE'
-                                    AND ae.grantor = v.proowner
-                                    AND NOT ae.is_grantable
-                                    AND (ae.grantee = v.proowner
-                                         OR pg_get_userbyid(ae.grantee) = 'service_role')))), FALSE) END
-                                                                                     AS acl_no_unexpected_entry,
-    -- BODY
-    coalesce(md5(v.prosrc) = v.mojibake_digest, FALSE)                               AS is_known_mojibake,
-    coalesce(md5(v.prosrc) IN (v.lf_digest, v.crlf_digest), FALSE)                    AS already_reviewed
-  FROM live v
-),
-scored AS (
-  SELECT
-    e.*,
-    (e.function_present AND e.single_overload AND e.signature_ok
-     AND e.full_arguments_ok AND e.nargs_ok AND e.no_arg_defaults
-     AND e.no_default_expressions AND e.argnames_ok AND e.argmodes_plain_in
-     AND e.no_out_or_table_args AND e.argtypes_ok AND e.no_alternate_arity
-     AND e.owner_ok AND e.security_ok AND e.search_path_ok
-     AND e.language_ok AND e.prokind_ok AND e.rettype_ok
-     AND e.volatility_ok AND e.strictness_ok AND e.parallel_ok AND e.leakproof_ok
-     AND e.retset_ok AND e.cost_ok AND e.rows_ok AND e.variadic_ok
-     AND e.no_support_function AND e.no_transforms
-     AND e.no_c_binary_link AND e.no_sql_standard_body
-     AND e.acl_cardinality_exact AND e.acl_owner_entry_exact
-     AND e.acl_service_role_entry_exact AND e.acl_no_unexpected_entry)               AS attributes_ok
-  FROM evaluated e
-)
--- ---------------------------------------------------------------------------
 -- QUERY 1 — Per-function detail. Every flag below is an input to the verdict.
--- ---------------------------------------------------------------------------
-SELECT
-  proname,
-  function_present, single_overload, signature_ok,
-  -- callable interface (R15.3B)
-  full_arguments_ok, nargs_ok, no_arg_defaults, no_default_expressions,
-  argnames_ok, argmodes_plain_in, no_out_or_table_args, argtypes_ok, no_alternate_arity,
-  -- authority (R15.3C: exact direct-ACL set equality)
-  owner_ok, security_ok, search_path_ok,
-  acl_cardinality_exact, acl_owner_entry_exact, acl_service_role_entry_exact, acl_no_unexpected_entry,
-  -- identity / type
-  language_ok, prokind_ok, rettype_ok,
-  -- semantic attributes (R15.3A)
-  volatility_ok, strictness_ok, parallel_ok, leakproof_ok,
-  retset_ok, cost_ok, rows_ok, variadic_ok, no_support_function, no_transforms,
-  no_c_binary_link, no_sql_standard_body,
-  attributes_ok,
-  is_known_mojibake, already_reviewed,
-  (attributes_ok AND is_known_mojibake AND NOT already_reviewed)  AS restorable,
-  -- live values, for escalation evidence
-  pg_get_function_arguments(oid)     AS live_full_arguments,
-  pronargs                           AS live_nargs,
-  pronargdefaults                    AS live_nargdefaults,
-  (proargdefaults IS NOT NULL)       AS live_has_default_expressions,
-  proargnames::text                  AS live_argnames,
-  proargmodes::text                  AS live_argmodes,
-  proallargtypes::text               AS live_allargtypes,
-  proargtypes::text                  AS live_argtypes,
-  lanname                            AS live_language,
-  prorettype::regtype                AS live_rettype,
-  provolatile                        AS live_volatility,
-  proisstrict                        AS live_strict,
-  proparallel                        AS live_parallel,
-  proleakproof                       AS live_leakproof,
-  procost                            AS live_cost,
-  prorows                            AS live_rows,
-  pg_get_userbyid(proowner)          AS live_owner,
-  proconfig::text                    AS live_search_path,
-  coalesce(proacl::text, '(default)') AS live_acl,
-  md5(prosrc)                        AS live_raw_md5_prosrc,
-  octet_length(prosrc)               AS live_bytes
-FROM scored
-ORDER BY proname;
-
--- ---------------------------------------------------------------------------
--- QUERY 2 — VERDICT. Act on this value alone.
 --
---   SAFE_TO_RESTORE_REVIEWED_BODIES
---     both functions carry the exact reviewed identity, callable interface,
---     semantic attribute contract and authority, and both bodies are the KNOWN
---     mojibake and neither reviewed digest. Only the comment bytes need repair.
---
---   UNEXPECTED_LIVE_BODY_STOP
---     anything else. Three distinct causes, which the runbook keeps separate:
---       * already_reviewed_count > 0 — restoration already ran; go to 12.
---       * attributes_ok = false      — an attribute, ACL or CALLABLE-INTERFACE
---                                      drift (including any argument default).
---                                      STOP and ESCALATE. Do NOT run 11.
---       * a third unknown body       — unexplained drift. STOP and escalate.
+-- Expected direct ACL on the live database BEFORE restoration:
+--   qhub_decide_review : exactly 2 rows — owner, service_role
+--   qhub_row_immutable : exactly 5 rows — PUBLIC, anon, authenticated, owner,
+--                        service_role   (the Supabase default state)
+-- all EXECUTE, granted by the owner, none grantable.
 -- ---------------------------------------------------------------------------
-WITH target(signature, proname, identity_arguments, full_arguments, owner_table,
+WITH target(signature, proname, identity_arguments, owner_table,
             expect_lang, expect_kind, expect_rettype, expect_secdef, expect_config,
-            expect_volatile, expect_strict, expect_parallel, expect_leakproof,
-            expect_retset, expect_cost, expect_rows, expect_variadic, expect_default_acl,
             expect_nargs, expect_argnames, expect_argtypes,
             lf_digest, crlf_digest, mojibake_digest) AS (
   VALUES
     ('public.qhub_decide_review(uuid,text,boolean,text,text,text)', 'qhub_decide_review',
      'p_request_id uuid, p_actor text, p_is_staff boolean, p_decision text, p_reason text, p_policy_version text',
-     'p_request_id uuid, p_actor text, p_is_staff boolean, p_decision text, p_reason text, p_policy_version text',
      'public.qhub_manual_review_requests',
      'plpgsql', 'f', 'jsonb', TRUE, ARRAY['search_path=pg_catalog, public'],
-     'v', FALSE, 'u', FALSE,
-     FALSE, 100::real, 0::real, 0::oid, FALSE,
      6, ARRAY['p_request_id','p_actor','p_is_staff','p_decision','p_reason','p_policy_version'], '2950 25 16 25 25 25',
      '7e678f1e4bba0c540507cfe3743fbe54', 'dac8abcd56d7fc804baac660059c14bf',
      '9bc91d1671c5f65241ea22538c00d703'),
     ('public.qhub_row_immutable()', 'qhub_row_immutable',
      '',
-     '',
      'public.qhub_acknowledgments',
      'plpgsql', 'f', 'trigger', FALSE, NULL::text[],
-     'v', FALSE, 'u', FALSE,
-     FALSE, 100::real, 0::real, 0::oid, TRUE,
      0, NULL::text[], '',
      '41ae59dde9a471b580d28e2cb45984f5', '4936e3f58627dde5abc10d2b0ecf5b4f',
      '583882c1a9b203e278b27d1080065c9e')
 ),
 resolved AS (
-  SELECT
-    k.*,
-    to_regprocedure(k.signature) AS resolved_regproc,
-    (SELECT count(*) FROM pg_proc p2 JOIN pg_namespace n2 ON n2.oid = p2.pronamespace
-      WHERE n2.nspname = 'public' AND p2.proname = k.proname) AS overload_count
-  FROM target k
+  SELECT k.*, to_regprocedure(k.signature) AS resolved_regproc,
+         (SELECT count(*) FROM pg_proc p2 JOIN pg_namespace n2 ON n2.oid = p2.pronamespace
+           WHERE n2.nspname = 'public' AND p2.proname = k.proname) AS overload_count
+    FROM target k
 ),
 live AS (
   SELECT r.*, p.oid, p.proowner, p.prosecdef, p.proconfig, p.prosrc, p.proacl,
@@ -331,74 +89,214 @@ live AS (
 evaluated AS (
   SELECT
     v.proname,
-    (v.oid IS NOT NULL
-     AND v.overload_count = 1
-     AND coalesce(pg_get_function_identity_arguments(v.oid) = v.identity_arguments, FALSE)
-     -- CALLABLE INTERFACE (R15.3B)
-     AND coalesce(pg_get_function_arguments(v.oid) = v.full_arguments, FALSE)
-     AND coalesce(v.pronargs = v.expect_nargs, FALSE)
-     AND coalesce(v.pronargdefaults = 0, FALSE)
-     AND v.proargdefaults IS NULL
-     AND coalesce(v.proargnames IS NOT DISTINCT FROM v.expect_argnames, FALSE)
-     AND v.proargmodes IS NULL
-     AND v.proallargtypes IS NULL
-     AND coalesce(v.proargtypes::text = v.expect_argtypes, FALSE)
-     -- AUTHORITY
-     AND coalesce(v.proowner = (SELECT c.relowner FROM pg_class c WHERE c.oid = to_regclass(v.owner_table)), FALSE)
-     AND coalesce(v.prosecdef = v.expect_secdef, FALSE)
-     AND coalesce(v.proconfig IS NOT DISTINCT FROM v.expect_config, FALSE)
-     -- IDENTITY / TYPE
-     AND coalesce(v.lanname = v.expect_lang, FALSE)
-     AND coalesce(v.prokind = v.expect_kind, FALSE)
-     AND coalesce(v.prorettype = v.expect_rettype::regtype, FALSE)
-     -- SEMANTIC ATTRIBUTES (R15.3A)
-     AND coalesce(v.provolatile = v.expect_volatile, FALSE)
-     AND coalesce(v.proisstrict = v.expect_strict, FALSE)
-     AND coalesce(v.proparallel = v.expect_parallel, FALSE)
-     AND coalesce(v.proleakproof = v.expect_leakproof, FALSE)
-     AND coalesce(v.proretset = v.expect_retset, FALSE)
-     AND coalesce(v.procost = v.expect_cost, FALSE)
-     AND coalesce(v.prorows = v.expect_rows, FALSE)
-     AND coalesce(v.provariadic = v.expect_variadic, FALSE)
-     AND coalesce(v.prosupport = 0::oid, FALSE)
-     AND (v.oid IS NOT NULL AND v.protrftypes IS NULL)
-     AND (v.oid IS NOT NULL AND v.probin IS NULL)
-     AND (v.oid IS NOT NULL AND v.prosqlbody IS NULL)
-     -- DIRECT ACL — R15.3C exact set equality (see QUERY 1 for the per-flag breakdown).
-     AND CASE WHEN v.expect_default_acl
-           THEN (v.oid IS NOT NULL AND v.proacl IS NULL)
-           ELSE coalesce((SELECT count(*) FROM aclexplode(v.proacl)) = 2, FALSE)
-                AND coalesce((SELECT EXISTS (SELECT 1 FROM aclexplode(v.proacl) ae
-                           WHERE ae.grantee = v.proowner AND ae.privilege_type = 'EXECUTE'
-                             AND ae.grantor = v.proowner AND NOT ae.is_grantable)), FALSE)
-                AND coalesce((SELECT EXISTS (SELECT 1 FROM aclexplode(v.proacl) ae
-                           WHERE pg_get_userbyid(ae.grantee) = 'service_role'
-                             AND ae.privilege_type = 'EXECUTE'
-                             AND ae.grantor = v.proowner AND NOT ae.is_grantable)), FALSE)
-                AND coalesce((SELECT NOT EXISTS (SELECT 1 FROM aclexplode(v.proacl) ae
-                           WHERE NOT (ae.privilege_type = 'EXECUTE'
-                                      AND ae.grantor = v.proowner
-                                      AND NOT ae.is_grantable
-                                      AND (ae.grantee = v.proowner
-                                           OR pg_get_userbyid(ae.grantee) = 'service_role')))), FALSE)
-         END)                                                                        AS attributes_ok,
-    coalesce(md5(v.prosrc) = v.mojibake_digest, FALSE)                               AS is_known_mojibake,
-    coalesce(md5(v.prosrc) IN (v.lf_digest, v.crlf_digest), FALSE)                    AS already_reviewed
+    (v.oid IS NOT NULL)                                                          AS function_present,
+    (v.overload_count = 1)                                                       AS single_overload,
+    coalesce(pg_get_function_identity_arguments(v.oid) = v.identity_arguments, FALSE) AS signature_ok,
+    coalesce(pg_get_function_arguments(v.oid) = v.identity_arguments, FALSE)   AS full_arguments_ok,
+    coalesce(v.pronargs = v.expect_nargs, FALSE)                              AS nargs_ok,
+    coalesce(v.pronargdefaults = 0, FALSE)                                       AS no_arg_defaults,
+    (v.oid IS NOT NULL AND v.proargdefaults IS NULL)                          AS no_default_expressions,
+    coalesce(v.proargnames IS NOT DISTINCT FROM v.expect_argnames, FALSE)     AS argnames_ok,
+    (v.oid IS NOT NULL AND v.proargmodes IS NULL)                             AS argmodes_plain_in,
+    (v.oid IS NOT NULL AND v.proallargtypes IS NULL)                          AS no_out_or_table_args,
+    coalesce(v.proargtypes::text = v.expect_argtypes, FALSE)                  AS argtypes_ok,
+    coalesce(v.pronargdefaults = 0 AND v.provariadic = 0::oid, FALSE)         AS no_alternate_arity,
+    coalesce(v.proowner = (SELECT c.relowner FROM pg_class c WHERE c.oid = to_regclass(v.owner_table)), FALSE)
+                                                                                    AS owner_ok,
+    coalesce(v.prosecdef = v.expect_secdef, FALSE)                            AS security_ok,
+    coalesce(v.proconfig IS NOT DISTINCT FROM v.expect_config, FALSE)         AS search_path_ok,
+    coalesce(v.lanname = v.expect_lang, FALSE)                                AS language_ok,
+    coalesce(v.prokind = v.expect_kind, FALSE)                                AS prokind_ok,
+    coalesce(v.prorettype = v.expect_rettype::regtype, FALSE)                 AS rettype_ok,
+    coalesce(v.provolatile = 'v', FALSE)                                         AS volatility_ok,
+    coalesce(v.proisstrict = FALSE, FALSE)                                       AS strictness_ok,
+    coalesce(v.proparallel = 'u', FALSE)                                         AS parallel_ok,
+    coalesce(v.proleakproof = FALSE, FALSE)                                      AS leakproof_ok,
+    coalesce(v.proretset = FALSE, FALSE)                                         AS retset_ok,
+    coalesce(v.procost = 100::real, FALSE)                                       AS cost_ok,
+    coalesce(v.prorows = 0::real, FALSE)                                         AS rows_ok,
+    coalesce(v.provariadic = 0::oid, FALSE)                                      AS variadic_ok,
+    coalesce(v.prosupport = 0::oid, FALSE)                                       AS no_support_function,
+    (v.oid IS NOT NULL AND v.protrftypes IS NULL)                             AS no_transforms,
+    (v.oid IS NOT NULL AND v.probin IS NULL)                                  AS no_c_binary_link,
+    (v.oid IS NOT NULL AND v.prosqlbody IS NULL)                              AS no_sql_standard_body,
+    CASE WHEN v.proname = 'qhub_decide_review'
+           THEN coalesce((SELECT count(*) FROM aclexplode(v.proacl)) = 2, FALSE)
+           ELSE coalesce((SELECT count(*) FROM aclexplode(v.proacl)) = 5, FALSE) END                                                    AS acl_cardinality_exact,
+    CASE WHEN v.proname = 'qhub_decide_review'
+           THEN coalesce((SELECT EXISTS (SELECT 1 FROM aclexplode(v.proacl) ae WHERE ae.grantee = v.proowner AND ae.privilege_type = 'EXECUTE' AND ae.grantor = v.proowner AND NOT ae.is_grantable)), FALSE)
+                AND coalesce((SELECT EXISTS (SELECT 1 FROM aclexplode(v.proacl) ae WHERE pg_get_userbyid(ae.grantee) = 'service_role' AND ae.privilege_type = 'EXECUTE' AND ae.grantor = v.proowner AND NOT ae.is_grantable)), FALSE)
+           ELSE coalesce((SELECT EXISTS (SELECT 1 FROM aclexplode(v.proacl) ae WHERE ae.grantee = 0 AND ae.privilege_type = 'EXECUTE' AND ae.grantor = v.proowner AND NOT ae.is_grantable)), FALSE)
+                AND coalesce((SELECT EXISTS (SELECT 1 FROM aclexplode(v.proacl) ae WHERE pg_get_userbyid(ae.grantee) = 'anon' AND ae.privilege_type = 'EXECUTE' AND ae.grantor = v.proowner AND NOT ae.is_grantable)), FALSE)
+                AND coalesce((SELECT EXISTS (SELECT 1 FROM aclexplode(v.proacl) ae WHERE pg_get_userbyid(ae.grantee) = 'authenticated' AND ae.privilege_type = 'EXECUTE' AND ae.grantor = v.proowner AND NOT ae.is_grantable)), FALSE)
+                AND coalesce((SELECT EXISTS (SELECT 1 FROM aclexplode(v.proacl) ae WHERE ae.grantee = v.proowner AND ae.privilege_type = 'EXECUTE' AND ae.grantor = v.proowner AND NOT ae.is_grantable)), FALSE)
+                AND coalesce((SELECT EXISTS (SELECT 1 FROM aclexplode(v.proacl) ae WHERE pg_get_userbyid(ae.grantee) = 'service_role' AND ae.privilege_type = 'EXECUTE' AND ae.grantor = v.proowner AND NOT ae.is_grantable)), FALSE) END                                                 AS acl_expected_rows_present,
+    CASE WHEN v.proname = 'qhub_decide_review'
+           THEN coalesce((SELECT NOT EXISTS (SELECT 1 FROM aclexplode(v.proacl) ae
+                     WHERE NOT (ae.privilege_type = 'EXECUTE' AND ae.grantor = v.proowner AND NOT ae.is_grantable AND (ae.grantee = v.proowner OR pg_get_userbyid(ae.grantee) = 'service_role')))), FALSE)
+           ELSE coalesce((SELECT NOT EXISTS (SELECT 1 FROM aclexplode(v.proacl) ae
+                     WHERE NOT (ae.privilege_type = 'EXECUTE' AND ae.grantor = v.proowner AND NOT ae.is_grantable AND (ae.grantee = 0 OR pg_get_userbyid(ae.grantee) = 'anon' OR pg_get_userbyid(ae.grantee) = 'authenticated' OR ae.grantee = v.proowner OR pg_get_userbyid(ae.grantee) = 'service_role')))), FALSE) END                                                 AS acl_no_unexpected_entry,
+    coalesce(md5(v.prosrc) = v.mojibake_digest, FALSE)                        AS is_known_mojibake,
+    coalesce(md5(v.prosrc) IN (v.lf_digest, v.crlf_digest), FALSE)         AS already_reviewed
   FROM live v
+),
+scored AS (
+  SELECT e.*, (function_present AND single_overload AND signature_ok AND full_arguments_ok
+     AND nargs_ok AND no_arg_defaults AND no_default_expressions AND argnames_ok
+     AND argmodes_plain_in AND no_out_or_table_args AND argtypes_ok AND no_alternate_arity
+     AND owner_ok AND security_ok AND search_path_ok
+     AND language_ok AND prokind_ok AND rettype_ok
+     AND volatility_ok AND strictness_ok AND parallel_ok AND leakproof_ok
+     AND retset_ok AND cost_ok AND rows_ok AND variadic_ok
+     AND no_support_function AND no_transforms AND no_c_binary_link AND no_sql_standard_body
+     AND acl_cardinality_exact AND acl_expected_rows_present AND acl_no_unexpected_entry) AS attributes_ok FROM evaluated e
 )
 SELECT
-  count(*)                                                                      AS functions_expected,
-  count(*) FILTER (WHERE attributes_ok)                                         AS attributes_ok_count,
-  count(*) FILTER (WHERE is_known_mojibake)                                     AS known_mojibake_count,
-  count(*) FILTER (WHERE already_reviewed)                                      AS already_reviewed_count,
+  proname,
+  function_present, single_overload, signature_ok,
+  full_arguments_ok, nargs_ok, no_arg_defaults, no_default_expressions,
+  argnames_ok, argmodes_plain_in, no_out_or_table_args, argtypes_ok, no_alternate_arity,
+  owner_ok, security_ok, search_path_ok,
+  acl_cardinality_exact, acl_expected_rows_present, acl_no_unexpected_entry,
+  language_ok, prokind_ok, rettype_ok,
+  volatility_ok, strictness_ok, parallel_ok, leakproof_ok,
+  retset_ok, cost_ok, rows_ok, variadic_ok, no_support_function, no_transforms,
+  no_c_binary_link, no_sql_standard_body,
+  attributes_ok, is_known_mojibake, already_reviewed,
+  (attributes_ok AND is_known_mojibake AND NOT already_reviewed) AS restorable
+FROM scored
+ORDER BY proname;
+
+-- ---------------------------------------------------------------------------
+-- QUERY 2 — VERDICT. Act on this value alone.
+--
+--   SAFE_TO_RESTORE_REVIEWED_BODIES
+--     both functions are in the exact documented live starting state, so the
+--     deliberate body restoration + trigger-ACL normalization may proceed.
+--
+--   UNEXPECTED_LIVE_BODY_STOP
+--     anything else. Distinct causes, kept separate in the runbook:
+--       * already_reviewed_count > 0 — restoration already ran; go to 12.
+--       * attributes_ok = false      — attribute, callable-interface or ACL drift
+--                                      outside the documented transition.
+--                                      STOP and ESCALATE. Do NOT run 11.
+--       * a body that is not the known mojibake — unexplained drift. Escalate.
+-- ---------------------------------------------------------------------------
+WITH target(signature, proname, identity_arguments, owner_table,
+            expect_lang, expect_kind, expect_rettype, expect_secdef, expect_config,
+            expect_nargs, expect_argnames, expect_argtypes,
+            lf_digest, crlf_digest, mojibake_digest) AS (
+  VALUES
+    ('public.qhub_decide_review(uuid,text,boolean,text,text,text)', 'qhub_decide_review',
+     'p_request_id uuid, p_actor text, p_is_staff boolean, p_decision text, p_reason text, p_policy_version text',
+     'public.qhub_manual_review_requests',
+     'plpgsql', 'f', 'jsonb', TRUE, ARRAY['search_path=pg_catalog, public'],
+     6, ARRAY['p_request_id','p_actor','p_is_staff','p_decision','p_reason','p_policy_version'], '2950 25 16 25 25 25',
+     '7e678f1e4bba0c540507cfe3743fbe54', 'dac8abcd56d7fc804baac660059c14bf',
+     '9bc91d1671c5f65241ea22538c00d703'),
+    ('public.qhub_row_immutable()', 'qhub_row_immutable',
+     '',
+     'public.qhub_acknowledgments',
+     'plpgsql', 'f', 'trigger', FALSE, NULL::text[],
+     0, NULL::text[], '',
+     '41ae59dde9a471b580d28e2cb45984f5', '4936e3f58627dde5abc10d2b0ecf5b4f',
+     '583882c1a9b203e278b27d1080065c9e')
+),
+resolved AS (
+  SELECT k.*, to_regprocedure(k.signature) AS resolved_regproc,
+         (SELECT count(*) FROM pg_proc p2 JOIN pg_namespace n2 ON n2.oid = p2.pronamespace
+           WHERE n2.nspname = 'public' AND p2.proname = k.proname) AS overload_count
+    FROM target k
+),
+live AS (
+  SELECT r.*, p.oid, p.proowner, p.prosecdef, p.proconfig, p.prosrc, p.proacl,
+         p.provolatile, p.proisstrict, p.proparallel, p.proleakproof, p.proretset,
+         p.procost, p.prorows, p.provariadic, p.prosupport, p.protrftypes,
+         p.prokind, p.prorettype, p.pronargs, p.pronargdefaults, p.proargdefaults,
+         p.proargnames, p.proargmodes, p.proallargtypes, p.proargtypes,
+         p.probin, p.prosqlbody, l.lanname
+    FROM resolved r
+    LEFT JOIN pg_proc p ON p.oid = r.resolved_regproc
+    LEFT JOIN pg_language l ON l.oid = p.prolang
+),
+evaluated AS (
+  SELECT
+    v.proname,
+    (v.oid IS NOT NULL)                                                          AS function_present,
+    (v.overload_count = 1)                                                       AS single_overload,
+    coalesce(pg_get_function_identity_arguments(v.oid) = v.identity_arguments, FALSE) AS signature_ok,
+    coalesce(pg_get_function_arguments(v.oid) = v.identity_arguments, FALSE)   AS full_arguments_ok,
+    coalesce(v.pronargs = v.expect_nargs, FALSE)                              AS nargs_ok,
+    coalesce(v.pronargdefaults = 0, FALSE)                                       AS no_arg_defaults,
+    (v.oid IS NOT NULL AND v.proargdefaults IS NULL)                          AS no_default_expressions,
+    coalesce(v.proargnames IS NOT DISTINCT FROM v.expect_argnames, FALSE)     AS argnames_ok,
+    (v.oid IS NOT NULL AND v.proargmodes IS NULL)                             AS argmodes_plain_in,
+    (v.oid IS NOT NULL AND v.proallargtypes IS NULL)                          AS no_out_or_table_args,
+    coalesce(v.proargtypes::text = v.expect_argtypes, FALSE)                  AS argtypes_ok,
+    coalesce(v.pronargdefaults = 0 AND v.provariadic = 0::oid, FALSE)         AS no_alternate_arity,
+    coalesce(v.proowner = (SELECT c.relowner FROM pg_class c WHERE c.oid = to_regclass(v.owner_table)), FALSE)
+                                                                                    AS owner_ok,
+    coalesce(v.prosecdef = v.expect_secdef, FALSE)                            AS security_ok,
+    coalesce(v.proconfig IS NOT DISTINCT FROM v.expect_config, FALSE)         AS search_path_ok,
+    coalesce(v.lanname = v.expect_lang, FALSE)                                AS language_ok,
+    coalesce(v.prokind = v.expect_kind, FALSE)                                AS prokind_ok,
+    coalesce(v.prorettype = v.expect_rettype::regtype, FALSE)                 AS rettype_ok,
+    coalesce(v.provolatile = 'v', FALSE)                                         AS volatility_ok,
+    coalesce(v.proisstrict = FALSE, FALSE)                                       AS strictness_ok,
+    coalesce(v.proparallel = 'u', FALSE)                                         AS parallel_ok,
+    coalesce(v.proleakproof = FALSE, FALSE)                                      AS leakproof_ok,
+    coalesce(v.proretset = FALSE, FALSE)                                         AS retset_ok,
+    coalesce(v.procost = 100::real, FALSE)                                       AS cost_ok,
+    coalesce(v.prorows = 0::real, FALSE)                                         AS rows_ok,
+    coalesce(v.provariadic = 0::oid, FALSE)                                      AS variadic_ok,
+    coalesce(v.prosupport = 0::oid, FALSE)                                       AS no_support_function,
+    (v.oid IS NOT NULL AND v.protrftypes IS NULL)                             AS no_transforms,
+    (v.oid IS NOT NULL AND v.probin IS NULL)                                  AS no_c_binary_link,
+    (v.oid IS NOT NULL AND v.prosqlbody IS NULL)                              AS no_sql_standard_body,
+    CASE WHEN v.proname = 'qhub_decide_review'
+           THEN coalesce((SELECT count(*) FROM aclexplode(v.proacl)) = 2, FALSE)
+           ELSE coalesce((SELECT count(*) FROM aclexplode(v.proacl)) = 5, FALSE) END                                                    AS acl_cardinality_exact,
+    CASE WHEN v.proname = 'qhub_decide_review'
+           THEN coalesce((SELECT EXISTS (SELECT 1 FROM aclexplode(v.proacl) ae WHERE ae.grantee = v.proowner AND ae.privilege_type = 'EXECUTE' AND ae.grantor = v.proowner AND NOT ae.is_grantable)), FALSE)
+                AND coalesce((SELECT EXISTS (SELECT 1 FROM aclexplode(v.proacl) ae WHERE pg_get_userbyid(ae.grantee) = 'service_role' AND ae.privilege_type = 'EXECUTE' AND ae.grantor = v.proowner AND NOT ae.is_grantable)), FALSE)
+           ELSE coalesce((SELECT EXISTS (SELECT 1 FROM aclexplode(v.proacl) ae WHERE ae.grantee = 0 AND ae.privilege_type = 'EXECUTE' AND ae.grantor = v.proowner AND NOT ae.is_grantable)), FALSE)
+                AND coalesce((SELECT EXISTS (SELECT 1 FROM aclexplode(v.proacl) ae WHERE pg_get_userbyid(ae.grantee) = 'anon' AND ae.privilege_type = 'EXECUTE' AND ae.grantor = v.proowner AND NOT ae.is_grantable)), FALSE)
+                AND coalesce((SELECT EXISTS (SELECT 1 FROM aclexplode(v.proacl) ae WHERE pg_get_userbyid(ae.grantee) = 'authenticated' AND ae.privilege_type = 'EXECUTE' AND ae.grantor = v.proowner AND NOT ae.is_grantable)), FALSE)
+                AND coalesce((SELECT EXISTS (SELECT 1 FROM aclexplode(v.proacl) ae WHERE ae.grantee = v.proowner AND ae.privilege_type = 'EXECUTE' AND ae.grantor = v.proowner AND NOT ae.is_grantable)), FALSE)
+                AND coalesce((SELECT EXISTS (SELECT 1 FROM aclexplode(v.proacl) ae WHERE pg_get_userbyid(ae.grantee) = 'service_role' AND ae.privilege_type = 'EXECUTE' AND ae.grantor = v.proowner AND NOT ae.is_grantable)), FALSE) END                                                 AS acl_expected_rows_present,
+    CASE WHEN v.proname = 'qhub_decide_review'
+           THEN coalesce((SELECT NOT EXISTS (SELECT 1 FROM aclexplode(v.proacl) ae
+                     WHERE NOT (ae.privilege_type = 'EXECUTE' AND ae.grantor = v.proowner AND NOT ae.is_grantable AND (ae.grantee = v.proowner OR pg_get_userbyid(ae.grantee) = 'service_role')))), FALSE)
+           ELSE coalesce((SELECT NOT EXISTS (SELECT 1 FROM aclexplode(v.proacl) ae
+                     WHERE NOT (ae.privilege_type = 'EXECUTE' AND ae.grantor = v.proowner AND NOT ae.is_grantable AND (ae.grantee = 0 OR pg_get_userbyid(ae.grantee) = 'anon' OR pg_get_userbyid(ae.grantee) = 'authenticated' OR ae.grantee = v.proowner OR pg_get_userbyid(ae.grantee) = 'service_role')))), FALSE) END                                                 AS acl_no_unexpected_entry,
+    coalesce(md5(v.prosrc) = v.mojibake_digest, FALSE)                        AS is_known_mojibake,
+    coalesce(md5(v.prosrc) IN (v.lf_digest, v.crlf_digest), FALSE)         AS already_reviewed
+  FROM live v
+),
+scored AS (
+  SELECT e.*, (function_present AND single_overload AND signature_ok AND full_arguments_ok
+     AND nargs_ok AND no_arg_defaults AND no_default_expressions AND argnames_ok
+     AND argmodes_plain_in AND no_out_or_table_args AND argtypes_ok AND no_alternate_arity
+     AND owner_ok AND security_ok AND search_path_ok
+     AND language_ok AND prokind_ok AND rettype_ok
+     AND volatility_ok AND strictness_ok AND parallel_ok AND leakproof_ok
+     AND retset_ok AND cost_ok AND rows_ok AND variadic_ok
+     AND no_support_function AND no_transforms AND no_c_binary_link AND no_sql_standard_body
+     AND acl_cardinality_exact AND acl_expected_rows_present AND acl_no_unexpected_entry) AS attributes_ok FROM evaluated e
+)
+SELECT
+  count(*)                                                                  AS functions_expected,
+  count(*) FILTER (WHERE attributes_ok)                                     AS attributes_ok_count,
+  count(*) FILTER (WHERE is_known_mojibake)                                 AS known_mojibake_count,
+  count(*) FILTER (WHERE already_reviewed)                                  AS already_reviewed_count,
   count(*) FILTER (WHERE attributes_ok AND is_known_mojibake AND NOT already_reviewed)
-                                                                                AS restorable_count,
+                                                                            AS restorable_count,
   CASE
     WHEN count(*) = 2
      AND count(*) FILTER (WHERE attributes_ok AND is_known_mojibake AND NOT already_reviewed) = 2
       THEN 'SAFE_TO_RESTORE_REVIEWED_BODIES'
     ELSE 'UNEXPECTED_LIVE_BODY_STOP'
-  END                                                                           AS verdict
-FROM evaluated;
+  END                                                                       AS verdict
+FROM scored;
 
 COMMIT;

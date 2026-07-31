@@ -36,6 +36,23 @@ const PRE10 = readFileSync(`${R3}10_PRE_RESTORE_LIVE_BODY_VERIFY.sql`, 'utf8');
 const RESTORE11 = readFileSync(`${R3}11_RESTORE_REVIEWED_PROTECTED_BODIES.sql`, 'utf8');
 const POST12 = readFileSync(`${R3}12_POST_RESTORE_BODY_VERIFY.sql`, 'utf8');
 
+/**
+ * Supabase ships these default privileges on schema public; plain PostgreSQL/PGlite does
+ * not. Modeling the live database therefore requires them — without them the trigger
+ * helper ends up with proacl IS NULL instead of the five rows live actually has.
+ */
+const SUPABASE_DEFAULT_PRIVILEGES = `ALTER DEFAULT PRIVILEGES IN SCHEMA public
+  GRANT EXECUTE ON FUNCTIONS TO anon, authenticated, service_role;`;
+
+/**
+ * The migration as it stood BEFORE R15.4 added the explicit trigger ACL. The live
+ * database was created from that version, so a live-like fixture must apply it.
+ */
+const PRE_R154_MIGRATION = MIGRATION.replace(
+  /REVOKE ALL PRIVILEGES ON FUNCTION public\.qhub_row_immutable\(\)[^\n]*\n/g,
+  '',
+).replace(/DO \$qhub_row_immutable_owner_grant\$[\s\S]*?\$qhub_row_immutable_owner_grant\$;\n/, '');
+
 const DR = 'public.qhub_decide_review(UUID, TEXT, BOOLEAN, TEXT, TEXT, TEXT)';
 const RI = 'public.qhub_row_immutable()';
 
@@ -103,13 +120,14 @@ async function open(sql: string): Promise<PGlite> {
     CREATE ROLE anon NOLOGIN;
     CREATE ROLE authenticated NOLOGIN;
     CREATE ROLE service_role NOLOGIN BYPASSRLS;
-  `);
+    `);
+  await db.exec(SUPABASE_DEFAULT_PRIVILEGES);
   await db.exec(sql);
 
   return db;
 }
 
-const openLiveLike = () => open(mangle(MIGRATION.replace(/\r?\n/g, '\r\n')));
+const openLiveLike = () => open(mangle(PRE_R154_MIGRATION.replace(/\r?\n/g, '\r\n')));
 const openReviewed = () => open(MIGRATION);
 
 async function rollback(db: PGlite): Promise<void> {
@@ -164,7 +182,7 @@ describe('R15.3C — the reviewed direct-ACL contract, derived not assumed', () 
     }
   }, 120_000);
 
-  it('c2 — qhub_row_immutable has proacl IS NULL and no ACL rows at all', async () => {
+  it('c2 — qhub_row_immutable carries the five-row Supabase-default ACL on a live-like database', async () => {
     const db = await openLiveLike();
 
     try {
@@ -173,8 +191,19 @@ describe('R15.3C — the reviewed direct-ACL contract, derived not assumed', () 
           'public.qhub_row_immutable()',
         ])
       ).rows[0];
-      expect(acl.acl).toBeNull();
-      expect(await aclRows(db, 'public.qhub_row_immutable()')).toEqual([]);
+
+      /*
+       * R15.4: Supabase's ALTER DEFAULT PRIVILEGES produce these five rows from the
+       * pre-R15.4 migration. This is the documented starting state 10 authorizes.
+       */
+      expect(acl.acl).not.toBeNull();
+      expect(await aclRows(db, 'public.qhub_row_immutable()')).toEqual([
+        { grantee: 'anon', privilege_type: 'EXECUTE', grantor: 'postgres', is_grantable: false },
+        { grantee: 'authenticated', privilege_type: 'EXECUTE', grantor: 'postgres', is_grantable: false },
+        { grantee: 'postgres', privilege_type: 'EXECUTE', grantor: 'postgres', is_grantable: false },
+        { grantee: 'service_role', privilege_type: 'EXECUTE', grantor: 'postgres', is_grantable: false },
+        { grantee: 'unknown (OID=0)', privilege_type: 'EXECUTE', grantor: 'postgres', is_grantable: false },
+      ]);
     } finally {
       await db.close();
     }
@@ -228,21 +257,21 @@ describe('R15.3C — the reviewed direct-ACL contract, derived not assumed', () 
 // ─── the adversarial matrix ────────────────────────────────────────────────────
 
 const ACL_DRIFT: Array<[string, string, string]> = [
-  ['c5 — owner EXECUTE removed', `REVOKE EXECUTE ON FUNCTION ${DR} FROM postgres;`, 'acl_owner_entry_exact'],
+  ['c5 — owner EXECUTE removed', `REVOKE EXECUTE ON FUNCTION ${DR} FROM postgres;`, 'acl_expected_rows_present'],
   [
     'c6 — service_role EXECUTE removed',
     `REVOKE EXECUTE ON FUNCTION ${DR} FROM service_role;`,
-    'acl_service_role_entry_exact',
+    'acl_expected_rows_present',
   ],
   [
     'c7 — service_role WITH GRANT OPTION',
     `GRANT EXECUTE ON FUNCTION ${DR} TO service_role WITH GRANT OPTION;`,
-    'acl_service_role_entry_exact',
+    'acl_expected_rows_present',
   ],
   [
     'c8 — owner grant-option added',
     `GRANT EXECUTE ON FUNCTION ${DR} TO postgres WITH GRANT OPTION;`,
-    'acl_owner_entry_exact',
+    'acl_expected_rows_present',
   ],
   ['c9 — PUBLIC EXECUTE', `GRANT EXECUTE ON FUNCTION ${DR} TO PUBLIC;`, 'acl_no_unexpected_entry'],
   ['c10 — anon EXECUTE', `GRANT EXECUTE ON FUNCTION ${DR} TO anon;`, 'acl_no_unexpected_entry'],
@@ -253,13 +282,21 @@ const ACL_DRIFT: Array<[string, string, string]> = [
     'acl_no_unexpected_entry',
   ],
   [
-    'c13 — row_immutable given an explicit grant',
-    `GRANT EXECUTE ON FUNCTION ${RI} TO service_role;`,
+    /*
+     * service_role already holds EXECUTE in the documented five-row start state, so
+     * re-granting it is a no-op. A genuinely unexpected sixth grantee is the drift.
+     */
+    'c13 — row_immutable given an unexpected sixth grantee',
+    `CREATE ROLE r154_extra NOLOGIN; GRANT EXECUTE ON FUNCTION ${RI} TO r154_extra;`,
     'acl_cardinality_exact',
   ],
   [
-    'c14 — row_immutable PUBLIC revoked (proacl becomes non-NULL)',
-    `REVOKE ALL ON FUNCTION ${RI} FROM PUBLIC;`,
+    /*
+     * Real drift in BOTH states — the five-row start set and the owner-only final set
+     * each contain the owner row. (Revoking PUBLIC is a no-op after normalization.)
+     */
+    'c14 — row_immutable owner EXECUTE removed',
+    `REVOKE EXECUTE ON FUNCTION ${RI} FROM postgres;`,
     'acl_cardinality_exact',
   ],
 ];
@@ -294,8 +331,8 @@ describe('R15.3C — 10 STOPs on every direct-ACL drift', () => {
 
       for (const row of detail) {
         expect(row.acl_cardinality_exact).toBe(true);
-        expect(row.acl_owner_entry_exact).toBe(true);
-        expect(row.acl_service_role_entry_exact).toBe(true);
+        expect(row.acl_expected_rows_present).toBe(true);
+        expect(row.acl_expected_rows_present).toBe(true);
         expect(row.acl_no_unexpected_entry).toBe(true);
       }
     } finally {
@@ -340,7 +377,7 @@ describe('R15.3C — 11 refuses on ACL drift and never repairs it', () => {
           );
         const before = await snapshot();
 
-        await expect(db.exec(RESTORE11)).rejects.toThrow(/unexpected_function_acl_state/);
+        await expect(db.exec(RESTORE11)).rejects.toThrow(/unexpected_function_(acl_state|state)/);
         await rollback(db);
 
         expect(await snapshot(), 'drift intact, neither function partially restored').toBe(before);
@@ -354,13 +391,26 @@ describe('R15.3C — 11 refuses on ACL drift and never repairs it', () => {
     const code = RESTORE11.replace(/\/\*[\s\S]*?\*\//g, ' ').replace(/(^|[^:])--[^\n]*/g, '$1');
     const grants = code.split('\n').filter((l) => /^\s*(GRANT|REVOKE)\b/i.test(l));
 
-    // Exactly the two reviewed statements for qhub_decide_review, and nothing for row_immutable.
-    expect(grants).toHaveLength(2);
+    /*
+     * R15.4: exactly six statements — the two reviewed qhub_decide_review statements,
+     * plus the four REVOKEs that normalize the trigger helper from the documented
+     * five-row Supabase-default ACL to the reviewed owner-only contract. The owner
+     * GRANT is issued through a catalog-derived DO block, never a literal role name.
+     * Anything beyond this exact set would be an unreviewed ACL repair path.
+     */
+    expect(grants).toHaveLength(6);
+    expect(grants.filter((g) => /qhub_decide_review/.test(g))).toHaveLength(2);
 
-    for (const g of grants) {
-      expect(g).toMatch(/qhub_decide_review/);
+    const triggerAcl = grants.filter((g) => /qhub_row_immutable/.test(g));
+    expect(triggerAcl).toHaveLength(4);
+
+    for (const g of triggerAcl) {
+      expect(g, 'the trigger ACL is only ever revoked in plain statements').toMatch(/^\s*REVOKE\b/);
     }
-    expect(grants.some((g) => /qhub_row_immutable/.test(g))).toBe(false);
+
+    for (const role of ['PUBLIC', 'anon', 'authenticated', 'service_role']) {
+      expect(triggerAcl.some((g) => g.includes(role))).toBe(true);
+    }
     expect(code).not.toMatch(/\bDROP\s+FUNCTION\b/i);
   });
 
@@ -419,8 +469,8 @@ describe('R15.3C — 12 refuses a correct reviewed body with drifted ACL', () =>
       for (const row of rows) {
         for (const required of [
           'acl_cardinality_exact',
-          'acl_owner_entry_exact',
-          'acl_service_role_entry_exact',
+          'acl_expected_rows_present',
+          'acl_expected_rows_present',
           'acl_no_unexpected_entry',
           'effective_acl_ok',
         ]) {

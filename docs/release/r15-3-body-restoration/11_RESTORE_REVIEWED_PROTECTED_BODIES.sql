@@ -1,239 +1,188 @@
 -- ============================================================================
--- QHUB R15.3 — 11 RESTORE REVIEWED PROTECTED BODIES
---              + SEMANTIC ATTRIBUTE + CALLABLE-INTERFACE CONTRACT
+-- QHUB R15.3/R15.4 — 11 RESTORE REVIEWED BODIES + NORMALIZE THE TRIGGER ACL
 -- Schema version: 2026-07-30.commercial-launch-r8 (UNCHANGED)
 --
--- Restores ONLY these two functions to their exact reviewed body, semantic attribute
--- contract and callable interface:
---   public.qhub_decide_review(uuid,text,boolean,text,text,text)
---   public.qhub_row_immutable()
+-- In ONE transaction this script:
+--   1. requires the EXACT documented live starting state (bodies, attributes,
+--      callable interface, owner/security, and both direct ACLs);
+--   2. restores the two exact reviewed bodies;
+--   3. normalizes ONLY public.qhub_row_immutable()'s ACL from the documented
+--      five-row Supabase-default state to the reviewed owner-only contract;
+--   4. re-asserts the complete final contract before COMMIT.
 --
--- THE BODY IS VERBATIM. Everything from `AS $$` onward in each definition below is a
--- byte-for-byte extract of supabase/migrations/20260729_commercial_launch_foundation.sql
--- at the reviewed commit (migration SHA-256
--- b5f0a466f293212812a8ea3d71d6c650ca7af30255275ef248cb420910a0d1cf) — copied, never
--- retyped. A build-time check proves these statements reproduce the approved reviewed
--- LF digests, the exact reviewed attribute values and the exact reviewed callable
--- interface with zero argument defaults.
+-- THE BODIES ARE VERBATIM. Everything from `AS $$` onward in each definition below is
+-- a byte-for-byte extract of supabase/migrations/20260729_commercial_launch_foundation.sql
+-- at the reviewed commit — copied, never retyped.
 --
--- R15.3A — WHY THE HEADERS STATE EVERY ATTRIBUTE EXPLICITLY.
--- CREATE OR REPLACE FUNCTION does NOT preserve omitted attribute clauses; it RESETS
--- volatility, strictness, parallel safety, leakproof and cost to their defaults. The
--- reviewed values happen to BE those defaults, which is precisely why a drifted live
--- function (e.g. altered to STRICT PARALLEL SAFE) was previously repaired silently and
--- invisibly. Every reviewed attribute is now stated explicitly, and GATE 1 REFUSES when
--- any live attribute differs, so an altered function is ESCALATED, never normalised.
+-- WHY THIS SCRIPT MAY CHANGE AN ACL AT ALL.
+-- Every earlier round of this package refused to touch ACLs, and that rule still holds
+-- for unknown drift. This one transition is different and is explicitly authorized:
+-- the starting state is fully documented and reproduced (Supabase applies
+-- ALTER DEFAULT PRIVILEGES granting EXECUTE on new functions to anon, authenticated
+-- and service_role, so the trigger helper acquired five ACL rows the migration never
+-- asked for), and the target is the reviewed least-privilege contract the migration now
+-- states explicitly. GATE 1 refuses unless the live ACL is EXACTLY that documented
+-- five-row set, so no unknown ACL drift can be silently normalized.
 --
--- R15.3B — WHY ARGUMENT DEFAULTS ARE CHECKED SEPARATELY AND FIRST.
--- pg_get_function_identity_arguments() EXCLUDES defaults. Adding
--- `p_policy_version TEXT DEFAULT NULL` leaves the identity arguments AND the raw prosrc
--- digest completely unchanged while creating a NEW callable arity — independently
--- verified, a five-argument call into this SECURITY DEFINER decision RPC then succeeded
--- with p_policy_version silently NULL. GATE 1 therefore pins pronargs, pronargdefaults,
--- proargdefaults, pg_get_function_arguments(), proargnames, proargmodes,
--- proallargtypes, proargtypes and provariadic, and raises
--- unexpected_function_default_argument_state before touching anything.
--- This script NEVER removes an unknown default: PostgreSQL forbids dropping defaults
--- through CREATE OR REPLACE ("cannot remove parameter defaults from existing function"),
--- and silently doing so would destroy the evidence. It refuses instead.
+-- WHY REVOKING IS SAFE — verified, not assumed. PostgreSQL checks EXECUTE on a trigger
+-- function at CREATE TRIGGER time, NOT at fire time. With EXECUTE revoked from PUBLIC,
+-- anon, authenticated and service_role, the immutability triggers still fire: a
+-- protected-field UPDATE is still rejected, the allowed ACTIVE->REVOKED transition
+-- still succeeds, and direct invocation remains impossible for every role
+-- ("trigger functions can only be called as triggers").
 --
--- Only the raw prosrc digest is repaired by this script. Nothing else is "fixed".
+-- NOTHING ELSE CHANGES. No other function, table, policy, RLS setting, constraint,
+-- index, trigger, configuration row or data. No overload, no DROP, no data mutation,
+-- no destructive statement, and never any cluster role-membership change.
 --
--- NOT LEAKPROOF is safe to state: only setting LEAKPROOF requires superuser.
--- ROWS is deliberately absent — it is valid only for set-returning functions, and both
--- targets are proretset = false with prorows = 0.
---
--- THIS SCRIPT CHANGES NOTHING ELSE. No other function, table, policy, RLS setting,
--- constraint, index, trigger, configuration row or data. It creates no overload, drops
--- nothing, mutates no data, contains no destructive statement, and never touches cluster
--- role memberships.
---
--- ACL / OWNER SCOPE:
---   * qhub_decide_review — the migration's exact ACL contract is restated verbatim
---     below, and the owner is restored from the owner of the migration-created table
---     public.qhub_manual_review_requests (derived, never guessed).
---   * qhub_row_immutable — the reviewed migration grants it NOTHING (proacl stays
---     NULL) and sets no owner explicitly. CREATE OR REPLACE preserves both, so this
---     script deliberately issues NO grant, revoke or owner change for it.
+-- qhub_decide_review's ACL is restated verbatim from the migration and must already be
+-- exactly the reviewed set both before and after.
 --
 -- Run ONCE, as one transaction, only after 10_PRE_RESTORE_LIVE_BODY_VERIFY.sql returns
--- SAFE_TO_RESTORE_REVIEWED_BODIES. Idempotent: a second run is a no-op that still passes
--- both gates.
+-- SAFE_TO_RESTORE_REVIEWED_BODIES. A second run under the final reviewed state is a
+-- no-op that still passes both gates.
 --
 -- TRANSFER SAFELY OR NOT AT ALL:
 --   Get-Content -Raw -Encoding UTF8 <file> | Set-Clipboard
--- Never PowerShell 5.1 Get-Content without -Encoding UTF8 — that is the exact defect
--- being repaired here, and it would silently reintroduce it.
+-- Never PowerShell 5.1 Get-Content without -Encoding UTF8 — that is the defect this
+-- package repairs, and it would silently reintroduce it.
 -- ============================================================================
 
 BEGIN;
 
 -- ---------------------------------------------------------------------------
 -- GATE 1 — FAIL-CLOSED PRECONDITION (runs BEFORE any change).
---
--- Both functions must already carry the exact reviewed callable interface (including
--- ZERO argument defaults), identity, authority AND complete semantic attribute
--- contract, and each body must be EITHER the known mojibake digest (the state this
--- script repairs) OR already reviewed (idempotent re-run). Any drift raises and
--- changes nothing — this script never repairs an unreviewed attribute or default as a
--- side effect of repairing a body.
+-- Requires the exact documented live starting state, including the five-row
+-- Supabase-default ACL on the trigger helper. Any other state raises and changes
+-- nothing, leaving the drift intact as escalation evidence.
 -- ---------------------------------------------------------------------------
-DO $r15_3_pre$
+DO $r15_4_pre$
 DECLARE
   r     record;
   v_oid oid;
   v_own oid;
   p     record;
+  v_acl_start boolean;
+  v_acl_final boolean;
+  v_is_start boolean;
+  v_is_final boolean;
 BEGIN
   FOR r IN
     SELECT * FROM (VALUES
       ('public.qhub_decide_review(uuid,text,boolean,text,text,text)',
        'p_request_id uuid, p_actor text, p_is_staff boolean, p_decision text, p_reason text, p_policy_version text',
-       'p_request_id uuid, p_actor text, p_is_staff boolean, p_decision text, p_reason text, p_policy_version text',
        'public.qhub_manual_review_requests', 'plpgsql', 'f', 'jsonb', TRUE,
-       ARRAY['search_path=pg_catalog, public'], 'v', FALSE, 'u', FALSE, FALSE, 100::real, 0::real, 0::oid, FALSE,
-       6, ARRAY['p_request_id','p_actor','p_is_staff','p_decision','p_reason','p_policy_version'], '2950 25 16 25 25 25',
+       ARRAY['search_path=pg_catalog, public'], 6, ARRAY['p_request_id','p_actor','p_is_staff','p_decision','p_reason','p_policy_version'], '2950 25 16 25 25 25',
        '7e678f1e4bba0c540507cfe3743fbe54', 'dac8abcd56d7fc804baac660059c14bf', '9bc91d1671c5f65241ea22538c00d703'),
       ('public.qhub_row_immutable()',
        '',
-       '',
-       'public.qhub_acknowledgments',        'plpgsql', 'f', 'trigger', FALSE,
-       NULL::text[],                          'v', FALSE, 'u', FALSE, FALSE, 100::real, 0::real, 0::oid, TRUE,
-       0, NULL::text[], '',
+       'public.qhub_acknowledgments', 'plpgsql', 'f', 'trigger', FALSE,
+       NULL::text[], 0, NULL::text[], '',
        '41ae59dde9a471b580d28e2cb45984f5', '4936e3f58627dde5abc10d2b0ecf5b4f', '583882c1a9b203e278b27d1080065c9e')
-    ) AS t(sig, args, full_args, owner_table, lang, kind, rettype, secdef, cfg,
-             vol, strictv, par, leakv, retset, costv, rws, varia, default_acl,
-             nargs, argnames, argtypes, lf, crlf, moji)
+    ) AS t(sig, args, owner_table, lang, kind, rettype, secdef, cfg, nargs, argnames, argtypes, lf, crlf, moji)
   LOOP
     v_oid := to_regprocedure(r.sig);
     IF v_oid IS NULL THEN
-      RAISE EXCEPTION 'R15.3 PRE: % is missing or not at its exact reviewed signature', r.sig;
-    END IF;
-
+      RAISE EXCEPTION 'R15.3 PRE: % is missing or not at its exact reviewed signature', r.sig; END IF;
     IF (SELECT count(*) FROM pg_proc pp JOIN pg_namespace nn ON nn.oid = pp.pronamespace
          WHERE nn.nspname = 'public'
            AND pp.proname = split_part(split_part(r.sig, '(', 1), '.', 2)) <> 1 THEN
-      RAISE EXCEPTION 'R15.3 PRE: % has an unexpected overload', r.sig;
-    END IF;
+      RAISE EXCEPTION 'R15.3 PRE: % has an unexpected overload', r.sig; END IF;
 
     SELECT pp.*, l.lanname INTO p
-      FROM pg_proc pp JOIN pg_language l ON l.oid = pp.prolang
-     WHERE pp.oid = v_oid;
-
+      FROM pg_proc pp JOIN pg_language l ON l.oid = pp.prolang WHERE pp.oid = v_oid;
     SELECT c.relowner INTO v_own FROM pg_class c WHERE c.oid = to_regclass(r.owner_table);
     IF v_own IS NULL THEN
-      RAISE EXCEPTION 'R15.3 PRE: cannot resolve the contract owner from %', r.owner_table;
-    END IF;
+      RAISE EXCEPTION 'R15.3 PRE: cannot resolve the contract owner from %', r.owner_table; END IF;
 
-    -- ── CALLABLE INTERFACE / DEFAULT ARGUMENTS (R15.3B) ─────────────────────────
-    -- Checked FIRST and separately, because pg_get_function_identity_arguments()
-    -- EXCLUDES defaults: a trailing DEFAULT leaves the identity arguments AND the raw
-    -- prosrc digest unchanged while adding a new callable arity. This script never
-    -- removes an unknown default (PostgreSQL forbids it via CREATE OR REPLACE anyway);
-    -- it refuses, so the drift survives as escalation evidence.
-    IF p.pronargdefaults <> 0 OR p.proargdefaults IS NOT NULL THEN
-      RAISE EXCEPTION 'unexpected_function_default_argument_state: % has % argument default(s) (%). The reviewed contract has NONE. Identity arguments and the body digest can BOTH look correct while a default adds a shorter callable arity. No change was made - STOP and escalate.',
-        r.sig, p.pronargdefaults, pg_get_function_arguments(v_oid);
-    END IF;
-    IF pg_get_function_arguments(v_oid) IS DISTINCT FROM r.full_args THEN
-      RAISE EXCEPTION 'unexpected_function_default_argument_state: % full argument list drifted (live=%, reviewed=%)',
-        r.sig, pg_get_function_arguments(v_oid), r.full_args; END IF;
-    IF p.pronargs     IS DISTINCT FROM r.nargs        THEN
-      RAISE EXCEPTION 'R15.3 PRE: % argument count drifted', r.sig; END IF;
-    IF p.proargnames  IS DISTINCT FROM r.argnames     THEN
-      RAISE EXCEPTION 'R15.3 PRE: % argument names drifted', r.sig; END IF;
-    IF p.proargmodes  IS NOT NULL                     THEN
-      RAISE EXCEPTION 'R15.3 PRE: % has non-IN argument modes (OUT/INOUT/VARIADIC/TABLE)', r.sig; END IF;
-    IF p.proallargtypes IS NOT NULL                   THEN
-      RAISE EXCEPTION 'R15.3 PRE: % has OUT/TABLE argument types', r.sig; END IF;
-    IF p.proargtypes::text IS DISTINCT FROM r.argtypes THEN
-      RAISE EXCEPTION 'R15.3 PRE: % argument types drifted', r.sig; END IF;
-
-    -- ── IDENTITY, AUTHORITY AND SEMANTIC ATTRIBUTES (R15.3A) ────────────────────
-    -- CREATE OR REPLACE resets omitted attributes to defaults, so each is asserted
-    -- explicitly rather than assumed.
     IF pg_get_function_identity_arguments(v_oid) IS DISTINCT FROM r.args THEN
       RAISE EXCEPTION 'R15.3 PRE: % identity arguments drifted', r.sig; END IF;
-    IF p.proowner    IS DISTINCT FROM v_own          THEN
+    IF pg_get_function_arguments(v_oid) IS DISTINCT FROM r.args THEN
+      RAISE EXCEPTION 'unexpected_function_default_argument_state: % full argument list drifted (live=%)', r.sig, pg_get_function_arguments(v_oid); END IF;
+    IF p.pronargdefaults <> 0 OR p.proargdefaults IS NOT NULL THEN
+      RAISE EXCEPTION 'unexpected_function_default_argument_state: % has % argument default(s). The reviewed contract has NONE.', r.sig, p.pronargdefaults; END IF;
+    IF p.pronargs IS DISTINCT FROM r.nargs THEN
+      RAISE EXCEPTION 'R15.3 PRE: % argument count drifted', r.sig; END IF;
+    IF p.proargnames IS DISTINCT FROM r.argnames THEN
+      RAISE EXCEPTION 'R15.3 PRE: % argument names drifted', r.sig; END IF;
+    IF p.proargmodes IS NOT NULL OR p.proallargtypes IS NOT NULL THEN
+      RAISE EXCEPTION 'R15.3 PRE: % has non-IN argument modes', r.sig; END IF;
+    IF p.proargtypes::text IS DISTINCT FROM r.argtypes THEN
+      RAISE EXCEPTION 'R15.3 PRE: % argument types drifted', r.sig; END IF;
+    IF p.proowner IS DISTINCT FROM v_own THEN
       RAISE EXCEPTION 'R15.3 PRE: % owner drifted', r.sig; END IF;
-    IF p.prosecdef   IS DISTINCT FROM r.secdef       THEN
+    IF p.prosecdef IS DISTINCT FROM r.secdef THEN
       RAISE EXCEPTION 'R15.3 PRE: % security mode drifted', r.sig; END IF;
-    IF p.proconfig   IS DISTINCT FROM r.cfg          THEN
+    IF p.proconfig IS DISTINCT FROM r.cfg THEN
       RAISE EXCEPTION 'R15.3 PRE: % search_path drifted', r.sig; END IF;
-    IF p.lanname     IS DISTINCT FROM r.lang         THEN
+    IF p.lanname IS DISTINCT FROM r.lang THEN
       RAISE EXCEPTION 'R15.3 PRE: % language drifted', r.sig; END IF;
-    IF p.prokind     IS DISTINCT FROM r.kind         THEN
+    IF p.prokind IS DISTINCT FROM r.kind THEN
       RAISE EXCEPTION 'R15.3 PRE: % prokind drifted', r.sig; END IF;
-    IF p.prorettype  IS DISTINCT FROM r.rettype::regtype THEN
+    IF p.prorettype IS DISTINCT FROM r.rettype::regtype THEN
       RAISE EXCEPTION 'R15.3 PRE: % return type drifted', r.sig; END IF;
-    IF p.provolatile IS DISTINCT FROM r.vol          THEN
-      RAISE EXCEPTION 'R15.3 PRE: % volatility drifted (live=%, reviewed=%)', r.sig, p.provolatile, r.vol; END IF;
-    IF p.proisstrict IS DISTINCT FROM r.strictv      THEN
-      RAISE EXCEPTION 'R15.3 PRE: % strictness drifted (live=%, reviewed=%)', r.sig, p.proisstrict, r.strictv; END IF;
-    IF p.proparallel IS DISTINCT FROM r.par          THEN
-      RAISE EXCEPTION 'R15.3 PRE: % parallel safety drifted (live=%, reviewed=%)', r.sig, p.proparallel, r.par; END IF;
-    IF p.proleakproof IS DISTINCT FROM r.leakv       THEN
-      RAISE EXCEPTION 'R15.3 PRE: % leakproof drifted', r.sig; END IF;
-    IF p.proretset   IS DISTINCT FROM r.retset       THEN
-      RAISE EXCEPTION 'R15.3 PRE: % set-returning flag drifted', r.sig; END IF;
-    IF p.procost     IS DISTINCT FROM r.costv        THEN
-      RAISE EXCEPTION 'R15.3 PRE: % cost drifted (live=%, reviewed=%)', r.sig, p.procost, r.costv; END IF;
-    IF p.prorows     IS DISTINCT FROM r.rws          THEN
-      RAISE EXCEPTION 'R15.3 PRE: % rows estimate drifted', r.sig; END IF;
-    IF p.provariadic IS DISTINCT FROM r.varia        THEN
-      RAISE EXCEPTION 'R15.3 PRE: % variadic drifted', r.sig; END IF;
-    IF p.prosupport  IS DISTINCT FROM 0::oid         THEN
-      RAISE EXCEPTION 'R15.3 PRE: % has an unexpected support function', r.sig; END IF;
-    IF p.protrftypes IS NOT NULL                     THEN
-      RAISE EXCEPTION 'R15.3 PRE: % has unexpected transforms', r.sig; END IF;
-    -- BODY CARRIER: plpgsql stores its source in prosrc alone. probin is set only for
-    -- C-language functions and prosqlbody only for SQL-standard BEGIN ATOMIC bodies;
-    -- either being non-NULL would put executable text where the digest cannot see it.
-    IF p.probin      IS NOT NULL                     THEN
-      RAISE EXCEPTION 'R15.3 PRE: % has a C-language binary link (probin)', r.sig; END IF;
-    IF p.prosqlbody  IS NOT NULL                     THEN
-      RAISE EXCEPTION 'R15.3 PRE: % has a SQL-standard body (prosqlbody) the prosrc digest cannot cover', r.sig; END IF;
+    IF p.provolatile <> 'v' OR p.proisstrict OR p.proparallel <> 'u' OR p.proleakproof
+       OR p.proretset OR p.procost <> 100::real OR p.prorows <> 0::real
+       OR p.provariadic <> 0::oid OR p.prosupport <> 0::oid
+       OR p.protrftypes IS NOT NULL OR p.probin IS NOT NULL OR p.prosqlbody IS NOT NULL THEN
+      RAISE EXCEPTION 'R15.3 PRE: % semantic attributes drifted (volatility/strict/parallel/leakproof/retset/cost/rows/variadic/support/transforms/probin/prosqlbody)', r.sig; END IF;
 
-    -- ACL: the two contracts differ by design (see the runbook).
-    IF r.default_acl THEN
-      IF p.proacl IS NOT NULL THEN
-        RAISE EXCEPTION 'unexpected_function_acl_state: % has an explicit direct ACL (live=%). The reviewed contract grants it NOTHING (proacl IS NULL). No change was made - STOP and escalate. This script never repairs ACL drift.',
-          r.sig, p.proacl::text; END IF;
+
+    IF r.sig = 'public.qhub_decide_review(uuid,text,boolean,text,text,text)' THEN
+      v_acl_start := (coalesce((SELECT count(*) FROM aclexplode(p.proacl)) = 2, FALSE)
+                 AND coalesce((SELECT EXISTS (SELECT 1 FROM aclexplode(p.proacl) ae
+                         WHERE ae.grantee = p.proowner AND ae.privilege_type = 'EXECUTE' AND ae.grantor = p.proowner AND NOT ae.is_grantable)), FALSE)
+                 AND coalesce((SELECT EXISTS (SELECT 1 FROM aclexplode(p.proacl) ae
+                         WHERE pg_get_userbyid(ae.grantee) = 'service_role' AND ae.privilege_type = 'EXECUTE' AND ae.grantor = p.proowner AND NOT ae.is_grantable)), FALSE)
+                 AND coalesce((SELECT NOT EXISTS (SELECT 1 FROM aclexplode(p.proacl) ae
+                         WHERE NOT (ae.privilege_type = 'EXECUTE' AND ae.grantor = p.proowner AND NOT ae.is_grantable AND (ae.grantee = p.proowner OR pg_get_userbyid(ae.grantee) = 'service_role')))), FALSE));
+      v_acl_final := (coalesce((SELECT count(*) FROM aclexplode(p.proacl)) = 2, FALSE)
+                 AND coalesce((SELECT EXISTS (SELECT 1 FROM aclexplode(p.proacl) ae
+                         WHERE ae.grantee = p.proowner AND ae.privilege_type = 'EXECUTE' AND ae.grantor = p.proowner AND NOT ae.is_grantable)), FALSE)
+                 AND coalesce((SELECT EXISTS (SELECT 1 FROM aclexplode(p.proacl) ae
+                         WHERE pg_get_userbyid(ae.grantee) = 'service_role' AND ae.privilege_type = 'EXECUTE' AND ae.grantor = p.proowner AND NOT ae.is_grantable)), FALSE)
+                 AND coalesce((SELECT NOT EXISTS (SELECT 1 FROM aclexplode(p.proacl) ae
+                         WHERE NOT (ae.privilege_type = 'EXECUTE' AND ae.grantor = p.proowner AND NOT ae.is_grantable AND (ae.grantee = p.proowner OR pg_get_userbyid(ae.grantee) = 'service_role')))), FALSE));
     ELSE
-      -- R15.3C — EXACT SET EQUALITY, not "service_role is present". The reviewed ACL is
-      -- exactly two rows: the OWNER's own EXECUTE entry and service_role's, both granted
-      -- by the owner, neither grantable. Requiring the owner row matters because
-      -- revoking it leaves {service_role=X/postgres}, which every weaker check accepts.
-      IF NOT (SELECT count(*) FROM aclexplode(p.proacl)) = 2
-         OR NOT EXISTS (SELECT 1 FROM aclexplode(p.proacl) ae
-                         WHERE ae.grantee = p.proowner AND ae.privilege_type = 'EXECUTE'
-                           AND ae.grantor = p.proowner AND NOT ae.is_grantable)
-         OR NOT EXISTS (SELECT 1 FROM aclexplode(p.proacl) ae
-                         WHERE pg_get_userbyid(ae.grantee) = 'service_role'
-                           AND ae.privilege_type = 'EXECUTE'
-                           AND ae.grantor = p.proowner AND NOT ae.is_grantable)
-         OR EXISTS (SELECT 1 FROM aclexplode(p.proacl) ae
-                     WHERE NOT (ae.privilege_type = 'EXECUTE'
-                                AND ae.grantor = p.proowner
-                                AND NOT ae.is_grantable
-                                AND (ae.grantee = p.proowner
-                                     OR pg_get_userbyid(ae.grantee) = 'service_role'))) THEN
-        RAISE EXCEPTION 'unexpected_function_acl_state: % direct ACL is not the exact reviewed set (live=%). Reviewed: exactly the owner EXECUTE entry and service_role EXECUTE, both granted by the owner, neither grantable. No change was made - STOP and escalate. This script never repairs ACL drift.',
-          r.sig, coalesce(p.proacl::text, '(NULL)'); END IF;
+      v_acl_start := (coalesce((SELECT count(*) FROM aclexplode(p.proacl)) = 5, FALSE)
+                 AND coalesce((SELECT EXISTS (SELECT 1 FROM aclexplode(p.proacl) ae
+                         WHERE ae.grantee = 0 AND ae.privilege_type = 'EXECUTE' AND ae.grantor = p.proowner AND NOT ae.is_grantable)), FALSE)
+                 AND coalesce((SELECT EXISTS (SELECT 1 FROM aclexplode(p.proacl) ae
+                         WHERE pg_get_userbyid(ae.grantee) = 'anon' AND ae.privilege_type = 'EXECUTE' AND ae.grantor = p.proowner AND NOT ae.is_grantable)), FALSE)
+                 AND coalesce((SELECT EXISTS (SELECT 1 FROM aclexplode(p.proacl) ae
+                         WHERE pg_get_userbyid(ae.grantee) = 'authenticated' AND ae.privilege_type = 'EXECUTE' AND ae.grantor = p.proowner AND NOT ae.is_grantable)), FALSE)
+                 AND coalesce((SELECT EXISTS (SELECT 1 FROM aclexplode(p.proacl) ae
+                         WHERE ae.grantee = p.proowner AND ae.privilege_type = 'EXECUTE' AND ae.grantor = p.proowner AND NOT ae.is_grantable)), FALSE)
+                 AND coalesce((SELECT EXISTS (SELECT 1 FROM aclexplode(p.proacl) ae
+                         WHERE pg_get_userbyid(ae.grantee) = 'service_role' AND ae.privilege_type = 'EXECUTE' AND ae.grantor = p.proowner AND NOT ae.is_grantable)), FALSE)
+                 AND coalesce((SELECT NOT EXISTS (SELECT 1 FROM aclexplode(p.proacl) ae
+                         WHERE NOT (ae.privilege_type = 'EXECUTE' AND ae.grantor = p.proowner AND NOT ae.is_grantable AND (ae.grantee = 0 OR pg_get_userbyid(ae.grantee) = 'anon' OR pg_get_userbyid(ae.grantee) = 'authenticated' OR ae.grantee = p.proowner OR pg_get_userbyid(ae.grantee) = 'service_role')))), FALSE));
+      v_acl_final := (coalesce((SELECT count(*) FROM aclexplode(p.proacl)) = 1, FALSE)
+                 AND coalesce((SELECT EXISTS (SELECT 1 FROM aclexplode(p.proacl) ae
+                         WHERE ae.grantee = p.proowner AND ae.privilege_type = 'EXECUTE' AND ae.grantor = p.proowner AND NOT ae.is_grantable)), FALSE)
+                 AND coalesce((SELECT NOT EXISTS (SELECT 1 FROM aclexplode(p.proacl) ae
+                         WHERE NOT (ae.privilege_type = 'EXECUTE' AND ae.grantor = p.proowner AND NOT ae.is_grantable AND (ae.grantee = p.proowner)))), FALSE));
     END IF;
 
-    -- BODY: the known mojibake (what this script repairs) or an already-reviewed body
-    -- (idempotent re-run). Any third value is unexplained drift.
-    IF md5(p.prosrc) NOT IN (r.moji, r.lf, r.crlf) THEN
-      RAISE EXCEPTION 'R15.3 PRE: % carries an UNKNOWN body (md5=%). Not the diagnosed mojibake and not a reviewed body. STOP and escalate - do not restore.', r.sig, md5(p.prosrc);
+    v_is_start := (md5(p.prosrc) = r.moji)               AND v_acl_start;
+    v_is_final := (md5(p.prosrc) IN (r.lf, r.crlf))      AND v_acl_final;
+
+    IF NOT (v_is_start OR v_is_final) THEN
+      -- Name the specific cause so the deterministic tokens stay meaningful.
+      IF md5(p.prosrc) = r.moji OR md5(p.prosrc) IN (r.lf, r.crlf) THEN
+        RAISE EXCEPTION 'unexpected_function_acl_state: % has a recognized body but its direct ACL does not match the ACL for that state (live acl=%). Authorized pairs are: known-mojibake body WITH the documented starting ACL, or a reviewed body WITH the reviewed target ACL. No change was made - STOP and escalate. This script never repairs unknown ACL drift.',
+          r.sig, coalesce(p.proacl::text, '(NULL)');
+      ELSE
+        RAISE EXCEPTION 'unexpected_function_state: % carries an UNKNOWN body (md5=%) - neither the diagnosed mojibake nor a reviewed body. No change was made - STOP and escalate.',
+          r.sig, md5(p.prosrc);
+      END IF;
     END IF;
   END LOOP;
 END;
-$r15_3_pre$;
+$r15_4_pre$;
 
 -- ---------------------------------------------------------------------------
 -- VERBATIM REVIEWED BODY 1 of 2 — public.qhub_decide_review
--- (header states the reviewed attribute contract explicitly; body is verbatim)
 -- ---------------------------------------------------------------------------
 CREATE OR REPLACE FUNCTION public.qhub_decide_review(
   p_request_id UUID, p_actor TEXT, p_is_staff BOOLEAN, p_decision TEXT, p_reason TEXT, p_policy_version TEXT
@@ -420,7 +369,6 @@ $$;
 
 -- ---------------------------------------------------------------------------
 -- VERBATIM REVIEWED BODY 2 of 2 — public.qhub_row_immutable
--- (header states the reviewed attribute contract explicitly; body is verbatim)
 -- ---------------------------------------------------------------------------
 CREATE OR REPLACE FUNCTION public.qhub_row_immutable()
 RETURNS TRIGGER
@@ -468,14 +416,9 @@ END;
 $$;
 
 -- ---------------------------------------------------------------------------
--- EXACT OWNER + ACL for qhub_decide_review.
---
--- CREATE OR REPLACE preserves owner and ACL, so these are normally no-ops; they are
--- restated so the reviewed authority state is asserted rather than assumed. The owner
--- is derived from the migration-created table, never guessed. Nothing here applies to
--- qhub_row_immutable, whose reviewed contract is "no grants".
+-- EXACT OWNER + ACL for qhub_decide_review (restated verbatim from the migration).
 -- ---------------------------------------------------------------------------
-DO $r15_3_owner$
+DO $r15_4_owner$
 DECLARE
   v_owner name;
 BEGIN
@@ -487,23 +430,43 @@ BEGIN
   EXECUTE format(
     'ALTER FUNCTION public.qhub_decide_review(UUID, TEXT, BOOLEAN, TEXT, TEXT, TEXT) OWNER TO %I', v_owner);
 END;
-$r15_3_owner$;
+$r15_4_owner$;
 
 REVOKE ALL ON FUNCTION public.qhub_decide_review(UUID, TEXT, BOOLEAN, TEXT, TEXT, TEXT) FROM PUBLIC, anon, authenticated;
 GRANT EXECUTE ON FUNCTION public.qhub_decide_review(UUID, TEXT, BOOLEAN, TEXT, TEXT, TEXT) TO service_role;
 
 -- ---------------------------------------------------------------------------
--- GATE 2 — FAIL-CLOSED CERTIFICATION BEFORE COMMIT.
---
--- Re-asserts the COMPLETE contract — callable interface and argument defaults,
--- identity, authority, every semantic attribute, ACL — and requires both bodies to
--- hash to an approved reviewed digest and no longer to the mojibake. Any single
--- mismatch raises, and the ENTIRE transaction rolls back: both functions revert
--- together, leaving the database exactly as it was. If this file was itself
--- transferred through a mangling channel, the restored body is not a reviewed body and
--- this gate catches it.
+-- R15.4 — NORMALIZE THE TRIGGER HELPER ACL to the reviewed owner-only contract.
+-- Identical statements to the ones the migration now contains, so a fresh install
+-- and a live-patched database reach byte-identical ACL state. The owner GRANT is
+-- derived from the catalog, never a hardcoded role name.
 -- ---------------------------------------------------------------------------
-DO $r15_3_post$
+REVOKE ALL PRIVILEGES ON FUNCTION public.qhub_row_immutable() FROM PUBLIC;
+REVOKE ALL PRIVILEGES ON FUNCTION public.qhub_row_immutable() FROM anon;
+REVOKE ALL PRIVILEGES ON FUNCTION public.qhub_row_immutable() FROM authenticated;
+REVOKE ALL PRIVILEGES ON FUNCTION public.qhub_row_immutable() FROM service_role;
+
+DO $r15_4_trigger_acl$
+DECLARE
+  v_owner name;
+BEGIN
+  SELECT pg_get_userbyid(p.proowner) INTO v_owner
+    FROM pg_proc p WHERE p.oid = to_regprocedure('public.qhub_row_immutable()');
+  IF v_owner IS NULL THEN
+    RAISE EXCEPTION 'R15.4: cannot resolve the owner of public.qhub_row_immutable()';
+  END IF;
+  EXECUTE format('GRANT EXECUTE ON FUNCTION public.qhub_row_immutable() TO %I', v_owner);
+END;
+$r15_4_trigger_acl$;
+
+-- ---------------------------------------------------------------------------
+-- GATE 2 — FAIL-CLOSED CERTIFICATION BEFORE COMMIT.
+-- Re-asserts the COMPLETE final contract: both reviewed bodies, every semantic and
+-- callable attribute, owner/security/search_path, and BOTH final ACL sets — the
+-- trigger helper now owner-only. Any mismatch raises and the ENTIRE transaction
+-- rolls back: both bodies and the ACL revert together.
+-- ---------------------------------------------------------------------------
+DO $r15_4_post$
 DECLARE
   r     record;
   v_oid oid;
@@ -514,145 +477,86 @@ BEGIN
     SELECT * FROM (VALUES
       ('public.qhub_decide_review(uuid,text,boolean,text,text,text)',
        'p_request_id uuid, p_actor text, p_is_staff boolean, p_decision text, p_reason text, p_policy_version text',
-       'p_request_id uuid, p_actor text, p_is_staff boolean, p_decision text, p_reason text, p_policy_version text',
        'public.qhub_manual_review_requests', 'plpgsql', 'f', 'jsonb', TRUE,
-       ARRAY['search_path=pg_catalog, public'], 'v', FALSE, 'u', FALSE, FALSE, 100::real, 0::real, 0::oid, FALSE,
-       6, ARRAY['p_request_id','p_actor','p_is_staff','p_decision','p_reason','p_policy_version'], '2950 25 16 25 25 25',
+       ARRAY['search_path=pg_catalog, public'], 6, ARRAY['p_request_id','p_actor','p_is_staff','p_decision','p_reason','p_policy_version'], '2950 25 16 25 25 25',
        '7e678f1e4bba0c540507cfe3743fbe54', 'dac8abcd56d7fc804baac660059c14bf', '9bc91d1671c5f65241ea22538c00d703'),
       ('public.qhub_row_immutable()',
        '',
-       '',
-       'public.qhub_acknowledgments',        'plpgsql', 'f', 'trigger', FALSE,
-       NULL::text[],                          'v', FALSE, 'u', FALSE, FALSE, 100::real, 0::real, 0::oid, TRUE,
-       0, NULL::text[], '',
+       'public.qhub_acknowledgments', 'plpgsql', 'f', 'trigger', FALSE,
+       NULL::text[], 0, NULL::text[], '',
        '41ae59dde9a471b580d28e2cb45984f5', '4936e3f58627dde5abc10d2b0ecf5b4f', '583882c1a9b203e278b27d1080065c9e')
-    ) AS t(sig, args, full_args, owner_table, lang, kind, rettype, secdef, cfg,
-             vol, strictv, par, leakv, retset, costv, rws, varia, default_acl,
-             nargs, argnames, argtypes, lf, crlf, moji)
+    ) AS t(sig, args, owner_table, lang, kind, rettype, secdef, cfg, nargs, argnames, argtypes, lf, crlf, moji)
   LOOP
     v_oid := to_regprocedure(r.sig);
     IF v_oid IS NULL THEN
-      RAISE EXCEPTION 'R15.3 POST: % is missing or not at its exact reviewed signature', r.sig;
-    END IF;
-
+      RAISE EXCEPTION 'R15.3 POST: % is missing or not at its exact reviewed signature', r.sig; END IF;
     IF (SELECT count(*) FROM pg_proc pp JOIN pg_namespace nn ON nn.oid = pp.pronamespace
          WHERE nn.nspname = 'public'
            AND pp.proname = split_part(split_part(r.sig, '(', 1), '.', 2)) <> 1 THEN
-      RAISE EXCEPTION 'R15.3 POST: % has an unexpected overload', r.sig;
-    END IF;
+      RAISE EXCEPTION 'R15.3 POST: % has an unexpected overload', r.sig; END IF;
 
     SELECT pp.*, l.lanname INTO p
-      FROM pg_proc pp JOIN pg_language l ON l.oid = pp.prolang
-     WHERE pp.oid = v_oid;
-
+      FROM pg_proc pp JOIN pg_language l ON l.oid = pp.prolang WHERE pp.oid = v_oid;
     SELECT c.relowner INTO v_own FROM pg_class c WHERE c.oid = to_regclass(r.owner_table);
     IF v_own IS NULL THEN
-      RAISE EXCEPTION 'R15.3 POST: cannot resolve the contract owner from %', r.owner_table;
-    END IF;
+      RAISE EXCEPTION 'R15.3 POST: cannot resolve the contract owner from %', r.owner_table; END IF;
 
-    -- ── CALLABLE INTERFACE / DEFAULT ARGUMENTS (R15.3B) ─────────────────────────
-    -- Checked FIRST and separately, because pg_get_function_identity_arguments()
-    -- EXCLUDES defaults: a trailing DEFAULT leaves the identity arguments AND the raw
-    -- prosrc digest unchanged while adding a new callable arity. This script never
-    -- removes an unknown default (PostgreSQL forbids it via CREATE OR REPLACE anyway);
-    -- it refuses, so the drift survives as escalation evidence.
-    IF p.pronargdefaults <> 0 OR p.proargdefaults IS NOT NULL THEN
-      RAISE EXCEPTION 'unexpected_function_default_argument_state: % has % argument default(s) (%). The reviewed contract has NONE. Identity arguments and the body digest can BOTH look correct while a default adds a shorter callable arity. No change was made - STOP and escalate.',
-        r.sig, p.pronargdefaults, pg_get_function_arguments(v_oid);
-    END IF;
-    IF pg_get_function_arguments(v_oid) IS DISTINCT FROM r.full_args THEN
-      RAISE EXCEPTION 'unexpected_function_default_argument_state: % full argument list drifted (live=%, reviewed=%)',
-        r.sig, pg_get_function_arguments(v_oid), r.full_args; END IF;
-    IF p.pronargs     IS DISTINCT FROM r.nargs        THEN
-      RAISE EXCEPTION 'R15.3 POST: % argument count drifted', r.sig; END IF;
-    IF p.proargnames  IS DISTINCT FROM r.argnames     THEN
-      RAISE EXCEPTION 'R15.3 POST: % argument names drifted', r.sig; END IF;
-    IF p.proargmodes  IS NOT NULL                     THEN
-      RAISE EXCEPTION 'R15.3 POST: % has non-IN argument modes (OUT/INOUT/VARIADIC/TABLE)', r.sig; END IF;
-    IF p.proallargtypes IS NOT NULL                   THEN
-      RAISE EXCEPTION 'R15.3 POST: % has OUT/TABLE argument types', r.sig; END IF;
-    IF p.proargtypes::text IS DISTINCT FROM r.argtypes THEN
-      RAISE EXCEPTION 'R15.3 POST: % argument types drifted', r.sig; END IF;
-
-    -- ── IDENTITY, AUTHORITY AND SEMANTIC ATTRIBUTES (R15.3A) ────────────────────
-    -- CREATE OR REPLACE resets omitted attributes to defaults, so each is asserted
-    -- explicitly rather than assumed.
     IF pg_get_function_identity_arguments(v_oid) IS DISTINCT FROM r.args THEN
       RAISE EXCEPTION 'R15.3 POST: % identity arguments drifted', r.sig; END IF;
-    IF p.proowner    IS DISTINCT FROM v_own          THEN
+    IF pg_get_function_arguments(v_oid) IS DISTINCT FROM r.args THEN
+      RAISE EXCEPTION 'unexpected_function_default_argument_state: % full argument list drifted (live=%)', r.sig, pg_get_function_arguments(v_oid); END IF;
+    IF p.pronargdefaults <> 0 OR p.proargdefaults IS NOT NULL THEN
+      RAISE EXCEPTION 'unexpected_function_default_argument_state: % has % argument default(s). The reviewed contract has NONE.', r.sig, p.pronargdefaults; END IF;
+    IF p.pronargs IS DISTINCT FROM r.nargs THEN
+      RAISE EXCEPTION 'R15.3 POST: % argument count drifted', r.sig; END IF;
+    IF p.proargnames IS DISTINCT FROM r.argnames THEN
+      RAISE EXCEPTION 'R15.3 POST: % argument names drifted', r.sig; END IF;
+    IF p.proargmodes IS NOT NULL OR p.proallargtypes IS NOT NULL THEN
+      RAISE EXCEPTION 'R15.3 POST: % has non-IN argument modes', r.sig; END IF;
+    IF p.proargtypes::text IS DISTINCT FROM r.argtypes THEN
+      RAISE EXCEPTION 'R15.3 POST: % argument types drifted', r.sig; END IF;
+    IF p.proowner IS DISTINCT FROM v_own THEN
       RAISE EXCEPTION 'R15.3 POST: % owner drifted', r.sig; END IF;
-    IF p.prosecdef   IS DISTINCT FROM r.secdef       THEN
+    IF p.prosecdef IS DISTINCT FROM r.secdef THEN
       RAISE EXCEPTION 'R15.3 POST: % security mode drifted', r.sig; END IF;
-    IF p.proconfig   IS DISTINCT FROM r.cfg          THEN
+    IF p.proconfig IS DISTINCT FROM r.cfg THEN
       RAISE EXCEPTION 'R15.3 POST: % search_path drifted', r.sig; END IF;
-    IF p.lanname     IS DISTINCT FROM r.lang         THEN
+    IF p.lanname IS DISTINCT FROM r.lang THEN
       RAISE EXCEPTION 'R15.3 POST: % language drifted', r.sig; END IF;
-    IF p.prokind     IS DISTINCT FROM r.kind         THEN
+    IF p.prokind IS DISTINCT FROM r.kind THEN
       RAISE EXCEPTION 'R15.3 POST: % prokind drifted', r.sig; END IF;
-    IF p.prorettype  IS DISTINCT FROM r.rettype::regtype THEN
+    IF p.prorettype IS DISTINCT FROM r.rettype::regtype THEN
       RAISE EXCEPTION 'R15.3 POST: % return type drifted', r.sig; END IF;
-    IF p.provolatile IS DISTINCT FROM r.vol          THEN
-      RAISE EXCEPTION 'R15.3 POST: % volatility drifted (live=%, reviewed=%)', r.sig, p.provolatile, r.vol; END IF;
-    IF p.proisstrict IS DISTINCT FROM r.strictv      THEN
-      RAISE EXCEPTION 'R15.3 POST: % strictness drifted (live=%, reviewed=%)', r.sig, p.proisstrict, r.strictv; END IF;
-    IF p.proparallel IS DISTINCT FROM r.par          THEN
-      RAISE EXCEPTION 'R15.3 POST: % parallel safety drifted (live=%, reviewed=%)', r.sig, p.proparallel, r.par; END IF;
-    IF p.proleakproof IS DISTINCT FROM r.leakv       THEN
-      RAISE EXCEPTION 'R15.3 POST: % leakproof drifted', r.sig; END IF;
-    IF p.proretset   IS DISTINCT FROM r.retset       THEN
-      RAISE EXCEPTION 'R15.3 POST: % set-returning flag drifted', r.sig; END IF;
-    IF p.procost     IS DISTINCT FROM r.costv        THEN
-      RAISE EXCEPTION 'R15.3 POST: % cost drifted (live=%, reviewed=%)', r.sig, p.procost, r.costv; END IF;
-    IF p.prorows     IS DISTINCT FROM r.rws          THEN
-      RAISE EXCEPTION 'R15.3 POST: % rows estimate drifted', r.sig; END IF;
-    IF p.provariadic IS DISTINCT FROM r.varia        THEN
-      RAISE EXCEPTION 'R15.3 POST: % variadic drifted', r.sig; END IF;
-    IF p.prosupport  IS DISTINCT FROM 0::oid         THEN
-      RAISE EXCEPTION 'R15.3 POST: % has an unexpected support function', r.sig; END IF;
-    IF p.protrftypes IS NOT NULL                     THEN
-      RAISE EXCEPTION 'R15.3 POST: % has unexpected transforms', r.sig; END IF;
-    -- BODY CARRIER: plpgsql stores its source in prosrc alone. probin is set only for
-    -- C-language functions and prosqlbody only for SQL-standard BEGIN ATOMIC bodies;
-    -- either being non-NULL would put executable text where the digest cannot see it.
-    IF p.probin      IS NOT NULL                     THEN
-      RAISE EXCEPTION 'R15.3 POST: % has a C-language binary link (probin)', r.sig; END IF;
-    IF p.prosqlbody  IS NOT NULL                     THEN
-      RAISE EXCEPTION 'R15.3 POST: % has a SQL-standard body (prosqlbody) the prosrc digest cannot cover', r.sig; END IF;
+    IF p.provolatile <> 'v' OR p.proisstrict OR p.proparallel <> 'u' OR p.proleakproof
+       OR p.proretset OR p.procost <> 100::real OR p.prorows <> 0::real
+       OR p.provariadic <> 0::oid OR p.prosupport <> 0::oid
+       OR p.protrftypes IS NOT NULL OR p.probin IS NOT NULL OR p.prosqlbody IS NOT NULL THEN
+      RAISE EXCEPTION 'R15.3 POST: % semantic attributes drifted (volatility/strict/parallel/leakproof/retset/cost/rows/variadic/support/transforms/probin/prosqlbody)', r.sig; END IF;
 
-    -- ACL: the two contracts differ by design (see the runbook).
-    IF r.default_acl THEN
-      IF p.proacl IS NOT NULL THEN
-        RAISE EXCEPTION 'unexpected_function_acl_state: % has an explicit direct ACL after restoration (live=%). The reviewed contract grants it NOTHING. Rolling back.',
-          r.sig, p.proacl::text; END IF;
+    IF r.sig = 'public.qhub_decide_review(uuid,text,boolean,text,text,text)' THEN
+      IF NOT (coalesce((SELECT count(*) FROM aclexplode(p.proacl)) = 2, FALSE)
+                 AND coalesce((SELECT EXISTS (SELECT 1 FROM aclexplode(p.proacl) ae
+                         WHERE ae.grantee = p.proowner AND ae.privilege_type = 'EXECUTE' AND ae.grantor = p.proowner AND NOT ae.is_grantable)), FALSE)
+                 AND coalesce((SELECT EXISTS (SELECT 1 FROM aclexplode(p.proacl) ae
+                         WHERE pg_get_userbyid(ae.grantee) = 'service_role' AND ae.privilege_type = 'EXECUTE' AND ae.grantor = p.proowner AND NOT ae.is_grantable)), FALSE)
+                 AND coalesce((SELECT NOT EXISTS (SELECT 1 FROM aclexplode(p.proacl) ae
+                         WHERE NOT (ae.privilege_type = 'EXECUTE' AND ae.grantor = p.proowner AND NOT ae.is_grantable AND (ae.grantee = p.proowner OR pg_get_userbyid(ae.grantee) = 'service_role')))), FALSE)) THEN
+        RAISE EXCEPTION 'unexpected_function_acl_state: % direct ACL is not the exact reviewed set (live=%). Reviewed: qhub_decide_review: exactly 2 row(s) — owner, service_role (EXECUTE, granted by owner, not grantable).', r.sig, coalesce(p.proacl::text,'(NULL)'); END IF;
     ELSE
-      -- R15.3C — EXACT SET EQUALITY (see GATE 1 for the rationale).
-      IF NOT (SELECT count(*) FROM aclexplode(p.proacl)) = 2
-         OR NOT EXISTS (SELECT 1 FROM aclexplode(p.proacl) ae
-                         WHERE ae.grantee = p.proowner AND ae.privilege_type = 'EXECUTE'
-                           AND ae.grantor = p.proowner AND NOT ae.is_grantable)
-         OR NOT EXISTS (SELECT 1 FROM aclexplode(p.proacl) ae
-                         WHERE pg_get_userbyid(ae.grantee) = 'service_role'
-                           AND ae.privilege_type = 'EXECUTE'
-                           AND ae.grantor = p.proowner AND NOT ae.is_grantable)
-         OR EXISTS (SELECT 1 FROM aclexplode(p.proacl) ae
-                     WHERE NOT (ae.privilege_type = 'EXECUTE'
-                                AND ae.grantor = p.proowner
-                                AND NOT ae.is_grantable
-                                AND (ae.grantee = p.proowner
-                                     OR pg_get_userbyid(ae.grantee) = 'service_role'))) THEN
-        RAISE EXCEPTION 'unexpected_function_acl_state: % direct ACL is not the exact reviewed set after restoration (live=%). Rolling back.',
-          r.sig, coalesce(p.proacl::text, '(NULL)'); END IF;
+      IF NOT (coalesce((SELECT count(*) FROM aclexplode(p.proacl)) = 1, FALSE)
+                 AND coalesce((SELECT EXISTS (SELECT 1 FROM aclexplode(p.proacl) ae
+                         WHERE ae.grantee = p.proowner AND ae.privilege_type = 'EXECUTE' AND ae.grantor = p.proowner AND NOT ae.is_grantable)), FALSE)
+                 AND coalesce((SELECT NOT EXISTS (SELECT 1 FROM aclexplode(p.proacl) ae
+                         WHERE NOT (ae.privilege_type = 'EXECUTE' AND ae.grantor = p.proowner AND NOT ae.is_grantable AND (ae.grantee = p.proowner)))), FALSE)) THEN
+        RAISE EXCEPTION 'unexpected_function_acl_state: % direct ACL is not the expected reviewed target set (live=%). Expected: qhub_row_immutable: exactly 1 row(s) — owner (EXECUTE, granted by owner, not grantable).', r.sig, coalesce(p.proacl::text,'(NULL)'); END IF;
     END IF;
 
-    -- BODY: must now be a reviewed encoding and must no longer be the mojibake.
     IF md5(p.prosrc) = r.moji THEN
-      RAISE EXCEPTION 'R15.3 POST: % is STILL the mojibake body (md5=%). This file was transferred through a non-UTF-8 channel. Rolling back. Re-copy with: Get-Content -Raw -Encoding UTF8 <file> | Set-Clipboard', r.sig, md5(p.prosrc);
-    END IF;
+      RAISE EXCEPTION 'R15.3 POST: % is STILL the mojibake body (md5=%). Transferred through a non-UTF-8 channel. Rolling back. Re-copy with: Get-Content -Raw -Encoding UTF8 <file> | Set-Clipboard', r.sig, md5(p.prosrc); END IF;
     IF md5(p.prosrc) NOT IN (r.lf, r.crlf) THEN
-      RAISE EXCEPTION 'R15.3 POST: % does not match either reviewed digest (md5=%). Rolling back.', r.sig, md5(p.prosrc);
-    END IF;
+      RAISE EXCEPTION 'R15.3 POST: % does not match either reviewed digest (md5=%). Rolling back.', r.sig, md5(p.prosrc); END IF;
   END LOOP;
 END;
-$r15_3_post$;
+$r15_4_post$;
 
 COMMIT;

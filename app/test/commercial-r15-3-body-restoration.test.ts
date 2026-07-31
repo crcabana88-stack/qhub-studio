@@ -29,6 +29,23 @@ const MIGRATION = readFileSync(`${REPO}supabase/migrations/20260729_commercial_l
 const PRE10 = readFileSync(`${R3}10_PRE_RESTORE_LIVE_BODY_VERIFY.sql`, 'utf8');
 const RESTORE11 = readFileSync(`${R3}11_RESTORE_REVIEWED_PROTECTED_BODIES.sql`, 'utf8');
 const POST12 = readFileSync(`${R3}12_POST_RESTORE_BODY_VERIFY.sql`, 'utf8');
+
+/**
+ * Supabase ships these default privileges on schema public; plain PostgreSQL/PGlite does
+ * not. Modeling the live database therefore requires them — without them the trigger
+ * helper ends up with proacl IS NULL instead of the five rows live actually has.
+ */
+const SUPABASE_DEFAULT_PRIVILEGES = `ALTER DEFAULT PRIVILEGES IN SCHEMA public
+  GRANT EXECUTE ON FUNCTIONS TO anon, authenticated, service_role;`;
+
+/**
+ * The migration as it stood BEFORE R15.4 added the explicit trigger ACL. The live
+ * database was created from that version, so a live-like fixture must apply it.
+ */
+const PRE_R154_MIGRATION = MIGRATION.replace(
+  /REVOKE ALL PRIVILEGES ON FUNCTION public\.qhub_row_immutable\(\)[^\n]*\n/g,
+  '',
+).replace(/DO \$qhub_row_immutable_owner_grant\$[\s\S]*?\$qhub_row_immutable_owner_grant\$;\n/, '');
 const PRE07 = readFileSync(`${R2C}07_PRE_PATCH_EXACT_DIGEST_VERIFY.sql`, 'utf8');
 const PATCH08 = readFileSync(`${R2C}08_LIVE_VERIFIER_EXACT_DUAL_DIGEST_PATCH.sql`, 'utf8');
 const POST09 = readFileSync(`${R2C}09_POST_PATCH_VERIFY.sql`, 'utf8');
@@ -119,14 +136,15 @@ async function open(migration: string): Promise<PGlite> {
     CREATE ROLE anon NOLOGIN;
     CREATE ROLE authenticated NOLOGIN;
     CREATE ROLE service_role NOLOGIN BYPASSRLS;
-  `);
+    `);
+  await db.exec(SUPABASE_DEFAULT_PRIVILEGES);
   await db.exec(migration);
 
   return db;
 }
 
 /** A database in the exact state of live: the reviewed migration applied through the mangling channel. */
-const openLiveLike = () => open(mangle(toCrlf(MIGRATION)));
+const openLiveLike = () => open(mangle(toCrlf(PRE_R154_MIGRATION)));
 
 async function bodyDigests(db: PGlite): Promise<Record<string, string>> {
   const rows = (
@@ -334,7 +352,7 @@ describe('R15.3 — 11 restores exactly the two reviewed bodies and nothing else
     try {
       await db.exec(`CREATE OR REPLACE FUNCTION public.qhub_row_immutable() RETURNS TRIGGER LANGUAGE plpgsql AS $f$
                      BEGIN RAISE EXCEPTION 'unknown'; END; $f$;`);
-      await expect(db.exec(RESTORE11)).rejects.toThrow(/R15\.3 PRE.*UNKNOWN body/s);
+      await expect(db.exec(RESTORE11)).rejects.toThrow(/unexpected_function_state.*UNKNOWN body/s);
       await rollback(db);
     } finally {
       await db.close();
@@ -385,7 +403,7 @@ describe('R15.3 — 11 restores exactly the two reviewed bodies and nothing else
     }
   }, 120_000);
 
-  it('r18 — 11 preserves qhub_row_immutable ACL as the reviewed default and pins decide_review exactly', async () => {
+  it('r18 — 11 normalizes qhub_row_immutable to the owner-only ACL and pins decide_review exactly', async () => {
     const db = await openLiveLike();
 
     try {
@@ -399,7 +417,9 @@ describe('R15.3 — 11 restores exactly the two reviewed bodies and nothing else
       ).rows;
 
       const immut = acl.find((r) => r.proname === 'qhub_row_immutable');
-      expect(immut?.acl, 'the reviewed migration grants it nothing').toBeNull();
+      expect(immut?.acl, 'R15.4: normalized from the 5-row Supabase default to owner-only').toContain('postgres=X');
+      expect(immut?.acl).not.toContain('anon=');
+      expect(immut?.acl).not.toContain('authenticated=');
 
       const decide = acl.find((r) => r.proname === 'qhub_decide_review');
       expect(decide?.acl).toContain('service_role=X');
@@ -489,8 +509,8 @@ describe('R15.3 — 12 requires the exact reviewed state', () => {
       'CREATE ROLE r15_3_inh NOLOGIN; GRANT service_role TO r15_3_inh;',
     ],
     [
-      'r28 — a grant applied to qhub_row_immutable (its reviewed ACL is the default)',
-      'REVOKE ALL ON FUNCTION public.qhub_row_immutable() FROM PUBLIC;',
+      'r28 — a grant applied to qhub_row_immutable (its reviewed ACL is owner-only)',
+      'GRANT EXECUTE ON FUNCTION public.qhub_row_immutable() TO anon;',
     ],
     [
       'r29 — an unexpected overload',

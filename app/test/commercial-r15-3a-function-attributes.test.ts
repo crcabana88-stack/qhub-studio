@@ -31,6 +31,23 @@ const PRE10 = readFileSync(`${R3}10_PRE_RESTORE_LIVE_BODY_VERIFY.sql`, 'utf8');
 const RESTORE11 = readFileSync(`${R3}11_RESTORE_REVIEWED_PROTECTED_BODIES.sql`, 'utf8');
 const POST12 = readFileSync(`${R3}12_POST_RESTORE_BODY_VERIFY.sql`, 'utf8');
 
+/**
+ * Supabase ships these default privileges on schema public; plain PostgreSQL/PGlite does
+ * not. Modeling the live database therefore requires them — without them the trigger
+ * helper ends up with proacl IS NULL instead of the five rows live actually has.
+ */
+const SUPABASE_DEFAULT_PRIVILEGES = `ALTER DEFAULT PRIVILEGES IN SCHEMA public
+  GRANT EXECUTE ON FUNCTIONS TO anon, authenticated, service_role;`;
+
+/**
+ * The migration as it stood BEFORE R15.4 added the explicit trigger ACL. The live
+ * database was created from that version, so a live-like fixture must apply it.
+ */
+const PRE_R154_MIGRATION = MIGRATION.replace(
+  /REVOKE ALL PRIVILEGES ON FUNCTION public\.qhub_row_immutable\(\)[^\n]*\n/g,
+  '',
+).replace(/DO \$qhub_row_immutable_owner_grant\$[\s\S]*?\$qhub_row_immutable_owner_grant\$;\n/, '');
+
 const DR = 'public.qhub_decide_review(UUID, TEXT, BOOLEAN, TEXT, TEXT, TEXT)';
 const RI = 'public.qhub_row_immutable()';
 
@@ -101,8 +118,9 @@ async function openLiveLike(): Promise<PGlite> {
     CREATE ROLE anon NOLOGIN;
     CREATE ROLE authenticated NOLOGIN;
     CREATE ROLE service_role NOLOGIN BYPASSRLS;
-  `);
-  await db.exec(mangle(MIGRATION.replace(/\r?\n/g, '\r\n')));
+    `);
+  await db.exec(SUPABASE_DEFAULT_PRIVILEGES);
+  await db.exec(mangle(PRE_R154_MIGRATION.replace(/\r?\n/g, '\r\n')));
 
   return db;
 }
@@ -246,7 +264,7 @@ const ATTRIBUTE_DRIFT: Array<[string, string, string]> = [
   [
     'a21 — service_role WITH GRANT OPTION',
     `GRANT EXECUTE ON FUNCTION ${DR} TO service_role WITH GRANT OPTION;`,
-    'acl_service_role_entry_exact',
+    'acl_expected_rows_present',
   ],
   ['a22 — a grant applied to row_immutable', `REVOKE ALL ON FUNCTION ${RI} FROM PUBLIC;`, 'acl_cardinality_exact'],
 ];
@@ -362,7 +380,7 @@ describe('R15.3A — the reproduced exploit is refused, not silently repaired', 
       expect((await preRun(db)).verdict).toBe('UNEXPECTED_LIVE_BODY_STOP');
 
       // 11 must refuse BEFORE changing anything
-      await expect(db.exec(RESTORE11)).rejects.toThrow(/R15\.3 PRE:.*(strictness|parallel) drifted/s);
+      await expect(db.exec(RESTORE11)).rejects.toThrow(/R15\.3 PRE:.*semantic attributes drifted/s);
       await rollback(db);
 
       // the drift must SURVIVE — silently normalising it would destroy the evidence
@@ -488,8 +506,8 @@ describe('R15.3A — 12 refuses a correct body with drifted attributes', () => {
         'security_mode_exact',
         'search_path_exact',
         'acl_cardinality_exact',
-        'acl_owner_entry_exact',
-        'acl_service_role_entry_exact',
+        'acl_expected_rows_present',
+        'acl_expected_rows_present',
         'acl_no_unexpected_entry',
         'effective_acl_ok',
         'body_reviewed',

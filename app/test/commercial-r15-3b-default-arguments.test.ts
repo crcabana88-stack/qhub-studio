@@ -35,6 +35,23 @@ const PRE10 = readFileSync(`${R3}10_PRE_RESTORE_LIVE_BODY_VERIFY.sql`, 'utf8');
 const RESTORE11 = readFileSync(`${R3}11_RESTORE_REVIEWED_PROTECTED_BODIES.sql`, 'utf8');
 const POST12 = readFileSync(`${R3}12_POST_RESTORE_BODY_VERIFY.sql`, 'utf8');
 
+/**
+ * Supabase ships these default privileges on schema public; plain PostgreSQL/PGlite does
+ * not. Modeling the live database therefore requires them — without them the trigger
+ * helper ends up with proacl IS NULL instead of the five rows live actually has.
+ */
+const SUPABASE_DEFAULT_PRIVILEGES = `ALTER DEFAULT PRIVILEGES IN SCHEMA public
+  GRANT EXECUTE ON FUNCTIONS TO anon, authenticated, service_role;`;
+
+/**
+ * The migration as it stood BEFORE R15.4 added the explicit trigger ACL. The live
+ * database was created from that version, so a live-like fixture must apply it.
+ */
+const PRE_R154_MIGRATION = MIGRATION.replace(
+  /REVOKE ALL PRIVILEGES ON FUNCTION public\.qhub_row_immutable\(\)[^\n]*\n/g,
+  '',
+).replace(/DO \$qhub_row_immutable_owner_grant\$[\s\S]*?\$qhub_row_immutable_owner_grant\$;\n/, '');
+
 const SIG = 'public.qhub_decide_review(uuid,text,boolean,text,text,text)';
 const REVIEWED_LF = '7e678f1e4bba0c540507cfe3743fbe54';
 const MOJIBAKE = '9bc91d1671c5f65241ea22538c00d703';
@@ -106,14 +123,15 @@ async function open(sql: string): Promise<PGlite> {
     CREATE ROLE anon NOLOGIN;
     CREATE ROLE authenticated NOLOGIN;
     CREATE ROLE service_role NOLOGIN BYPASSRLS;
-  `);
+    `);
+  await db.exec(SUPABASE_DEFAULT_PRIVILEGES);
   await db.exec(sql);
 
   return db;
 }
 
 /** Live state: the reviewed migration applied through the mangling channel. */
-const openLiveLike = () => open(mangle(MIGRATION.replace(/\r?\n/g, '\r\n')));
+const openLiveLike = () => open(mangle(PRE_R154_MIGRATION.replace(/\r?\n/g, '\r\n')));
 
 /** A database whose bodies are already the reviewed LF text. */
 const openReviewed = () => open(MIGRATION);
