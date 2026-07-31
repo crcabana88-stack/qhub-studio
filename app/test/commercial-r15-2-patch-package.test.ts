@@ -13,6 +13,14 @@
  *                body could still be executed by the later statement.
  *           P2   07 ended with an unconditional verifier invocation that raised 42883 when the file was
  *                run in full after a missing-function STOP.
+ *   R15.2C  P1   a role could inherit effective EXECUTE through role membership
+ *                (GRANT service_role TO extra_browser) without appearing in the direct proacl; the
+ *                package saw no unexpected direct grantee and reported SAFE/READY. 07 and 09 now
+ *                enumerate every pg_roles role with has_function_privilege(role_oid, verifier_oid,
+ *                'EXECUTE'); the only approved effective executors are the exact contract owner,
+ *                service_role, and superusers. 08 aborts (full rollback) on a membership-derived
+ *                executor instead of ever modifying cluster role memberships, and rechecks the actual
+ *                effective ACL before COMMIT.
  */
 
 import { readFileSync } from 'node:fs';
@@ -44,8 +52,38 @@ function finalStatement(sql: string): string {
   return parts[parts.length - 1];
 }
 
+/** The statement of a package file that contains a marker token (for non-final diagnostics queries). */
+function statementWith(sql: string, token: string): string {
+  const hit = sql
+    .split(/;\s*\n/)
+    .map((chunk) =>
+      chunk
+        .split('\n')
+        .filter((l) => !/^\s*--/.test(l))
+        .join('\n')
+        .trim(),
+    )
+    .filter(Boolean)
+    .find((s) => s.includes(token));
+
+  if (!hit) {
+    throw new Error(`no statement containing ${token}`);
+  }
+
+  return hit;
+}
+
 const PRE_VERDICT = finalStatement(PRE);
 const POST_FINAL = finalStatement(POST);
+
+/** Recover the session after a package file aborted inside its own explicit transaction. */
+async function rollback(db: PGlite): Promise<void> {
+  try {
+    await db.exec('ROLLBACK');
+  } catch {
+    // no transaction was open
+  }
+}
 
 async function open(migration = MIGRATION, patch?: string): Promise<PGlite> {
   const db = new PGlite();
@@ -68,6 +106,13 @@ async function runPreInFull(db: PGlite): Promise<string> {
   await db.exec(PRE);
 
   return (await db.query<{ verdict: string }>(PRE_VERDICT)).rows[0].verdict;
+}
+
+/** Run 07 IN FULL and return the whole verdict row (R15.2C effective-ACL columns included). */
+async function runPreRowInFull(db: PGlite): Promise<Record<string, unknown>> {
+  await db.exec(PRE);
+
+  return (await db.query<Record<string, unknown>>(PRE_VERDICT)).rows[0];
 }
 
 /** Run 09 IN FULL and return its single authoritative row. */
@@ -471,6 +516,7 @@ describe('R15.2B — 09 is one snapshot, one statement, and gates the verifier c
         'no_unexpected_grantee',
         'no_unexpected_grant_option',
         'body_approved',
+        'effective_acl_ok',
         'authority_ok',
       ]) {
         expect(Object.keys(row), `final_status must consume ${required}`).toContain(required);
@@ -483,7 +529,433 @@ describe('R15.2B — 09 is one snapshot, one statement, and gates the verifier c
   }, 120_000);
 });
 
+// ─── R15.2C effective-privilege closure ─────────────────────────────────────────
+
+describe('R15.2C — 07 gates on effective EXECUTE (inherited privilege included)', () => {
+  it('c1 — healthy baseline: SAFE, exact executor arrays, direct ACL exact', async () => {
+    const db = await open();
+
+    try {
+      const row = await runPreRowInFull(db);
+      expect(row.verdict).toBe('SAFE_TO_APPLY_EXACT_DUAL_DIGEST_PATCH');
+      expect(row.direct_acl_ok).toBe(true);
+      expect(row.effective_acl_ok).toBe(true);
+      expect(row.expected_effective_executor_roles).toEqual(['postgres', 'service_role']);
+      expect(row.unexpected_effective_executor_roles).toBeNull();
+    } finally {
+      await db.close();
+    }
+  }, 120_000);
+
+  it('c2 — an unavoidable superuser is approved and displayed separately, never a false STOP', async () => {
+    const db = await open();
+
+    try {
+      await db.exec('CREATE ROLE extra_super SUPERUSER NOLOGIN;');
+
+      const row = await runPreRowInFull(db);
+      expect(row.verdict).toBe('SAFE_TO_APPLY_EXACT_DUAL_DIGEST_PATCH');
+      expect(row.superuser_executor_roles).toContain('extra_super');
+      expect(row.unexpected_effective_executor_roles).toBeNull();
+    } finally {
+      await db.close();
+    }
+  }, 120_000);
+
+  it('c3 — direct service_role membership STOPs while the direct ACL stays clean', async () => {
+    const db = await open();
+
+    try {
+      await db.exec('CREATE ROLE extra_browser NOLOGIN; GRANT service_role TO extra_browser;');
+
+      const row = await runPreRowInFull(db);
+      expect(row.verdict).toBe('UNEXPECTED_FUNCTION_BODY_STOP');
+      expect(row.direct_acl_ok, 'the direct proacl is clean — only inherited privilege exists').toBe(true);
+      expect(row.effective_acl_ok).toBe(false);
+      expect(row.unexpected_effective_executor_roles).toEqual(['extra_browser']);
+    } finally {
+      await db.close();
+    }
+  }, 120_000);
+
+  const PRE_EFFECTIVE_DRIFT: Array<[string, string]> = [
+    [
+      'c4 — nested membership (service_role -> role_a -> role_b)',
+      'CREATE ROLE role_a NOLOGIN; CREATE ROLE role_b NOLOGIN; GRANT service_role TO role_a; GRANT role_a TO role_b;',
+    ],
+    [
+      'c5 — effective privilege through PUBLIC',
+      'GRANT EXECUTE ON FUNCTION public.qhub_verify_commercial_schema() TO PUBLIC;',
+    ],
+    [
+      'c6 — unexpected direct grantee',
+      'CREATE ROLE sneaky NOLOGIN; GRANT EXECUTE ON FUNCTION public.qhub_verify_commercial_schema() TO sneaky;',
+    ],
+    [
+      'c7 — role inheriting from a directly granted role',
+      `CREATE ROLE role_direct NOLOGIN; CREATE ROLE role_x NOLOGIN;
+       GRANT EXECUTE ON FUNCTION public.qhub_verify_commercial_schema() TO role_direct;
+       GRANT role_direct TO role_x;`,
+    ],
+    [
+      'c8 — service_role WITH GRANT OPTION',
+      'GRANT EXECUTE ON FUNCTION public.qhub_verify_commercial_schema() TO service_role WITH GRANT OPTION;',
+    ],
+    ['c9 — anon direct EXECUTE', 'GRANT EXECUTE ON FUNCTION public.qhub_verify_commercial_schema() TO anon;'],
+    [
+      'c10 — authenticated direct EXECUTE',
+      'GRANT EXECUTE ON FUNCTION public.qhub_verify_commercial_schema() TO authenticated;',
+    ],
+  ];
+
+  for (const [name, drift] of PRE_EFFECTIVE_DRIFT) {
+    it(`${name} STOPs`, async () => {
+      expect(await verdictAfter(drift)).toBe('UNEXPECTED_FUNCTION_BODY_STOP');
+    }, 120_000);
+  }
+
+  it('c11 — removing the membership restores SAFE', async () => {
+    const db = await open();
+
+    try {
+      await db.exec('CREATE ROLE extra_browser NOLOGIN; GRANT service_role TO extra_browser;');
+      expect(await runPreInFull(db)).toBe('UNEXPECTED_FUNCTION_BODY_STOP');
+
+      await db.exec('REVOKE service_role FROM extra_browser;');
+      expect(await runPreInFull(db)).toBe('SAFE_TO_APPLY_EXACT_DUAL_DIGEST_PATCH');
+    } finally {
+      await db.close();
+    }
+  }, 120_000);
+
+  it('c12 — an extra role with no effective EXECUTE does not create a false failure', async () => {
+    expect(await verdictAfter('CREATE ROLE bystander NOLOGIN;')).toBe('SAFE_TO_APPLY_EXACT_DUAL_DIGEST_PATCH');
+  }, 120_000);
+
+  it('c13 — a missing verifier STOPs the whole file with no 42883', async () => {
+    const db = await open();
+
+    try {
+      await db.exec('DROP FUNCTION public.qhub_verify_commercial_schema();');
+
+      const row = await runPreRowInFull(db);
+      expect(row.verifier_present).toBe(false);
+      expect(row.effective_acl_ok).toBe(false);
+      expect(row.verdict).toBe('UNEXPECTED_FUNCTION_BODY_STOP');
+    } finally {
+      await db.close();
+    }
+  }, 120_000);
+
+  it('c14 — the membership diagnostics identify WHY a role is effective (path to service_role)', async () => {
+    const db = await open();
+
+    try {
+      await db.exec(
+        'CREATE ROLE extra_browser NOLOGIN; CREATE ROLE deep_role NOLOGIN; GRANT service_role TO extra_browser; GRANT extra_browser TO deep_role;',
+      );
+      await db.exec(PRE);
+
+      const rows = (await db.query<Record<string, unknown>>(statementWith(PRE, 'membership_path'))).rows;
+      const direct = rows.find((r) => r.rolname === 'extra_browser');
+      const nested = rows.find((r) => r.rolname === 'deep_role');
+
+      expect(direct?.effective_execute).toBe(true);
+      expect(direct?.direct_member_of_service_role).toBe(true);
+      expect(direct?.membership_path).toBe('service_role <- extra_browser');
+      expect(direct?.direct_function_acl, 'no direct ACL entry — the path explains the privilege').toBeNull();
+
+      expect(nested?.effective_execute).toBe(true);
+      expect(nested?.direct_member_of_service_role).toBe(false);
+      expect(nested?.member_of_service_role_recursive).toBe(true);
+      expect(nested?.membership_path).toBe('service_role <- extra_browser <- deep_role');
+    } finally {
+      await db.close();
+    }
+  }, 120_000);
+});
+
+describe('R15.2C — 08 aborts on an unsafe role graph and never touches memberships', () => {
+  it('c15 — a membership-derived executor aborts 08 BEFORE any change, with a full state proof', async () => {
+    const db = await open(MIGRATION, PATCH);
+
+    try {
+      await db.exec('CREATE ROLE extra_browser NOLOGIN; GRANT service_role TO extra_browser;');
+
+      const snapshot = () =>
+        db.query<{ body: string; acl: string; owner: string }>(
+          `select md5(p.prosrc) body, coalesce(p.proacl::text, '') acl, pg_get_userbyid(p.proowner) owner
+             from pg_proc p where p.oid = to_regprocedure('public.qhub_verify_commercial_schema()')`,
+        );
+      const before = (await snapshot()).rows[0];
+
+      await expect(db.exec(PATCH)).rejects.toThrow(/unexpected_effective_verifier_executor/);
+      await rollback(db);
+
+      expect((await snapshot()).rows[0], 'no change may be made').toEqual(before);
+
+      const membership = await db.query<{ n: number }>(
+        `select count(*)::int n from pg_auth_members am
+           join pg_roles g on g.oid = am.roleid join pg_roles m on m.oid = am.member
+          where g.rolname = 'service_role' and m.rolname = 'extra_browser'`,
+      );
+      expect(membership.rows[0].n, 'the membership must never be revoked').toBe(1);
+    } finally {
+      await db.close();
+    }
+  }, 120_000);
+
+  it('c16 — a nested membership also aborts 08', async () => {
+    const db = await open(MIGRATION, PATCH);
+
+    try {
+      await db.exec(
+        'CREATE ROLE role_a NOLOGIN; CREATE ROLE role_b NOLOGIN; GRANT service_role TO role_a; GRANT role_a TO role_b;',
+      );
+      await expect(db.exec(PATCH)).rejects.toThrow(/unexpected_effective_verifier_executor/);
+      await rollback(db);
+    } finally {
+      await db.close();
+    }
+  }, 120_000);
+
+  it('c17 — the post-patch recheck aborts before COMMIT and rolls back the ENTIRE patch', async () => {
+    const db = await open(MIGRATION, PATCH);
+
+    try {
+      /*
+       * With the verifier absent, the precondition has nothing to inspect and passes; the recreate,
+       * owner reset and GRANT then make service_role members effective again — the recheck must catch
+       * that reality before COMMIT and roll everything back.
+       */
+      await db.exec('CREATE ROLE extra_browser NOLOGIN; GRANT service_role TO extra_browser;');
+      await db.exec('DROP FUNCTION public.qhub_verify_commercial_schema();');
+
+      await expect(db.exec(PATCH)).rejects.toThrow(/unexpected_effective_verifier_executor_post_patch/);
+      await rollback(db);
+
+      const gone = await db.query<{ gone: boolean }>(
+        `select to_regprocedure('public.qhub_verify_commercial_schema()') is null gone`,
+      );
+      expect(gone.rows[0].gone, 'the CREATE OR REPLACE must have been rolled back').toBe(true);
+    } finally {
+      await db.close();
+    }
+  }, 120_000);
+
+  it('c18 — an unrelated membership neither aborts the patch nor gets revoked', async () => {
+    const db = await open(MIGRATION, PATCH);
+
+    try {
+      await db.exec('CREATE ROLE role_y NOLOGIN; CREATE ROLE role_z NOLOGIN; GRANT role_y TO role_z;');
+      await db.exec(PATCH);
+      expect(await postStatus(db)).toBe('R15_2_VERIFIER_READY');
+
+      const membership = await db.query<{ n: number }>(
+        `select count(*)::int n from pg_auth_members am
+           join pg_roles g on g.oid = am.roleid join pg_roles m on m.oid = am.member
+          where g.rolname = 'role_y' and m.rolname = 'role_z'`,
+      );
+      expect(membership.rows[0].n).toBe(1);
+    } finally {
+      await db.close();
+    }
+  }, 120_000);
+
+  it('c19 — after the membership is removed, 08 applies and stays idempotent', async () => {
+    const db = await open(MIGRATION, PATCH);
+
+    try {
+      await db.exec('CREATE ROLE extra_browser NOLOGIN; GRANT service_role TO extra_browser;');
+      await expect(db.exec(PATCH)).rejects.toThrow(/unexpected_effective_verifier_executor/);
+      await rollback(db);
+
+      await db.exec('REVOKE service_role FROM extra_browser;');
+      await db.exec(PATCH);
+      await db.exec(PATCH);
+      expect(await postStatus(db)).toBe('R15_2_VERIFIER_READY');
+    } finally {
+      await db.close();
+    }
+  }, 120_000);
+
+  it('c20 — statically: every REVOKE targets the function, never a role membership, and the checks bracket the changes', () => {
+    const code = PATCH.replace(/\/\*[\s\S]*?\*\//g, ' ').replace(/(^|[^:])--[^\n]*/g, '$1');
+
+    for (const line of code.split('\n').filter((l) => /\bREVOKE\b/i.test(l))) {
+      expect(line, 'a REVOKE may only ever target the verifier function').toMatch(/ON\s+FUNCTION/i);
+    }
+    expect(code).not.toMatch(/\bREVOKE\s+service_role\s+FROM/i);
+    expect(code).not.toMatch(/\bGRANT\s+service_role\s+TO/i);
+
+    const precheck = PATCH.indexOf('$r15_2c_precheck$');
+    const create = PATCH.indexOf('CREATE OR REPLACE FUNCTION');
+    const grant = PATCH.lastIndexOf('GRANT EXECUTE ON FUNCTION');
+    const postcheck = PATCH.indexOf('$r15_2c_postcheck$');
+    const commit = PATCH.lastIndexOf('COMMIT;');
+    expect(precheck).toBeGreaterThan(-1);
+    expect(precheck, 'the precondition must run before any change').toBeLessThan(create);
+    expect(postcheck, 'the recheck must run after the direct-ACL reset').toBeGreaterThan(grant);
+    expect(postcheck, 'the recheck must run before COMMIT').toBeLessThan(commit);
+  });
+});
+
+describe('R15.2C — 09 requires the effective-executor contract in final READY', () => {
+  it('c21 — inherited EXECUTE is NOT READY with a clean direct ACL and NO verifier invocation', async () => {
+    const db = await open(MIGRATION, PATCH);
+
+    try {
+      await db.exec('CREATE ROLE extra_browser NOLOGIN; GRANT service_role TO extra_browser;');
+
+      const row = await runPostInFull(db);
+
+      expect(row.no_unexpected_grantee, 'direct proacl stays clean').toBe(true);
+      expect(row.no_unexpected_grant_option).toBe(true);
+      expect(row.effective_acl_ok).toBe(false);
+      expect(row.unexpected_effective_executor_roles).toEqual(['extra_browser']);
+      expect(row.authority_ok).toBe(false);
+      expect(row.product_ready, 'the verifier must not have been invoked').toBeNull();
+      expect(row.final_status).toBe('R15_2_VERIFIER_NOT_READY');
+    } finally {
+      await db.close();
+    }
+  }, 120_000);
+
+  const POST_EFFECTIVE_DRIFT: Array<[string, string, string[]]> = [
+    [
+      'c22 — nested membership',
+      'CREATE ROLE role_a NOLOGIN; CREATE ROLE role_b NOLOGIN; GRANT service_role TO role_a; GRANT role_a TO role_b;',
+      ['role_a', 'role_b'],
+    ],
+    [
+      'c23 — role inheriting from a directly granted role',
+      `CREATE ROLE role_direct NOLOGIN; CREATE ROLE role_x NOLOGIN;
+       GRANT EXECUTE ON FUNCTION public.qhub_verify_commercial_schema() TO role_direct;
+       GRANT role_direct TO role_x;`,
+      ['role_direct', 'role_x'],
+    ],
+  ];
+
+  for (const [name, drift, roles] of POST_EFFECTIVE_DRIFT) {
+    it(`${name} is NOT READY and names every effective role`, async () => {
+      const db = await open(MIGRATION, PATCH);
+
+      try {
+        await db.exec(drift);
+
+        const row = await runPostInFull(db);
+        expect(row.final_status).toBe('R15_2_VERIFIER_NOT_READY');
+
+        for (const role of roles) {
+          expect(row.unexpected_effective_executor_roles).toContain(role);
+        }
+      } finally {
+        await db.close();
+      }
+    }, 120_000);
+  }
+
+  it('c24 — PUBLIC-derived effective privilege is NOT READY', async () => {
+    const db = await open(MIGRATION, PATCH);
+
+    try {
+      await db.exec('GRANT EXECUTE ON FUNCTION public.qhub_verify_commercial_schema() TO PUBLIC;');
+
+      const row = await runPostInFull(db);
+      expect(row.final_status).toBe('R15_2_VERIFIER_NOT_READY');
+      expect(row.public_denied).toBe(false);
+      expect(row.unexpected_effective_executor_roles).toContain('anon');
+      expect(row.unexpected_effective_executor_roles).toContain('authenticated');
+    } finally {
+      await db.close();
+    }
+  }, 120_000);
+
+  it('c25 — removing the membership restores READY', async () => {
+    const db = await open(MIGRATION, PATCH);
+
+    try {
+      await db.exec('CREATE ROLE extra_browser NOLOGIN; GRANT service_role TO extra_browser;');
+      expect(await postStatus(db)).toBe('R15_2_VERIFIER_NOT_READY');
+
+      await db.exec('REVOKE service_role FROM extra_browser;');
+      expect(await postStatus(db)).toBe('R15_2_VERIFIER_READY');
+    } finally {
+      await db.close();
+    }
+  }, 120_000);
+
+  it('c26 — an extra superuser does not break READY and is displayed separately', async () => {
+    const db = await open(MIGRATION, PATCH);
+
+    try {
+      await db.exec('CREATE ROLE extra_super SUPERUSER NOLOGIN;');
+
+      const row = await runPostInFull(db);
+      expect(row.final_status).toBe('R15_2_VERIFIER_READY');
+      expect(row.superuser_executor_roles).toContain('extra_super');
+      expect(row.unexpected_effective_executor_roles).toBeNull();
+    } finally {
+      await db.close();
+    }
+  }, 120_000);
+
+  it('c27 — a sentinel unreviewed body is never executed when the effective ACL fails', async () => {
+    const db = await open(MIGRATION, PATCH);
+
+    try {
+      await db.exec(`
+        CREATE OR REPLACE FUNCTION public.qhub_verify_commercial_schema() RETURNS JSONB
+        LANGUAGE plpgsql STABLE SECURITY DEFINER SET search_path = pg_catalog, public AS $f$
+        BEGIN
+          RAISE EXCEPTION 'SHOULD_NOT_EXECUTE_UNREVIEWED_VERIFIER';
+        END; $f$;
+      `);
+      await db.exec('CREATE ROLE eff_only NOLOGIN; GRANT service_role TO eff_only;');
+
+      await expect(db.exec(POST)).resolves.toBeDefined();
+
+      const row = (await db.query<Record<string, unknown>>(POST_FINAL)).rows[0];
+      expect(row.effective_acl_ok).toBe(false);
+      expect(row.product_ready).toBeNull();
+      expect(row.final_status).toBe('R15_2_VERIFIER_NOT_READY');
+    } finally {
+      await db.close();
+    }
+  }, 120_000);
+});
+
 // ─── live sequence ──────────────────────────────────────────────────────────────
+
+describe('R15.2C — live sequence with a mid-flight membership injection', () => {
+  it('c28 — CRLF -> 07 SAFE -> 08 -> 09 READY -> membership -> 09 NOT READY + 08 refuses -> removal -> SAFE/READY', async () => {
+    const db = await open(MIGRATION.replace(/\n/g, '\r\n'));
+
+    try {
+      expect(await runPreInFull(db)).toBe('SAFE_TO_APPLY_EXACT_DUAL_DIGEST_PATCH');
+      await db.exec(PATCH);
+      expect(await postStatus(db)).toBe('R15_2_VERIFIER_READY');
+
+      await db.exec('CREATE ROLE lseq_browser NOLOGIN; GRANT service_role TO lseq_browser;');
+
+      const drifted = await runPostInFull(db);
+      expect(drifted.final_status).toBe('R15_2_VERIFIER_NOT_READY');
+      expect(drifted.product_ready, 'the verifier must not run under an unsafe role graph').toBeNull();
+
+      await expect(db.exec(PATCH), '08 must refuse to run while the membership remains').rejects.toThrow(
+        /unexpected_effective_verifier_executor/,
+      );
+      await rollback(db);
+
+      await db.exec('REVOKE service_role FROM lseq_browser;');
+      expect(await runPreInFull(db)).toBe('SAFE_TO_APPLY_EXACT_DUAL_DIGEST_PATCH');
+      await db.exec(PATCH);
+      expect(await postStatus(db)).toBe('R15_2_VERIFIER_READY');
+    } finally {
+      await db.close();
+    }
+  }, 300_000);
+});
 
 describe('R15.2B — full live sequence', () => {
   it('tests 41-52 — CRLF -> 07 -> 08 -> 09 -> grant-option drift -> 08 -> 09 -> owner drift -> 08 -> 09', async () => {

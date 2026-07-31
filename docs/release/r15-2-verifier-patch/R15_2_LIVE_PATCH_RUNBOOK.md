@@ -40,7 +40,27 @@ silently passing.
 **Final READY requires all of:** product verifier `ready = true` · exact schema version · `failed = []` ·
 exact verifier signature with no overload · exact owner · exact security mode (SECURITY DEFINER) · exact
 fixed `search_path` · exact ACL (service_role EXECUTE present; PUBLIC/anon/authenticated denied; no
-unexpected grantee) · exact verifier body identity.
+unexpected grantee) · exact verifier body identity · **(R15.2C) no unexpected EFFECTIVE executor**.
+
+### The effective-executor contract (R15.2C)
+
+A role can hold EXECUTE **through role membership** (`GRANT service_role TO some_role`) without ever
+appearing in the function's direct ACL. Both 07 and 09 therefore enumerate **every** role in `pg_roles`
+and evaluate `has_function_privilege(role_oid, verifier_oid, 'EXECUTE')` — PostgreSQL's own privilege
+inheritance, nested memberships included. The only approved effective executors are:
+
+- the **exact contract owner** (the owner of `public.qhub_manual_review_requests`),
+- **`service_role`**,
+- **superuser roles** — displayed separately as inherent platform administrators, because superusers
+  bypass ordinary object privilege checks and cannot be meaningfully denied by a function ACL.
+
+No role is approved for being non-login, system-looking, name-prefixed, BYPASSRLS, or absent from
+`proacl`. Any other effective executor is a STOP / NOT READY.
+
+**Role memberships are never modified.** 08 **aborts** (full rollback) rather than touch the role
+graph, and the operator must **not** manually revoke Supabase-managed memberships — they can be shared
+by other Supabase services. If an unexpected inherited executor is reported, STOP and escalate with a
+separately reviewed plan.
 
 ## Step 1 — Verify branch, commit, origin and migration SHA
 
@@ -73,17 +93,28 @@ The **last result** is the verdict:
 | Verdict | Action |
 |---|---|
 | `SAFE_TO_APPLY_EXACT_DUAL_DIGEST_PATCH` | Continue to Step 3. |
-| `UNEXPECTED_FUNCTION_BODY_STOP` | **STOP.** A protected function is missing, renamed, wrong-signature, overloaded, or carries an unapproved body. Capture the per-function result and escalate. |
+| `UNEXPECTED_FUNCTION_BODY_STOP` | **STOP.** A protected function is missing, renamed, wrong-signature, overloaded, or carries an unapproved body — **or (R15.2C) the verifier is missing/overloaded/wrong-signature, its direct ACL is not exact, or an unapproved role holds effective EXECUTE on it.** Capture QUERY 1 and QUERY 4 and escalate. |
 
-The verdict binds **exact signature and exact raw digest together**. The line-ending counts are
-non-authorizing diagnostics and must not be used to justify proceeding.
+The verdict binds **exact signature and exact raw digest together**, and (R15.2C) additionally requires
+the verifier's exact identity, an **exact direct ACL** (service_role EXECUTE without grant option;
+PUBLIC/anon/authenticated denied; no unexpected direct grantee or grant option) and **no unexpected
+effective executor** — direct grants, PUBLIC, and inherited role memberships are all evaluated. The
+line-ending counts and the per-role membership diagnostics (QUERY 4) are non-authorizing and must not
+be used to justify proceeding; QUERY 4 exists to explain *why* a role is effective (it reports the
+`service_role <- …` membership path).
 
-07 reads `pg_catalog` only — it **never invokes a function**, so running the whole file is safe in any
-state, including one where a protected function or the verifier is missing. It cannot raise 42883.
-(The earlier optional "current verifier output" query was removed for exactly that reason.)
+**Unexpected inherited execution is a STOP.** Do not revoke the membership yourself; escalate.
+
+07 reads `pg_catalog` only — it **never invokes a user-defined function** (privilege evaluation uses
+OID-based catalog functions only), so running the whole file is safe in any state, including one where
+a protected function or the verifier is missing. It cannot raise 42883. (The earlier optional "current
+verifier output" query was removed for exactly that reason.)
 
 On the current live database expect `matches_crlf = true`, `matches_lf = false`, `signature_matches =
-true`, `overload_count = 1` and `authorized = true` for all five.
+true`, `overload_count = 1` and `authorized = true` for all five, and in the verdict row
+`direct_acl_ok = true`, `effective_acl_ok = true`, `unexpected_effective_executor_roles = NULL`, with
+`expected_effective_executor_roles` = the contract owner (`postgres`) plus `service_role`, and any
+superusers listed only under `superuser_executor_roles`.
 
 ## Step 3 — Apply the patch (one transaction, once)
 
@@ -92,8 +123,18 @@ SQL Editor → **New query** named `QHub R15.2 Verifier Exact Dual Digest` → p
 → **Run once**.
 
 Do not split it, edit it, or re-run fragments on error. It is one transaction, so a failure rolls back
-cleanly. The patch is idempotent. Line endings do not matter for the patch itself — the verifier's own
-body is accepted in either reviewed encoding.
+cleanly. The patch is idempotent under a healthy role graph. Line endings do not matter for the patch
+itself — the verifier's own body is accepted in either reviewed encoding.
+
+**08 will ABORT rather than modify cluster role memberships (R15.2C).** Before touching anything, a
+fail-closed precondition detects unapproved roles whose effective EXECUTE on the current verifier is
+inherited through role membership; if any exist it raises
+`unexpected_effective_verifier_executor` and **no change is made**. After the recreate and the exact
+direct-authority reset, and **before COMMIT**, a post-patch recheck re-evaluates every role's actual
+effective EXECUTE on the patched verifier; if any unapproved, non-superuser role remains it raises
+`unexpected_effective_verifier_executor_post_patch` and the **entire transaction rolls back**. In both
+cases: STOP, capture the message (it names the roles), and escalate — do **not** revoke
+Supabase-managed memberships without a separately reviewed plan.
 
 **08 resets the exact authority state**, because `CREATE OR REPLACE` preserves whatever owner and ACL
 already exist. It restores the owner (derived from the owner of the migration-created authority tables,
@@ -121,9 +162,14 @@ consequences to rely on:
   cannot raise PostgreSQL 42883 — it simply fails authority.
 
 Require **`final_status = R15_2_VERIFIER_READY`**. Every column in the result — identity, owner,
-security mode, search_path, each ACL condition (including `service_role_no_grant_option` and
-`no_unexpected_grant_option`), body identity, and the three product-verifier values — is an input to
-that verdict. Nothing displayed is merely informational.
+security mode, search_path, each direct-ACL condition (including `service_role_no_grant_option` and
+`no_unexpected_grant_option`), **the effective-ACL condition `effective_acl_ok` (R15.2C — no
+unexpected effective executor, with `effective_executor_roles` /
+`expected_effective_executor_roles` / `unexpected_effective_executor_roles` displayed and superusers
+listed separately under `superuser_executor_roles`)**, body identity, and the three product-verifier
+values — is an input to that verdict. Nothing displayed is merely informational. The verifier is not
+invoked unless every identity, body, owner, security, search_path, direct-ACL **and effective-ACL**
+check passes.
 
 | Status | Action |
 |---|---|
@@ -157,8 +203,11 @@ confirmation of the founder UUID, email, org ID and roles before any seed.
 - HEAD does not equal the commit in the final review report
 - Migration SHA-256 is not `b5f0a466f293212812a8ea3d71d6c650ca7af30255275ef248cb420910a0d1cf`
 - Pre-patch verdict is `UNEXPECTED_FUNCTION_BODY_STOP`
+- 08 raises `unexpected_effective_verifier_executor` or
+  `unexpected_effective_verifier_executor_post_patch` — do not revoke role memberships; escalate
 - **Any SQL error while running any of the three files** — do not retry fragments
-- `final_status` from 09 is not exactly `R15_2_VERIFIER_READY`
+- `final_status` from 09 is not exactly `R15_2_VERIFIER_READY` (history alignment in Step 5 stays
+  blocked until it is)
 - Any prompt for `--include-all`, reset, force, or replay of prior migrations
 
 ## Out of scope

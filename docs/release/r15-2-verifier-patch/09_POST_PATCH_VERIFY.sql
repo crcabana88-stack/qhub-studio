@@ -21,6 +21,16 @@
 --     cannot raise PostgreSQL 42883. A missing verifier simply fails authority and
 --     returns R15_2_VERIFIER_NOT_READY.
 --
+--   * R15.2C — EFFECTIVE ACL. The same snapshot enumerates EVERY pg_roles role
+--     and evaluates has_function_privilege(role_oid, verifier_oid, 'EXECUTE'),
+--     which follows PostgreSQL's own privilege inheritance (direct grants,
+--     PUBLIC, and nested role memberships alike). The only approved effective
+--     executors are the exact contract owner, service_role, and superusers —
+--     displayed separately as inherent platform administrators, because a
+--     function ACL cannot meaningfully deny a superuser. Any other effective
+--     executor fails effective_acl_ok, which is part of authority_ok, so the
+--     verifier is NOT invoked and final_status is R15_2_VERIFIER_NOT_READY.
+--
 -- final_status is computed from the same row that displays every check, so no
 -- displayed condition can be silently excluded from the verdict.
 -- ============================================================================
@@ -47,6 +57,32 @@ base AS (
   SELECT a.*, o.oid, o.proowner, o.prosecdef, o.proconfig, o.prosrc, o.proacl
     FROM approved a
     LEFT JOIN obj o ON TRUE
+),
+-- R15.2C — EFFECTIVE ACL from the SAME snapshot: every role, evaluated with the
+-- exact verifier OID through PostgreSQL's own privilege inheritance (nested
+-- memberships included). Aggregation over zero rows (missing verifier) yields
+-- count(*) = 0, so effective_acl_ok fails closed. coalesce(..., FALSE) on the
+-- owner comparison keeps a missing contract table fail-closed too.
+eff AS (
+  SELECT
+    (count(*) > 0
+     AND count(*) FILTER (WHERE f.hfp AND NOT f.approved_role) = 0)                 AS effective_acl_ok,
+    array_agg(r.rolname ORDER BY r.rolname) FILTER (WHERE f.hfp)                    AS effective_executor_roles,
+    array_agg(r.rolname ORDER BY r.rolname) FILTER (WHERE f.hfp AND f.approved_role)
+                                                                                    AS expected_effective_executor_roles,
+    array_agg(r.rolname ORDER BY r.rolname) FILTER (WHERE f.hfp AND NOT f.approved_role)
+                                                                                    AS unexpected_effective_executor_roles,
+    array_agg(r.rolname ORDER BY r.rolname) FILTER (WHERE f.hfp AND r.rolsuper)     AS superuser_executor_roles
+  FROM pg_roles r
+  CROSS JOIN obj o
+  CROSS JOIN LATERAL (
+    SELECT
+      has_function_privilege(r.oid, o.oid, 'EXECUTE')                               AS hfp,
+      (r.rolsuper
+       OR coalesce(r.oid = (SELECT c.relowner FROM pg_class c
+                             WHERE c.oid = to_regclass('public.qhub_manual_review_requests')), FALSE)
+       OR r.rolname = 'service_role')                                               AS approved_role
+  ) f
 ),
 checks AS (
   SELECT
@@ -95,13 +131,20 @@ checks AS (
 authority AS (
   SELECT
     c.*,
+    e.effective_acl_ok,
+    e.effective_executor_roles,
+    e.expected_effective_executor_roles,
+    e.unexpected_effective_executor_roles,
+    e.superuser_executor_roles,
     (c.verifier_present AND c.zero_argument_signature AND c.single_function_no_overload
      AND c.owner_exact AND c.security_definer AND c.search_path_exact
      AND c.service_role_execute AND c.service_role_no_grant_option
      AND c.public_denied AND c.anon_denied AND c.authenticated_denied
      AND c.no_unexpected_grantee AND c.no_unexpected_grant_option
-     AND c.body_approved)                                                        AS authority_ok
+     AND c.body_approved
+     AND e.effective_acl_ok)                                                     AS authority_ok
   FROM checks c
+  CROSS JOIN eff e
 ),
 -- The verifier runs ONLY when authority_ok. Naming it inside a string literal keeps a
 -- missing function from being resolved at parse time (no 42883).
@@ -142,6 +185,12 @@ SELECT
   no_unexpected_grantee,
   no_unexpected_grant_option,
   body_approved,
+  -- effective ACL (R15.2C) — inherited privilege, evaluated per role
+  effective_acl_ok,
+  effective_executor_roles,
+  expected_effective_executor_roles,
+  unexpected_effective_executor_roles,
+  superuser_executor_roles,
   authority_ok,
   -- product verifier (NULL when authority_ok is false — it was never invoked)
   product_ready,

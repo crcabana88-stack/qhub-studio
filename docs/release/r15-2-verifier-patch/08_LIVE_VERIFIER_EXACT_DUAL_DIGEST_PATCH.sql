@@ -15,7 +15,10 @@
 -- This script changes NO other object and NO data. It does not touch any
 -- protected function body, signature, owner, security mode, search_path, table,
 -- policy, constraint, index, RLS setting or ACL other than restating the
--- verifier's own reviewed grants.
+-- verifier's own reviewed grants. It NEVER grants, revokes, or otherwise
+-- modifies any cluster ROLE MEMBERSHIP — memberships can be shared by other
+-- Supabase services, so an unsafe role graph is a deterministic ABORT (full
+-- rollback), never a silent repair.
 --
 -- Run ONCE, as one transaction, only after
 -- 07_PRE_PATCH_EXACT_DIGEST_VERIFY.sql returns
@@ -23,6 +26,68 @@
 -- ============================================================================
 
 BEGIN;
+
+-- ---------------------------------------------------------------------------
+-- R15.2C — FAIL-CLOSED PRECONDITION (runs BEFORE any change).
+--
+-- A role can hold effective EXECUTE on the current verifier through role
+-- membership (GRANT service_role TO some_role) without appearing in the direct
+-- ACL. The direct-ACL reset below cannot remove that access, and this patch
+-- must never modify role memberships. So: if any unapproved, non-superuser role
+-- holds effective EXECUTE that would SURVIVE the direct-ACL reset (it inherits
+-- from service_role or from the contract owner via PostgreSQL's own USAGE
+-- inheritance, nested memberships included), RAISE and change nothing.
+--
+-- Unexpected access explained purely by revocable DIRECT grants (an unexpected
+-- direct grantee, or a PUBLIC grant) is left to the retained reset below, and
+-- the R15.2C post-patch recheck — the authoritative gate — then proves before
+-- COMMIT that NO unexpected role retains effective EXECUTE; otherwise the whole
+-- transaction rolls back.
+--
+-- Approved effective executors: the exact contract owner (owner of
+-- public.qhub_manual_review_requests), service_role, and superusers (inherent
+-- platform administrators that a function ACL cannot meaningfully deny).
+-- ---------------------------------------------------------------------------
+DO $r15_2c_precheck$
+DECLARE
+  v_verifier oid;
+  v_owner    oid;
+  v_service  oid;
+  v_unexpected text;
+BEGIN
+  SELECT c.relowner INTO v_owner
+    FROM pg_class c
+   WHERE c.oid = to_regclass('public.qhub_manual_review_requests');
+  IF v_owner IS NULL THEN
+    RAISE EXCEPTION 'R15.2C: cannot resolve the contract owner from public.qhub_manual_review_requests';
+  END IF;
+
+  SELECT r.oid INTO v_service FROM pg_roles r WHERE r.rolname = 'service_role';
+  IF v_service IS NULL THEN
+    RAISE EXCEPTION 'R15.2C: role service_role does not exist';
+  END IF;
+
+  v_verifier := to_regprocedure('public.qhub_verify_commercial_schema()');
+  IF v_verifier IS NULL THEN
+    -- Nothing exists to inherit EXECUTE from; the post-patch recheck below
+    -- still authoritatively gates the final state before COMMIT.
+    RETURN;
+  END IF;
+
+  SELECT string_agg(r.rolname, ', ' ORDER BY r.rolname)
+    INTO v_unexpected
+    FROM pg_roles r
+   WHERE NOT r.rolsuper
+     AND r.oid IS DISTINCT FROM v_owner
+     AND r.rolname <> 'service_role'
+     AND has_function_privilege(r.oid, v_verifier, 'EXECUTE')
+     AND (pg_has_role(r.oid, v_service, 'USAGE') OR pg_has_role(r.oid, v_owner, 'USAGE'));
+
+  IF v_unexpected IS NOT NULL THEN
+    RAISE EXCEPTION 'unexpected_effective_verifier_executor: % — EXECUTE is inherited through role membership. This patch will NOT modify cluster role memberships; no change was made. STOP and escalate with a separately reviewed plan.', v_unexpected;
+  END IF;
+END;
+$r15_2c_precheck$;
 
 CREATE OR REPLACE FUNCTION public.qhub_verify_commercial_schema()
 RETURNS JSONB
@@ -688,5 +753,48 @@ REVOKE ALL PRIVILEGES ON FUNCTION public.qhub_verify_commercial_schema() FROM an
 REVOKE ALL PRIVILEGES ON FUNCTION public.qhub_verify_commercial_schema() FROM authenticated;
 REVOKE ALL PRIVILEGES ON FUNCTION public.qhub_verify_commercial_schema() FROM service_role;
 GRANT EXECUTE ON FUNCTION public.qhub_verify_commercial_schema() TO service_role;
+
+-- ---------------------------------------------------------------------------
+-- R15.2C — POST-PATCH EFFECTIVE-ACL RECHECK (the authoritative gate, runs
+-- AFTER the recreate + exact direct-authority reset and BEFORE COMMIT).
+--
+-- Recomputes, in this same transaction, every role's ACTUAL effective EXECUTE
+-- on the patched verifier. If ANY unapproved, non-superuser role still holds
+-- effective EXECUTE — because the role graph changed mid-flight, or because
+-- membership-derived access survived the direct-ACL reset — the exception rolls
+-- back the ENTIRE transaction: the verifier replacement, the owner reset, and
+-- every grant change. This patch never repairs cluster role memberships.
+-- ---------------------------------------------------------------------------
+DO $r15_2c_postcheck$
+DECLARE
+  v_verifier oid;
+  v_owner    oid;
+  v_unexpected text;
+BEGIN
+  v_verifier := to_regprocedure('public.qhub_verify_commercial_schema()');
+  IF v_verifier IS NULL THEN
+    RAISE EXCEPTION 'R15.2C: verifier missing after patch — aborting the transaction';
+  END IF;
+
+  SELECT c.relowner INTO v_owner
+    FROM pg_class c
+   WHERE c.oid = to_regclass('public.qhub_manual_review_requests');
+  IF v_owner IS NULL THEN
+    RAISE EXCEPTION 'R15.2C: cannot resolve the contract owner from public.qhub_manual_review_requests';
+  END IF;
+
+  SELECT string_agg(r.rolname, ', ' ORDER BY r.rolname)
+    INTO v_unexpected
+    FROM pg_roles r
+   WHERE NOT r.rolsuper
+     AND r.oid IS DISTINCT FROM v_owner
+     AND r.rolname <> 'service_role'
+     AND has_function_privilege(r.oid, v_verifier, 'EXECUTE');
+
+  IF v_unexpected IS NOT NULL THEN
+    RAISE EXCEPTION 'unexpected_effective_verifier_executor_post_patch: % — the role graph still confers EXECUTE after the exact direct-ACL reset; rolling back the entire patch. This patch will NOT modify cluster role memberships. STOP and escalate with a separately reviewed plan.', v_unexpected;
+  END IF;
+END;
+$r15_2c_postcheck$;
 
 COMMIT;
