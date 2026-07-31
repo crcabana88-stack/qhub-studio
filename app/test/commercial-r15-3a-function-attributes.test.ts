@@ -332,13 +332,11 @@ describe('R15.3A — 10 STOPs on every semantic attribute drift', () => {
 
       for (const row of detail) {
         for (const [k, v] of Object.entries(row)) {
-          if (
-            typeof v === 'boolean' &&
-            k !== 'already_reviewed' &&
-            k !== 'live_strict' &&
-            k !== 'live_leakproof' &&
-            k !== 'live_retset'
-          ) {
+          /*
+           * `live_*` columns are raw catalog values reported as escalation evidence, not
+           * pass/fail flags — several are legitimately false on a healthy database.
+           */
+          if (typeof v === 'boolean' && k !== 'already_reviewed' && !k.startsWith('live_')) {
             expect(v, `${row.proname}.${k} should hold`).toBe(true);
           }
         }

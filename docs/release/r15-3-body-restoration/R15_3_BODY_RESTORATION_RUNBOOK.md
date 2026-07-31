@@ -81,6 +81,38 @@ and erase the evidence. `10`, `11` and `12` therefore bind the **complete** cont
 **Any** strictness, parallel-safety, volatility, leakproof, cost, rows, owner, security-mode,
 `search_path`, ACL or signature drift is a **STOP** at `10` and a **NOT READY** at `12`.
 
+## Callable-interface / default-argument contract (R15.3B)
+
+**Identity arguments are not sufficient.** `pg_get_function_identity_arguments()` deliberately
+**excludes** argument defaults, so adding `p_policy_version TEXT DEFAULT NULL` leaves *both* the
+identity arguments *and* the raw `prosrc` digest completely unchanged — while creating a new callable
+arity. Verified directly: with the reviewed body intact and one default added,
+`SELECT public.qhub_decide_review(uuid, text, boolean, text, text)` **succeeded**, passing
+`p_policy_version = NULL` into a SECURITY DEFINER decision RPC.
+
+The reviewed contract for **both** functions is:
+
+| property | reviewed value |
+|---|---|
+| `pronargs` | 6 (`qhub_decide_review`) / 0 (`qhub_row_immutable`) |
+| `pronargdefaults` | **0** |
+| `proargdefaults` | **NULL** |
+| `pg_get_function_arguments()` | exactly the reviewed argument list, with **no** `DEFAULT` |
+| `proargnames` | exact names / NULL |
+| `proargmodes` | **NULL** (every argument plain `IN`) |
+| `proallargtypes` | **NULL** (no OUT/TABLE arguments) |
+| `proargtypes` | exact type OIDs |
+| `provariadic` | 0 |
+| `probin` / `prosqlbody` | **NULL** (the body lives in `prosrc`, where the digest can see it) |
+
+**Any argument default is a STOP** — at `10`, inside `11`'s Gate 1 (raising
+`unexpected_function_default_argument_state`), and at `12`.
+
+> **`11` cannot and will not remove a default.** PostgreSQL itself refuses:
+> *"cannot remove parameter defaults from existing function"*. Removing one requires `DROP FUNCTION`
+> plus a recreate, which this package deliberately does **not** do. If `10` reports a default, STOP and
+> escalate with a separately reviewed plan.
+
 > **`11` refuses; it does not repair.** If `10` reports attribute drift, `11` raises before touching
 > anything and the drift is left in place as escalation evidence. Do not "fix" it by running `11`
 > anyway — that would destroy the only record that a `SECURITY DEFINER` decision function had been
@@ -127,10 +159,12 @@ The **last** result is the verdict:
 
 Three distinct STOP causes, and they are not interchangeable:
 - `already_reviewed_count > 0` — the restoration has already run. Skip to Step 4 (`12`).
-- `attributes_ok_count < 2` — an **attribute or authority drift** (strictness, parallel safety,
-  volatility, leakproof, cost, rows, owner, security mode, `search_path`, ACL, signature, overload).
+- `attributes_ok_count < 2` — an **attribute, authority or callable-interface drift** (strictness,
+  parallel safety, volatility, leakproof, cost, rows, owner, security mode, `search_path`, ACL,
+  signature, overload, **any argument default**, argument names/modes/types, `probin`/`prosqlbody`).
   **STOP and escalate. Do not run `11`** — it will refuse anyway, and running it is not a fix.
-  QUERY 1 shows exactly which flag failed and the live value beside it.
+  QUERY 1 shows exactly which flag failed and the live value beside it; for a default, look at
+  `no_arg_defaults`, `live_nargdefaults` and `live_full_arguments`.
 - a body is some **third** unknown value — unexplained drift that this package is not authorised to
   repair. Escalate; do **not** restore.
 
@@ -163,11 +197,14 @@ Copy `12_POST_RESTORE_BODY_VERIFY.sql` → new query → Run in full. It is one 
 transaction producing one authoritative statement (two rows, one per function).
 
 Require **`final_status = R15_3_REVIEWED_BODIES_RESTORED`** and `function_ok = true` on both rows. Every
-displayed check feeds that verdict: identity, no overload, language, prokind, return type, owner,
-security mode, `search_path`, ACL, effective ACL, volatility, strictness, parallel safety, leakproof,
-set-returning flag, cost, rows estimate, variadic, support function, transforms, the reviewed body
-digest, and mojibake cleared. A **correct body with a drifted attribute is NOT READY** — that is the
-R15.3A closure, and `body_reviewed` will read `true` beside the failing attribute flag so the cause is
+displayed check feeds that verdict: identity, no overload, language, prokind, return type, the full
+callable interface (`pg_get_function_arguments()`, `pronargs`, **no argument defaults**, argument
+names/modes/types, no alternate arity), owner, security mode, `search_path`, ACL, effective ACL,
+volatility, strictness, parallel safety, leakproof, set-returning flag, cost, rows estimate, variadic,
+support function, transforms, `probin`/`prosqlbody`, the reviewed body digest, and mojibake cleared.
+
+A **correct body with a drifted attribute or an added argument default is NOT READY** — that is the
+R15.3A/R15.3B closure. `body_reviewed` will read `true` beside the failing flag so the cause is
 unambiguous.
 
 The two ACL contracts differ **by design**: `qhub_decide_review` requires service_role EXECUTE without
@@ -223,8 +260,10 @@ founder UUID, email, org ID and roles before any seed.
 - Migration SHA-256 is not `b5f0a466f293212812a8ea3d71d6c650ca7af30255275ef248cb420910a0d1cf`
 - `10` returns `UNEXPECTED_LIVE_BODY_STOP` for any reason other than "already restored"
 - `10` reports any attribute/authority drift (`attributes_ok = false`) — escalate; **do not run `11`**
-- `11` raises — `R15.3 PRE: ... drifted` (attribute drift; escalate) or
-  `R15.3 POST: ... STILL the mojibake body` (bad transfer channel; re-copy with `-Encoding UTF8`)
+- `11` raises — `unexpected_function_default_argument_state` (an argument default or callable-interface
+  drift; escalate, and note the package will never remove a default), `R15.3 PRE: ... drifted`
+  (attribute drift; escalate) or `R15.3 POST: ... STILL the mojibake body` (bad transfer channel;
+  re-copy with `-Encoding UTF8`)
 - `12` is not exactly `R15_3_REVIEWED_BODIES_RESTORED`
 - `07` is not `SAFE_TO_APPLY_EXACT_DUAL_DIGEST_PATCH`, or `09` is not `R15_2_VERIFIER_READY`
 - Any SQL error while running any file — do not retry fragments

@@ -21,6 +21,17 @@
 -- alongside identity, owner, security mode, search_path, ACL and the raw body digest.
 -- A restored body with drifted strictness or parallel safety is NOT READY.
 --
+-- R15.3B — CALLABLE-INTERFACE CERTIFICATION. pg_get_function_identity_arguments()
+-- EXCLUDES argument defaults, so a trailing `DEFAULT NULL` leaves both the identity
+-- arguments and the raw prosrc digest completely unchanged while adding a NEW callable
+-- arity. Independently verified against this package: with the reviewed body intact and
+-- one default added, this file previously returned R15_3_REVIEWED_BODIES_RESTORED while
+--     SELECT public.qhub_decide_review(uuid, text, boolean, text, text)
+-- SUCCEEDED — a five-argument call into a SECURITY DEFINER decision RPC with
+-- p_policy_version silently NULL. The verdict therefore now also requires
+-- pg_get_function_arguments(), pronargs, pronargdefaults = 0, proargdefaults IS NULL,
+-- proargnames, proargmodes, proallargtypes, proargtypes and provariadic to be exact.
+--
 -- THE TWO CONTRACTS DIFFER, AND THAT IS DELIBERATE:
 --
 --   public.qhub_decide_review(uuid,text,boolean,text,text,text)
@@ -43,26 +54,31 @@
 BEGIN;
 SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY;
 
-WITH target(signature, proname, identity_arguments, owner_table,
+WITH target(signature, proname, identity_arguments, full_arguments, owner_table,
             expect_lang, expect_kind, expect_rettype, expect_secdef, expect_config,
             expect_volatile, expect_strict, expect_parallel, expect_leakproof,
             expect_retset, expect_cost, expect_rows, expect_variadic, expect_default_acl,
+            expect_nargs, expect_argnames, expect_argtypes,
             lf_digest, crlf_digest, mojibake_digest) AS (
   VALUES
     ('public.qhub_decide_review(uuid,text,boolean,text,text,text)', 'qhub_decide_review',
+     'p_request_id uuid, p_actor text, p_is_staff boolean, p_decision text, p_reason text, p_policy_version text',
      'p_request_id uuid, p_actor text, p_is_staff boolean, p_decision text, p_reason text, p_policy_version text',
      'public.qhub_manual_review_requests',
      'plpgsql', 'f', 'jsonb', TRUE, ARRAY['search_path=pg_catalog, public'],
      'v', FALSE, 'u', FALSE,
      FALSE, 100::real, 0::real, 0::oid, FALSE,
+     6, ARRAY['p_request_id','p_actor','p_is_staff','p_decision','p_reason','p_policy_version'], '2950 25 16 25 25 25',
      '7e678f1e4bba0c540507cfe3743fbe54', 'dac8abcd56d7fc804baac660059c14bf',
      '9bc91d1671c5f65241ea22538c00d703'),
     ('public.qhub_row_immutable()', 'qhub_row_immutable',
+     '',
      '',
      'public.qhub_acknowledgments',
      'plpgsql', 'f', 'trigger', FALSE, NULL::text[],
      'v', FALSE, 'u', FALSE,
      FALSE, 100::real, 0::real, 0::oid, TRUE,
+     0, NULL::text[], '',
      '41ae59dde9a471b580d28e2cb45984f5', '4936e3f58627dde5abc10d2b0ecf5b4f',
      '583882c1a9b203e278b27d1080065c9e')
 ),
@@ -73,7 +89,9 @@ base AS (
   SELECT o.*, p.oid, p.proowner, p.prosecdef, p.proconfig, p.prosrc, p.proacl,
          p.provolatile, p.proisstrict, p.proparallel, p.proleakproof, p.proretset,
          p.procost, p.prorows, p.provariadic, p.prosupport, p.protrftypes,
-         p.prokind, p.prorettype, l.lanname
+         p.prokind, p.prorettype, p.pronargs, p.pronargdefaults, p.proargdefaults,
+         p.proargnames, p.proargmodes, p.proallargtypes, p.proargtypes,
+         p.probin, p.prosqlbody, l.lanname
     FROM obj o
     LEFT JOIN pg_proc p ON p.oid = o.regproc
     LEFT JOIN pg_language l ON l.oid = p.prolang
@@ -90,6 +108,18 @@ checks AS (
     coalesce(b.lanname = b.expect_lang, FALSE)                                   AS language_exact,
     coalesce(b.prokind = b.expect_kind, FALSE)                                   AS prokind_exact,
     coalesce(b.prorettype = b.expect_rettype::regtype, FALSE)                    AS rettype_exact,
+    -- CALLABLE INTERFACE (R15.3B) — identity arguments alone are NOT sufficient,
+    -- because PostgreSQL excludes argument defaults from them.
+    coalesce(pg_get_function_arguments(b.oid) = b.full_arguments, FALSE)         AS full_arguments_exact,
+    coalesce(b.pronargs = b.expect_nargs, FALSE)                                 AS nargs_exact,
+    coalesce(b.pronargdefaults = 0, FALSE)                                       AS no_arg_defaults,
+    (b.oid IS NOT NULL AND b.proargdefaults IS NULL)                             AS no_default_expressions,
+    coalesce(b.proargnames IS NOT DISTINCT FROM b.expect_argnames, FALSE)        AS argnames_exact,
+    (b.oid IS NOT NULL AND b.proargmodes IS NULL)                                AS argmodes_plain_in,
+    (b.oid IS NOT NULL AND b.proallargtypes IS NULL)                             AS no_out_or_table_args,
+    coalesce(b.proargtypes::text = b.expect_argtypes, FALSE)                     AS argtypes_exact,
+    -- With zero defaults and no VARIADIC, the ONLY callable arity is pronargs.
+    coalesce(b.pronargdefaults = 0 AND b.provariadic = 0::oid, FALSE)            AS no_alternate_arity,
     -- AUTHORITY
     coalesce(b.proowner = (SELECT c.relowner FROM pg_class c WHERE c.oid = to_regclass(b.owner_table)), FALSE)
                                                                                  AS owner_exact,
@@ -106,6 +136,11 @@ checks AS (
     coalesce(b.provariadic = b.expect_variadic, FALSE)                           AS variadic_exact,
     coalesce(b.prosupport = 0::oid, FALSE)                                       AS no_support_function,
     (b.oid IS NOT NULL AND b.protrftypes IS NULL)                                AS no_transforms,
+    -- BODY CARRIER: a plpgsql function stores its source in prosrc alone. probin is set
+    -- only for C-language functions and prosqlbody only for SQL-standard BEGIN ATOMIC
+    -- bodies; either being non-NULL means the body lives somewhere the digest cannot see.
+    (b.oid IS NOT NULL AND b.probin IS NULL)                                     AS no_c_binary_link,
+    (b.oid IS NOT NULL AND b.prosqlbody IS NULL)                                 AS no_sql_standard_body,
     -- BODY: raw digest, dual reviewed encodings, NO normalization
     coalesce(md5(b.prosrc) IN (b.lf_digest, b.crlf_digest), FALSE)               AS body_reviewed,
     coalesce(md5(b.prosrc) <> b.mojibake_digest, FALSE)                          AS mojibake_cleared,
@@ -143,10 +178,14 @@ verdict AS (
     c.*,
     (c.function_present AND c.signature_exact AND c.single_function_no_overload
      AND c.language_exact AND c.prokind_exact AND c.rettype_exact
+     AND c.full_arguments_exact AND c.nargs_exact AND c.no_arg_defaults
+     AND c.no_default_expressions AND c.argnames_exact AND c.argmodes_plain_in
+     AND c.no_out_or_table_args AND c.argtypes_exact AND c.no_alternate_arity
      AND c.owner_exact AND c.security_mode_exact AND c.search_path_exact
      AND c.volatility_exact AND c.strictness_exact AND c.parallel_safety_exact
      AND c.leakproof_exact AND c.retset_exact AND c.cost_exact AND c.rows_exact
      AND c.variadic_exact AND c.no_support_function AND c.no_transforms
+     AND c.no_c_binary_link AND c.no_sql_standard_body
      AND c.body_reviewed AND c.mojibake_cleared
      AND c.acl_exact AND c.effective_acl_ok)                                     AS function_ok
   FROM checks c
@@ -160,6 +199,16 @@ SELECT
   language_exact,
   prokind_exact,
   rettype_exact,
+  -- callable interface (R15.3B)
+  full_arguments_exact,
+  nargs_exact,
+  no_arg_defaults,
+  no_default_expressions,
+  argnames_exact,
+  argmodes_plain_in,
+  no_out_or_table_args,
+  argtypes_exact,
+  no_alternate_arity,
   -- authority
   owner_exact,
   security_mode_exact,
@@ -177,12 +226,17 @@ SELECT
   variadic_exact,
   no_support_function,
   no_transforms,
+  no_c_binary_link,
+  no_sql_standard_body,
   -- body
   body_reviewed,
   mojibake_cleared,
   -- live values, for escalation evidence
   md5(prosrc)                                        AS live_raw_md5_prosrc,
   octet_length(prosrc)                               AS live_bytes,
+  pg_get_function_arguments(oid)                     AS live_full_arguments,
+  pronargdefaults                                    AS live_nargdefaults,
+  (proargdefaults IS NOT NULL)                       AS live_has_default_expressions,
   (md5(prosrc) = lf_digest)                          AS restored_as_lf,
   (md5(prosrc) = crlf_digest)                        AS restored_as_crlf,
   provolatile                                        AS live_volatility,
