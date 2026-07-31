@@ -435,7 +435,13 @@ describe('TEST 4: Browser-supplied identity claims are ignored', () => {
 
     const response = await action({ request, context: {} as any, params: {} });
     expect(response.status).toBe(401);
-  });
+
+    /*
+     * Explicit timeout: this case does a real dynamic import of the route module, which under a fully
+     * parallel suite run can exceed vitest's 5s default purely through CPU contention (it completes in
+     * well under a second on its own). The assertion is unchanged; only the deadline is realistic.
+     */
+  }, 30_000);
 });
 
 // ─── Test 5: No session → production deploy BLOCKED ──────────────────────────
