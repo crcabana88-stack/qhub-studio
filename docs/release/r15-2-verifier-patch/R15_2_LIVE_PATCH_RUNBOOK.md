@@ -1,5 +1,11 @@
 # QHUB R15.2 — Live Verifier Exact Dual-Digest Patch Runbook
 
+> **SUPERSEDED (R15.5).** This package remains reviewed history, but its verifier body predates the
+> R15.4 trigger-helper ACL contract and **must not be installed as the operational verifier patch**.
+> The final live sequence uses `docs/release/r15-5-runtime-verifier/` (13/14/15 →
+> `R15_5_VERIFIER_READY`) after the R15.3/R15.4 body+ACL restoration (10/11/12). See
+> `docs/release/r15-5-runtime-verifier/R15_5_RUNTIME_VERIFIER_RUNBOOK.md`.
+
 Human-operated. Fixes the five `*_body_drift` verifier failures on the live database by making the body
 pins accept exactly the two separately reviewed encodings of each reviewed body.
 

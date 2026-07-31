@@ -1,6 +1,6 @@
 # QHUB R15.3 — Encoding-Safe Protected-Body Restoration Runbook
 
-Human-operated. Restores **two** live function bodies to their exact reviewed text so the R15.2C
+Human-operated. Restores **two** live function bodies to their exact reviewed text so the R15.5 runtime-
 verifier package can proceed. Nothing else on the database is touched.
 
 ## Why this exists
@@ -33,11 +33,11 @@ reviewed migration is correct and is **not** changed by this package.
 | Branch | `commercial-launch-foundation` |
 | Base main | `6ab2c2bc82dc67a3073de1eb457583773cab0ac6` |
 | Migration | `supabase/migrations/20260729_commercial_launch_foundation.sql` |
-| Migration SHA-256 | `17f6ee4d014979f5459fc6c553219a162a2ed7e9fdc3d97de855c90aa978d70f` |
+| Migration SHA-256 | `f893fb9883835b5212a0aa823f8b3b33c5c28b116d0ab6922795fd48fe6a860a` |
 | Schema version | `2026-07-30.commercial-launch-r8` |
 | Live project reference | `jsjsanmaahvmynblmzkq` |
 | This package | `docs/release/r15-3-body-restoration/` |
-| Verifier package (runs after) | `docs/release/r15-2-verifier-patch/` |
+| Verifier package (runs after) | `docs/release/r15-5-runtime-verifier/` (supersedes `r15-2-verifier-patch/`) |
 
 The release commit hash is deliberately **not** printed here — a commit cannot contain its own hash. Take
 it from the final review report and verify it in Step 1.
@@ -214,7 +214,7 @@ git -C "C:\Users\ccaba\qhub-studio\.claude\worktrees\commercial-launch-foundatio
 
 Require, in order: branch is `commercial-launch-foundation`; `HEAD` **equals** `origin/...`; both equal the
 commit in the final review report; migration SHA-256 is exactly
-`17f6ee4d014979f5459fc6c553219a162a2ed7e9fdc3d97de855c90aa978d70f`. **STOP** on any mismatch — and never
+`f893fb9883835b5212a0aa823f8b3b33c5c28b116d0ab6922795fd48fe6a860a`. **STOP** on any mismatch — and never
 edit a file to make a hash match.
 
 > **Run each file IN FULL, as one unit.** Each opens and closes its own transaction. On any SQL error,
@@ -255,9 +255,10 @@ Copy `11_RESTORE_REVIEWED_PROTECTED_BODIES.sql` with the encoding-safe command �
 It replaces only the two function bodies using text extracted **verbatim** from the reviewed migration
 (everything from `AS $$` onward is byte-for-byte; the headers additionally state the reviewed attribute
 contract explicitly, which does not affect `prosrc` and so does not affect the digest). It restates
-`qhub_decide_review`'s exact owner and ACL, and issues **no** grant, revoke or owner change for
-`qhub_row_immutable` (whose reviewed contract is "no grants"). It creates no overload, alters no other
-object, mutates no data, and never touches cluster role memberships. It is idempotent.
+`qhub_decide_review`'s exact owner and ACL, and (R15.4) **normalizes `qhub_row_immutable`'s ACL** from
+the documented five-row Supabase-default set to the reviewed owner-only contract, using the identical
+statements the migration now contains. It creates no overload, alters no other object, mutates no
+data, and never touches cluster role memberships. It is idempotent under the final reviewed state.
 
 **Gate 1** re-asserts the complete identity + attribute + authority contract before any change and
 raises on the first mismatch. **Gate 2** re-asserts all of it again *before* `COMMIT`, so a single
@@ -283,32 +284,36 @@ A **correct body with a drifted attribute or an added argument default is NOT RE
 R15.3A/R15.3B closure. `body_reviewed` will read `true` beside the failing flag so the cause is
 unambiguous.
 
-The two ACL contracts differ **by design**: `qhub_decide_review` requires service_role EXECUTE without
-grant option with PUBLIC/anon/authenticated denied and no unexpected direct or effective executor;
-`qhub_row_immutable` is a trigger function the reviewed migration deliberately grants nothing, so its
-exact reviewed state is `proacl IS NULL` (PUBLIC default) and the effective-executor test is reported
-not-applicable rather than failed. Requiring a browser-denied ACL there would be a false failure — R15.2C's
-own verifier does not pin it either.
+The two final ACL contracts differ **by design** (R15.4): `qhub_decide_review` requires exactly its
+two reviewed rows — the owner's and service_role's EXECUTE, neither grantable — with
+PUBLIC/anon/authenticated denied and no unexpected direct or effective executor; `qhub_row_immutable`
+requires **exactly one row, the owner's own EXECUTE**. Trigger execution does not require browser or
+service_role direct EXECUTE at fire time — PostgreSQL checks EXECUTE at `CREATE TRIGGER` time, which
+was verified before the contract was adopted — so no other grant exists or is needed.
 
 | Status | Action |
 |---|---|
 | `R15_3_REVIEWED_BODIES_RESTORED` | Continue to Step 5. |
 | `R15_3_BODY_RESTORE_NOT_READY` | **STOP.** Capture both rows and escalate. |
 
-## Step 5 — Run the already-reviewed R15.2C verifier package
+## Step 5 — Run the R15.5 runtime-verifier package
 
-Now, and only now, proceed through `docs/release/r15-2-verifier-patch/` exactly as its own runbook
+**R15.5 supersedes R15.2C (`07/08/09`) as the operational verifier patch.** The R15.2C package
+remains reviewed history and its discipline is carried forward verbatim inside R15.5, but its
+verifier body predates the R15.4 trigger-ACL contract and must not be installed after it.
+
+Now, and only now, proceed through `docs/release/r15-5-runtime-verifier/` exactly as its own runbook
 specifies — same encoding-safe copy command for every file:
 
-1. `07_PRE_PATCH_EXACT_DIGEST_VERIFY.sql` → require `SAFE_TO_APPLY_EXACT_DUAL_DIGEST_PATCH`
-2. `08_LIVE_VERIFIER_EXACT_DUAL_DIGEST_PATCH.sql` → run once
-3. `09_POST_PATCH_VERIFY.sql` → require `R15_2_VERIFIER_READY`
+1. `13_PRE_PATCH_RUNTIME_VERIFIER_VERIFY.sql` → require `SAFE_TO_APPLY_RUNTIME_VERIFIER_PATCH`
+2. `14_LIVE_RUNTIME_VERIFIER_TRIGGER_ACL_PATCH.sql` → run once
+3. `15_POST_PATCH_RUNTIME_VERIFIER_VERIFY.sql` → require **`R15_5_VERIFIER_READY`**
 
-`08` installs the verifier whose **own** body `09` digest-pins. If `08` is transferred through a mangling
-channel the verifier body becomes mojibake and `09`'s `body_approved` fails — the same defect, one level
-up. Use the encoding-safe command.
+`14` installs the verifier whose **own** body `15` digest-pins, and additionally verifies its own
+installed digest before COMMIT — if the transfer channel mangles it, the whole transaction rolls
+back. Use the encoding-safe command anyway.
 
-## Step 6 — Mark migration history (only after Step 5 returns READY)
+## Step 6 — Mark migration history (only after Step 5 returns `R15_5_VERIFIER_READY`)
 
 ```bash
 npx --yes supabase@2.110.0 migration repair --status applied 20260729
@@ -333,7 +338,7 @@ founder UUID, email, org ID and roles before any seed.
 
 - Branch is not `commercial-launch-foundation`, or local and origin HEAD differ
 - HEAD does not equal the commit in the final review report
-- Migration SHA-256 is not `17f6ee4d014979f5459fc6c553219a162a2ed7e9fdc3d97de855c90aa978d70f`
+- Migration SHA-256 is not `f893fb9883835b5212a0aa823f8b3b33c5c28b116d0ab6922795fd48fe6a860a`
 - `10` returns `UNEXPECTED_LIVE_BODY_STOP` for any reason other than "already restored"
 - `10` reports any attribute/authority drift (`attributes_ok = false`) — escalate; **do not run `11`**
 - `11` raises — `unexpected_function_acl_state` (direct-ACL drift, including a missing **owner** EXECUTE
@@ -342,7 +347,7 @@ founder UUID, email, org ID and roles before any seed.
   `R15.3 PRE: ... drifted` (attribute drift; escalate) or `R15.3 POST: ... STILL the mojibake body`
   (bad transfer channel; re-copy with `-Encoding UTF8`)
 - `12` is not exactly `R15_3_REVIEWED_BODIES_RESTORED`
-- `07` is not `SAFE_TO_APPLY_EXACT_DUAL_DIGEST_PATCH`, or `09` is not `R15_2_VERIFIER_READY`
+- `13` is not `SAFE_TO_APPLY_RUNTIME_VERIFIER_PATCH`, or `15` is not `R15_5_VERIFIER_READY`
 - Any SQL error while running any file — do not retry fragments
 - Any prompt for `--include-all`, reset, force, or replay of prior migrations
 

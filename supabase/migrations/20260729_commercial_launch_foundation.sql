@@ -2234,6 +2234,94 @@ BEGIN
     v_failed := v_failed || 'r7_authority_row_missing'::text;
   END IF;
 
+  /*
+   * R15.5 — trigger-helper authority contract for public.qhub_row_immutable().
+   *
+   * R15.4 made the helper's ACL explicit and least-privilege: exactly ONE row, the
+   * owner's own EXECUTE (granted by the owner, not grantable); PUBLIC, anon,
+   * authenticated and service_role all denied. Revoking is safe because PostgreSQL
+   * checks EXECUTE on a trigger function at CREATE TRIGGER time, not at fire time
+   * (verified before adoption). This block makes the RUNTIME verifier enforce that
+   * contract — before R15.5 a `GRANT EXECUTE ... TO anon` on the helper still
+   * reported ready=true (independently reproduced), a false READY.
+   *
+   * Labels are stable and specific so each condition is independently actionable.
+   * Missing function fails closed: to_regprocedure() yields NULL, every EXISTS
+   * below is false, and the identity/ACL labels fire rather than silently passing.
+   */
+  PERFORM 1 FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace
+    WHERE n.nspname='public' AND p.proname='qhub_row_immutable'
+      AND NOT p.prosecdef AND p.proconfig IS NULL
+      AND p.prorettype = 'trigger'::regtype AND p.prokind = 'f'
+      AND p.pronargs = 0 AND p.pronargdefaults = 0 AND p.provariadic = 0
+      AND p.proowner = (SELECT relowner FROM pg_class WHERE oid='public.qhub_acknowledgments'::regclass);
+  IF NOT FOUND THEN v_failed := v_failed || 'row_immutable_identity'::text; END IF;
+
+  IF (SELECT count(*) FROM pg_proc p, aclexplode(p.proacl) ae
+       WHERE p.oid = to_regprocedure('public.qhub_row_immutable()')) IS DISTINCT FROM 1 THEN
+    v_failed := v_failed || 'row_immutable_acl_cardinality'::text;
+  END IF;
+  IF NOT EXISTS (SELECT 1 FROM pg_proc p, aclexplode(p.proacl) ae
+       WHERE p.oid = to_regprocedure('public.qhub_row_immutable()')
+         AND ae.grantee = p.proowner AND ae.privilege_type = 'EXECUTE'
+         AND ae.grantor = p.proowner AND NOT ae.is_grantable) THEN
+    v_failed := v_failed || 'row_immutable_acl_owner_entry'::text;
+  END IF;
+  -- Any grantee other than the owner (PUBLIC = grantee 0, anon, authenticated,
+  -- service_role, or anything else) is forbidden by the reviewed contract.
+  IF EXISTS (SELECT 1 FROM pg_proc p, aclexplode(p.proacl) ae
+       WHERE p.oid = to_regprocedure('public.qhub_row_immutable()')
+         AND ae.grantee <> p.proowner) THEN
+    v_failed := v_failed || 'row_immutable_acl_unexpected_grantee'::text;
+  END IF;
+  IF EXISTS (SELECT 1 FROM pg_proc p, aclexplode(p.proacl) ae
+       WHERE p.oid = to_regprocedure('public.qhub_row_immutable()')
+         AND ae.is_grantable) THEN
+    v_failed := v_failed || 'row_immutable_acl_grant_option'::text;
+  END IF;
+
+  /*
+   * R15.5 — the three immutability triggers, derived from this migration's own
+   * trigger-creation loop: trg_<table>_immutable BEFORE UPDATE OR DELETE FOR EACH
+   * ROW on qhub_acknowledgments, qhub_usage_ledger and qhub_entitlement_audit, each
+   * bound to EXACTLY public.qhub_row_immutable() and enabled ('O'). The binding is
+   * checked by exact name + table + function OID + timing/event bits, so a renamed,
+   * rebound or replacement trigger cannot satisfy a count, and an unrelated extra
+   * trigger satisfies nothing. tgtype bits: 1=FOR EACH ROW, 2=BEFORE, 8=DELETE,
+   * 16=UPDATE.
+   */
+  FOR t IN SELECT unnest(ARRAY['qhub_acknowledgments','qhub_usage_ledger','qhub_entitlement_audit']) LOOP
+    IF NOT EXISTS (
+      SELECT 1 FROM pg_trigger tg
+      WHERE tg.tgname = 'trg_' || t || '_immutable'
+        AND tg.tgrelid = to_regclass('public.' || t)
+        AND NOT tg.tgisinternal
+        AND tg.tgfoid = to_regprocedure('public.qhub_row_immutable()')
+        AND (tg.tgtype & 1) <> 0 AND (tg.tgtype & 2) <> 0
+        AND (tg.tgtype & 8) <> 0 AND (tg.tgtype & 16) <> 0
+    ) THEN
+      IF NOT EXISTS (
+        SELECT 1 FROM pg_trigger tg
+        WHERE tg.tgname = 'trg_' || t || '_immutable'
+          AND tg.tgrelid = to_regclass('public.' || t)
+          AND NOT tg.tgisinternal
+      ) THEN
+        v_failed := v_failed || ('row_immutable_trigger_missing:' || t);
+      ELSE
+        v_failed := v_failed || ('row_immutable_trigger_binding:' || t);
+      END IF;
+    END IF;
+    IF EXISTS (
+      SELECT 1 FROM pg_trigger tg
+      WHERE tg.tgname = 'trg_' || t || '_immutable'
+        AND tg.tgrelid = to_regclass('public.' || t)
+        AND NOT tg.tgisinternal
+        AND tg.tgenabled <> 'O'
+    ) THEN
+      v_failed := v_failed || ('row_immutable_trigger_disabled:' || t);
+    END IF;
+  END LOOP;
+
   RETURN jsonb_build_object(
     'expected_version', '2026-07-30.commercial-launch-r8',
     'ready', (cardinality(v_failed) = 0),
