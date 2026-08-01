@@ -2139,13 +2139,22 @@ BEGIN
       AND (tg.tgtype & 8) <> 0          -- DELETE
       AND (tg.tgtype & 16) <> 0         -- UPDATE
       AND tg.tgenabled = 'O'            -- enabled (origin/always)
-      AND tg.tgfoid = 'public.qhub_row_immutable()'::regprocedure
+      -- R15.6: to_regprocedure, not a hard ::regprocedure cast — the cast raised
+      -- 42883 when the helper was dropped, turning fail-closed drift into an
+      -- ERROR instead of a NOT READY verdict. NULL matches no tgfoid, so the
+      -- r7_ack_immutable_trigger label fires exactly as intended.
+      AND tg.tgfoid = to_regprocedure('public.qhub_row_immutable()')
   ) THEN
     v_failed := v_failed || 'r7_ack_immutable_trigger'::text;
   END IF;
+  -- R15.6: pinned to the exact zero-argument signature. The bare-proname subquery
+  -- raised 21000 (more than one row) when an overload existed, turning the whole
+  -- verifier into an ERROR instead of a NOT READY verdict; to_regprocedure keeps
+  -- the identical digest semantics and lets the overload itself be reported by
+  -- row_immutable_callable_interface.
   IF NOT coalesce(
-       (SELECT md5(p.prosrc) FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace
-          WHERE n.nspname='public' AND p.proname='qhub_row_immutable')
+       (SELECT md5(p.prosrc) FROM pg_proc p
+          WHERE p.oid = to_regprocedure('public.qhub_row_immutable()'))
        IN ('41ae59dde9a471b580d28e2cb45984f5',   -- reviewed body, LF encoding
            '4936e3f58627dde5abc10d2b0ecf5b4f'),  -- reviewed body, CRLF encoding
      FALSE) THEN
@@ -2249,13 +2258,59 @@ BEGIN
    * Missing function fails closed: to_regprocedure() yields NULL, every EXISTS
    * below is false, and the identity/ACL labels fire rather than silently passing.
    */
+  /*
+   * R15.6 — the COMPLETE reviewed pg_proc contract, split into independently
+   * actionable labels. Every value below was derived from this migration in a
+   * disposable database (identical under plain PostgreSQL and Supabase default
+   * privileges), never guessed. Before R15.6, `ALTER FUNCTION ... IMMUTABLE
+   * STRICT PARALLEL SAFE LEAKPROOF COST 42` still reported ready=true
+   * (independently reproduced) — semantic drift on the helper was a false READY.
+   * Missing function fails closed: every PERFORM finds no row and all labels fire.
+   */
   PERFORM 1 FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace
     WHERE n.nspname='public' AND p.proname='qhub_row_immutable'
       AND NOT p.prosecdef AND p.proconfig IS NULL
-      AND p.prorettype = 'trigger'::regtype AND p.prokind = 'f'
-      AND p.pronargs = 0 AND p.pronargdefaults = 0 AND p.provariadic = 0
       AND p.proowner = (SELECT relowner FROM pg_class WHERE oid='public.qhub_acknowledgments'::regclass);
   IF NOT FOUND THEN v_failed := v_failed || 'row_immutable_identity'::text; END IF;
+  -- Callable interface: exactly one pg_proc row under this name, zero-argument
+  -- trigger function, no defaults, no variadic, no arg metadata, plpgsql.
+  PERFORM 1 FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace
+    JOIN pg_language l ON l.oid=p.prolang
+    WHERE n.nspname='public' AND p.proname='qhub_row_immutable'
+      AND p.prorettype = 'trigger'::regtype AND NOT p.proretset AND p.prokind = 'f'
+      AND p.pronargs = 0 AND p.pronargdefaults = 0 AND p.proargdefaults IS NULL
+      AND p.proargnames IS NULL AND p.proargmodes IS NULL AND p.proallargtypes IS NULL
+      AND p.proargtypes::text = '' AND p.provariadic = 0
+      AND pg_get_function_identity_arguments(p.oid) = ''
+      AND pg_get_function_arguments(p.oid) = ''
+      AND l.lanname = 'plpgsql'
+      AND (SELECT count(*) FROM pg_proc q JOIN pg_namespace qn ON qn.oid=q.pronamespace
+            WHERE qn.nspname='public' AND q.proname='qhub_row_immutable') = 1;
+  IF NOT FOUND THEN v_failed := v_failed || 'row_immutable_callable_interface'::text; END IF;
+  -- Semantic/planner attributes: the reviewed values are the CREATE FUNCTION
+  -- defaults, so a drift here is always an explicit ALTER someone must explain.
+  PERFORM 1 FROM pg_proc p
+    WHERE p.oid = to_regprocedure('public.qhub_row_immutable()')
+      AND p.provolatile = 'v' AND NOT p.proisstrict
+      AND p.proparallel = 'u' AND NOT p.proleakproof
+      AND p.procost = 100 AND p.prorows = 0;
+  IF NOT FOUND THEN v_failed := v_failed || 'row_immutable_semantic_attributes'::text; END IF;
+  -- Execution metadata: no support function, no transforms, no binary payload,
+  -- no SQL-standard body substitution.
+  PERFORM 1 FROM pg_proc p
+    WHERE p.oid = to_regprocedure('public.qhub_row_immutable()')
+      AND p.prosupport::oid = 0
+      AND coalesce(cardinality(p.protrftypes), 0) = 0
+      AND p.probin IS NULL AND p.prosqlbody IS NULL;
+  IF NOT FOUND THEN v_failed := v_failed || 'row_immutable_execution_metadata'::text; END IF;
+  -- Body: exact raw digest, reviewed LF or CRLF encoding only. The known live
+  -- mojibake digest is deliberately NOT accepted here — R15.3's restoration is
+  -- the only sanctioned path out of that state.
+  PERFORM 1 FROM pg_proc p
+    WHERE p.oid = to_regprocedure('public.qhub_row_immutable()')
+      AND md5(p.prosrc) IN ('41ae59dde9a471b580d28e2cb45984f5',
+                            '4936e3f58627dde5abc10d2b0ecf5b4f');
+  IF NOT FOUND THEN v_failed := v_failed || 'row_immutable_body_digest'::text; END IF;
 
   IF (SELECT count(*) FROM pg_proc p, aclexplode(p.proacl) ae
        WHERE p.oid = to_regprocedure('public.qhub_row_immutable()')) IS DISTINCT FROM 1 THEN
@@ -2285,10 +2340,17 @@ BEGIN
    * trigger-creation loop: trg_<table>_immutable BEFORE UPDATE OR DELETE FOR EACH
    * ROW on qhub_acknowledgments, qhub_usage_ledger and qhub_entitlement_audit, each
    * bound to EXACTLY public.qhub_row_immutable() and enabled ('O'). The binding is
-   * checked by exact name + table + function OID + timing/event bits, so a renamed,
+   * checked by exact name + table + function OID + EXACT tgtype, so a renamed,
    * rebound or replacement trigger cannot satisfy a count, and an unrelated extra
-   * trigger satisfies nothing. tgtype bits: 1=FOR EACH ROW, 2=BEFORE, 8=DELETE,
-   * 16=UPDATE.
+   * trigger satisfies nothing.
+   *
+   * R15.6: tgtype must EQUAL 27 (1 FOR EACH ROW + 2 BEFORE + 8 DELETE + 16 UPDATE),
+   * derived from this migration's own CREATE TRIGGER statements. Bit containment
+   * was insufficient — a trigger broadened to BEFORE INSERT OR UPDATE OR DELETE
+   * (tgtype 31) still contained every required bit and reported ready=true
+   * (independently reproduced). Equality forbids INSERT (4), TRUNCATE (32),
+   * INSTEAD OF (64), AFTER (bit 2 absent), statement-level (bit 1 absent) and any
+   * other extra or missing timing/event bit.
    */
   FOR t IN SELECT unnest(ARRAY['qhub_acknowledgments','qhub_usage_ledger','qhub_entitlement_audit']) LOOP
     IF NOT EXISTS (
@@ -2297,8 +2359,7 @@ BEGIN
         AND tg.tgrelid = to_regclass('public.' || t)
         AND NOT tg.tgisinternal
         AND tg.tgfoid = to_regprocedure('public.qhub_row_immutable()')
-        AND (tg.tgtype & 1) <> 0 AND (tg.tgtype & 2) <> 0
-        AND (tg.tgtype & 8) <> 0 AND (tg.tgtype & 16) <> 0
+        AND tg.tgtype = 27
     ) THEN
       IF NOT EXISTS (
         SELECT 1 FROM pg_trigger tg

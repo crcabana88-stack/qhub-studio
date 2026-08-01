@@ -152,15 +152,25 @@ describe('R15.2 — exactly two reviewed encodings are accepted', () => {
     expect(LF).not.toMatch(/translate\(p\.prosrc/);
     expect(LF).not.toMatch(/(btrim|ltrim|rtrim|trim)\(p\.prosrc/);
 
-    // Exactly five raw pins, each with one LF and one CRLF approved value.
-    expect((LF.match(/md5\(p\.prosrc\)/g) ?? []).length).toBe(5);
+    /*
+     * Six raw pins: the five R7-era per-function pins, plus R15.6's
+     * row_immutable_body_digest check, which re-pins the SAME two approved
+     * qhub_row_immutable digests under a row_immutable-scoped label.
+     */
+    expect((LF.match(/md5\(p\.prosrc\)/g) ?? []).length).toBe(6);
     expect((LF.match(/-- reviewed body, LF encoding/g) ?? []).length).toBe(5);
     expect((LF.match(/-- reviewed body, CRLF encoding/g) ?? []).length).toBe(5);
 
-    // Every approved digest constant is present exactly once.
-    for (const { lf, crlf } of Object.values(APPROVED_DIGESTS)) {
-      expect((LF.match(new RegExp(lf, 'g')) ?? []).length, `LF digest ${lf}`).toBe(1);
-      expect((LF.match(new RegExp(crlf, 'g')) ?? []).length, `CRLF digest ${crlf}`).toBe(1);
+    /*
+     * Every approved digest constant appears exactly at its pin sites — once per
+     * function, except qhub_row_immutable whose two digests appear exactly twice
+     * (the R7 pin and the R15.6 pin). No OTHER digest is ever added: the count
+     * being exact both ways is what forbids quietly blessing a new encoding.
+     */
+    for (const [proname, { lf, crlf }] of Object.entries(APPROVED_DIGESTS)) {
+      const expected = proname === 'qhub_row_immutable' ? 2 : 1;
+      expect((LF.match(new RegExp(lf, 'g')) ?? []).length, `LF digest ${lf}`).toBe(expected);
+      expect((LF.match(new RegExp(crlf, 'g')) ?? []).length, `CRLF digest ${crlf}`).toBe(expected);
     }
   });
 });

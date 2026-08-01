@@ -33,7 +33,7 @@ reviewed migration is correct and is **not** changed by this package.
 | Branch | `commercial-launch-foundation` |
 | Base main | `6ab2c2bc82dc67a3073de1eb457583773cab0ac6` |
 | Migration | `supabase/migrations/20260729_commercial_launch_foundation.sql` |
-| Migration SHA-256 | `f893fb9883835b5212a0aa823f8b3b33c5c28b116d0ab6922795fd48fe6a860a` |
+| Migration SHA-256 | `1509eb59056764b0b6500aa8bfbb2df65eb330a1ff363758bff0e4797427a755` |
 | Schema version | `2026-07-30.commercial-launch-r8` |
 | Live project reference | `jsjsanmaahvmynblmzkq` |
 | This package | `docs/release/r15-3-body-restoration/` |
@@ -214,7 +214,7 @@ git -C "C:\Users\ccaba\qhub-studio\.claude\worktrees\commercial-launch-foundatio
 
 Require, in order: branch is `commercial-launch-foundation`; `HEAD` **equals** `origin/...`; both equal the
 commit in the final review report; migration SHA-256 is exactly
-`f893fb9883835b5212a0aa823f8b3b33c5c28b116d0ab6922795fd48fe6a860a`. **STOP** on any mismatch — and never
+`1509eb59056764b0b6500aa8bfbb2df65eb330a1ff363758bff0e4797427a755`. **STOP** on any mismatch — and never
 edit a file to make a hash match.
 
 > **Run each file IN FULL, as one unit.** Each opens and closes its own transaction. On any SQL error,
@@ -338,7 +338,7 @@ founder UUID, email, org ID and roles before any seed.
 
 - Branch is not `commercial-launch-foundation`, or local and origin HEAD differ
 - HEAD does not equal the commit in the final review report
-- Migration SHA-256 is not `f893fb9883835b5212a0aa823f8b3b33c5c28b116d0ab6922795fd48fe6a860a`
+- Migration SHA-256 is not `1509eb59056764b0b6500aa8bfbb2df65eb330a1ff363758bff0e4797427a755`
 - `10` returns `UNEXPECTED_LIVE_BODY_STOP` for any reason other than "already restored"
 - `10` reports any attribute/authority drift (`attributes_ok = false`) — escalate; **do not run `11`**
 - `11` raises — `unexpected_function_acl_state` (direct-ACL drift, including a missing **owner** EXECUTE

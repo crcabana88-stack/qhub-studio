@@ -6,11 +6,20 @@
 --
 -- Identical architecture to the Codex-approved R15.2C 09 (single snapshot, single
 -- authoritative statement, guarded query_to_xml invocation, effective-executor
--- contract). Only the verifier's own approved body digests changed — they now pin
--- the R15.5 body, whose new row_immutable ACL and trigger checks are therefore
--- part of what "body_approved" certifies. ready=true now REQUIRES the R15.4
--- one-row trigger-helper ACL and all three immutability triggers attached,
--- enabled and correctly bound, because the R15.5 verifier fails otherwise.
+-- contract). The verifier's own approved body digests pin the R15.6 body, whose
+-- row_immutable ACL, semantic/callable, body-digest and EXACT-tgtype trigger
+-- checks are therefore part of what "body_approved" certifies. ready=true now
+-- REQUIRES the R15.4 one-row trigger-helper ACL, the complete reviewed pg_proc
+-- contract for the helper, and all three immutability triggers attached, enabled
+-- and bound with tgtype EXACTLY 27 (an extra INSERT event is NOT READY), because
+-- the R15.6 verifier fails otherwise.
+--
+-- R15.6 — this file additionally certifies the verifier's OWN complete final
+-- authority: the exact TWO-row normalized direct ACL (the owner's own EXECUTE row
+-- is MANDATORY — its absence was previously accepted, a Codex-reproduced P1 —
+-- and both rows must be owner-granted and non-grantable, with no grant option
+-- anywhere), plus the exact semantic/callable attribute contract. Every displayed
+-- check feeds final_status.
 --
 -- R15.2B design — one transaction, one snapshot, one authoritative statement:
 --
@@ -48,8 +57,8 @@ SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY;
 
 WITH approved(lf_digest, crlf_digest, expected_search_path, expected_version) AS (
   VALUES (
-    '83c8cd60a96e44e6cb8d66db93daf403',
-    'f3c181abf13b54087eaf802ce11a29a4',
+    '1c6f85b4cb410dc4ca307ed22ee1de47',
+    '42b43aaa01a770dc7d4a2a0d2f7f33b6',
     ARRAY['search_path=pg_catalog, public'],
     '2026-07-30.commercial-launch-r8'
   )
@@ -132,6 +141,34 @@ checks AS (
     coalesce((SELECT NOT EXISTS (SELECT 1 FROM aclexplode(b.proacl) ae
                WHERE ae.is_grantable
                  AND ae.grantee <> b.proowner)), FALSE)                          AS no_unexpected_grant_option,
+    -- R15.6 — EXACT normalized direct-ACL set: exactly TWO rows, the owner's own
+    -- EXECUTE and service_role's EXECUTE, both granted BY the owner, neither
+    -- grantable. The owner row is MANDATORY (its absence was previously accepted
+    -- — Codex-reproduced P1) and NO row may carry a grant option, the owner's
+    -- included. Set-based on (grantee, privilege, grantor, is_grantable).
+    coalesce((SELECT count(*) = 2 FROM aclexplode(b.proacl)), FALSE)             AS acl_cardinality_exact,
+    coalesce((SELECT EXISTS (SELECT 1 FROM aclexplode(b.proacl) ae
+               WHERE ae.grantee = b.proowner AND ae.privilege_type = 'EXECUTE'
+                 AND ae.grantor = b.proowner AND NOT ae.is_grantable)), FALSE)   AS owner_execute_row_exact,
+    coalesce((SELECT EXISTS (SELECT 1 FROM aclexplode(b.proacl) ae
+               WHERE ae.grantee = (SELECT oid FROM pg_roles WHERE rolname = 'service_role')
+                 AND ae.privilege_type = 'EXECUTE'
+                 AND ae.grantor = b.proowner AND NOT ae.is_grantable)), FALSE)   AS service_role_owner_granted,
+    coalesce((SELECT NOT EXISTS (SELECT 1 FROM aclexplode(b.proacl) ae
+               WHERE ae.is_grantable)), FALSE)                                   AS no_grant_option,
+    -- R15.6 — exact semantic/callable attributes of the verifier itself, derived
+    -- from the reviewed migration in a disposable database, never guessed.
+    coalesce((SELECT (p.prorettype = 'jsonb'::regtype AND NOT p.proretset AND p.prokind = 'f'
+                  AND p.pronargs = 0 AND p.pronargdefaults = 0 AND p.proargdefaults IS NULL
+                  AND p.proargnames IS NULL AND p.proargmodes IS NULL AND p.proallargtypes IS NULL
+                  AND p.proargtypes::text = '' AND p.provariadic = 0
+                  AND l.lanname = 'plpgsql'
+                  AND p.provolatile = 's' AND NOT p.proisstrict AND p.proparallel = 'u'
+                  AND NOT p.proleakproof AND p.procost = 100 AND p.prorows = 0
+                  AND p.prosupport::oid = 0 AND coalesce(cardinality(p.protrftypes), 0) = 0
+                  AND p.probin IS NULL AND p.prosqlbody IS NULL)
+               FROM pg_proc p JOIN pg_language l ON l.oid = p.prolang
+               WHERE p.oid = b.oid), FALSE)                                      AS semantic_callable_exact,
     -- BODY (raw, dual reviewed encodings, no normalization)
     coalesce(md5(b.prosrc) IN (b.lf_digest, b.crlf_digest), FALSE)               AS body_approved
   FROM base b
@@ -149,6 +186,9 @@ authority AS (
      AND c.service_role_execute AND c.service_role_no_grant_option
      AND c.public_denied AND c.anon_denied AND c.authenticated_denied
      AND c.no_unexpected_grantee AND c.no_unexpected_grant_option
+     AND c.acl_cardinality_exact AND c.owner_execute_row_exact
+     AND c.service_role_owner_granted AND c.no_grant_option
+     AND c.semantic_callable_exact
      AND c.body_approved
      AND e.effective_acl_ok)                                                     AS authority_ok
   FROM checks c
@@ -192,6 +232,12 @@ SELECT
   authenticated_denied,
   no_unexpected_grantee,
   no_unexpected_grant_option,
+  -- R15.6 exactness
+  acl_cardinality_exact,
+  owner_execute_row_exact,
+  service_role_owner_granted,
+  no_grant_option,
+  semantic_callable_exact,
   body_approved,
   -- effective ACL (R15.2C) — inherited privilege, evaluated per role
   effective_acl_ok,

@@ -1,20 +1,26 @@
 -- ============================================================================
--- QHUB R15.5 — 14 LIVE RUNTIME VERIFIER TRIGGER-ACL PATCH
+-- QHUB R15.5/R15.6 — 14 LIVE RUNTIME VERIFIER TRIGGER-ACL PATCH
 -- Schema version: 2026-07-30.commercial-launch-r8 (UNCHANGED)
 --
--- Replaces ONLY public.qhub_verify_commercial_schema() with the R15.5 body, which
--- adds enforcement of the qhub_row_immutable() authority contract established by
--- R15.4:
+-- Replaces ONLY public.qhub_verify_commercial_schema() with the reviewed R15.6
+-- body, which enforces the COMPLETE qhub_row_immutable() contract established by
+-- R15.4 and closed by R15.5/R15.6:
 --   * exact one-row owner-only direct ACL (labels row_immutable_acl_cardinality,
 --     row_immutable_acl_owner_entry, row_immutable_acl_unexpected_grantee,
---     row_immutable_acl_grant_option, row_immutable_identity)
+--     row_immutable_acl_grant_option)
+--   * the complete reviewed pg_proc contract (labels row_immutable_identity,
+--     row_immutable_callable_interface, row_immutable_semantic_attributes,
+--     row_immutable_execution_metadata, row_immutable_body_digest)
 --   * the three immutability triggers attached, enabled and bound to EXACTLY this
---     function (labels row_immutable_trigger_missing/_binding/_disabled:<table>)
+--     function with EXACT tgtype 27 — bit containment allowed a trigger broadened
+--     to BEFORE INSERT OR UPDATE OR DELETE to stay READY (reproduced)
+--     (labels row_immutable_trigger_missing/_binding/_disabled:<table>)
 -- WHY: independently reproduced — after a clean R15.4 install, GRANT EXECUTE ON
--- public.qhub_row_immutable() TO anon still returned ready=true, failed=[]. A
--- runtime verifier that cannot see trigger-helper ACL drift can report a false
--- READY, which is exactly the class of failure this whole release loop exists to
--- prevent.
+-- public.qhub_row_immutable() TO anon still returned ready=true, failed=[]; after
+-- R15.5, ALTER FUNCTION ... IMMUTABLE STRICT PARALLEL SAFE LEAKPROOF COST 42
+-- still returned ready=true. A runtime verifier blind to any reviewed dimension
+-- can report a false READY, which is exactly the class of failure this whole
+-- release loop exists to prevent.
 --
 -- SUPERSEDES docs/release/r15-2-verifier-patch/08 as the operational verifier
 -- patch. That package remains reviewed history; its verifier body predates the
@@ -23,14 +29,21 @@
 -- Everything else about the R15.2C patch discipline is preserved verbatim:
 --   * the membership-derived effective-executor PREcondition runs before any
 --     change and never repairs cluster role memberships;
---   * the exact owner / direct-ACL reset (owner derived from the migration-created
---     authority tables, never guessed; REVOKE ALL from PUBLIC/anon/authenticated/
---     service_role — which strips any stale grant option — then GRANT EXECUTE to
---     service_role alone);
+--   * the exact owner / direct-ACL reassertion (owner derived from the
+--     migration-created authority tables, never guessed) — which, since R15.6,
+--     runs ONLY after the complete start-state gate has proven the authority
+--     state is already an explained one: it re-asserts a verified state and is
+--     forbidden from repairing an unexplained one;
 --   * the authoritative post-patch effective-ACL recheck before COMMIT;
---   * PLUS (new) a body-digest gate before COMMIT: the installed verifier must
---     hash to exactly the reviewed R15.5 LF or CRLF digest, so a mangling
---     transfer channel rolls the whole transaction back.
+--   * PLUS (R15.6) a COMPLETE start-state gate before CREATE OR REPLACE — body,
+--     authority (SECURITY DEFINER, owner, search_path, exact two-row ACL with
+--     grantors), and semantic/callable interface must ALL match an explained
+--     state or the patch raises before any replacement (Codex proved the R15.5
+--     gate silently repaired a SECURITY INVOKER start);
+--   * PLUS (R15.6) a COMPLETE final-contract gate before COMMIT: body digest,
+--     version, authority, exact ACL and semantic/callable attributes, so a
+--     mangling transfer channel or any residual drift rolls the whole
+--     transaction back.
 --
 -- This script changes NO other object and NO data. No table, policy, RLS setting,
 -- constraint, index, trigger, protected function body, configuration row, or
@@ -91,33 +104,125 @@ END;
 $r15_2c_precheck$;
 
 -- ---------------------------------------------------------------------------
--- R15.5 START-STATE GATE — the live verifier must be EITHER the exact documented
--- live body (the 2026-07-30 apply: commit 644b5c6's verifier through the CRLF +
--- cp1252 mojibake channel, digest a35d8320d4a9804725a95f76534fe5a2) OR
--- already the reviewed R15.5 body (idempotent re-run). Any third digest is
--- unexplained verifier drift: STOP and escalate, do not patch over it.
+-- R15.6 COMPLETE START-STATE GATE — runs BEFORE CREATE OR REPLACE and verifies
+-- the ENTIRE exact start contract, not just the body digest. The live verifier
+-- must be, in every respect, one of exactly two explained states:
+--   A. the documented live-era state (body a35d8320d4a9804725a95f76534fe5a2 —
+--      commit 644b5c6's verifier through the 2026-07-30 CRLF+cp1252 channel), or
+--   B. the reviewed final state (idempotent re-run).
+-- Both states share the SAME authority and interface contract: SECURITY DEFINER,
+-- exact search_path, exact owner, the exact two-row owner+service_role ACL
+-- (both rows owner-granted, neither grantable), and the exact semantic/callable
+-- attributes. Any drift — a SECURITY INVOKER start, a missing owner ACL row, a
+-- wrong grantor, a wrong search_path, a wrong owner, an overload, an attribute
+-- drift, an unknown body — is an UNEXPLAINED state: this gate raises a
+-- deterministic exception, no replacement happens, nothing is normalized, the
+-- evidence is left intact, and the whole transaction rolls back. Codex proved
+-- the R15.5 gate silently repaired a SECURITY INVOKER start (reproduced before
+-- this fix); repairing unexplained verifier authority drift is now impossible.
 -- ---------------------------------------------------------------------------
-DO $r15_5_start$
+DO $r15_6_start$
 DECLARE
+  v_oid oid;
   v_md5 text;
+  v_owner_oid oid;
+  v_detail text;
 BEGIN
-  SELECT md5(p.prosrc) INTO v_md5
-    FROM pg_proc p WHERE p.oid = to_regprocedure('public.qhub_verify_commercial_schema()');
-
-  IF v_md5 IS NULL THEN
-    RAISE EXCEPTION 'R15.5: public.qhub_verify_commercial_schema() is missing or not at its zero-argument signature';
+  v_oid := to_regprocedure('public.qhub_verify_commercial_schema()');
+  IF v_oid IS NULL THEN
+    RAISE EXCEPTION 'R15.6: public.qhub_verify_commercial_schema() is missing or not at its zero-argument signature';
   END IF;
 
-  IF v_md5 NOT IN ('a35d8320d4a9804725a95f76534fe5a2',      -- documented live body (644b5c6, CRLF+mojibake channel)
-                   '83c8cd60a96e44e6cb8d66db93daf403',          -- reviewed R15.5 body, LF
-                   'f3c181abf13b54087eaf802ce11a29a4') THEN   -- reviewed R15.5 body, CRLF
-    RAISE EXCEPTION 'unexpected_runtime_verifier_state: the live verifier body (md5=%) is neither the documented live digest nor the reviewed R15.5 body. No change was made - STOP and escalate.', v_md5;
+  SELECT c.relowner INTO v_owner_oid FROM pg_class c
+   WHERE c.oid = to_regclass('public.qhub_manual_review_requests');
+  IF v_owner_oid IS NULL THEN
+    RAISE EXCEPTION 'R15.6: cannot resolve the contract owner from public.qhub_manual_review_requests';
+  END IF;
+
+  SELECT md5(p.prosrc) INTO v_md5 FROM pg_proc p WHERE p.oid = v_oid;
+  IF v_md5 NOT IN ('a35d8320d4a9804725a95f76534fe5a2',     -- documented live body (644b5c6, CRLF+mojibake channel)
+                   '1c6f85b4cb410dc4ca307ed22ee1de47',     -- reviewed final body, LF
+                   '42b43aaa01a770dc7d4a2a0d2f7f33b6') THEN -- reviewed final body, CRLF
+    RAISE EXCEPTION 'unexpected_runtime_verifier_state: the live verifier body (md5=%) is neither the documented live digest nor the reviewed final body. No change was made - STOP and escalate.', v_md5;
+  END IF;
+
+  -- AUTHORITY: every condition below is part of BOTH explained states. Failing
+  -- any one of them means the start state is unexplained — never repair it.
+  SELECT string_agg(fail, ', ') INTO v_detail FROM (
+    SELECT 'not SECURITY DEFINER' AS fail FROM pg_proc p
+      WHERE p.oid = v_oid AND NOT p.prosecdef
+    UNION ALL
+    SELECT 'search_path drift' FROM pg_proc p
+      WHERE p.oid = v_oid
+        AND (p.proconfig IS NULL OR p.proconfig <> ARRAY['search_path=pg_catalog, public'])
+    UNION ALL
+    SELECT 'owner drift' FROM pg_proc p
+      WHERE p.oid = v_oid AND p.proowner <> v_owner_oid
+    UNION ALL
+    SELECT 'direct ACL cardinality <> 2' FROM pg_proc p
+      WHERE p.oid = v_oid
+        AND (SELECT count(*) FROM aclexplode(p.proacl)) IS DISTINCT FROM 2
+    UNION ALL
+    SELECT 'owner EXECUTE row missing or wrong (grantor/grant option)' FROM pg_proc p
+      WHERE p.oid = v_oid AND NOT EXISTS (
+        SELECT 1 FROM aclexplode(p.proacl) ae
+         WHERE ae.grantee = v_owner_oid AND ae.privilege_type = 'EXECUTE'
+           AND ae.grantor = v_owner_oid AND NOT ae.is_grantable)
+    UNION ALL
+    SELECT 'service_role EXECUTE row missing or wrong (grantor/grant option)' FROM pg_proc p
+      WHERE p.oid = v_oid AND NOT EXISTS (
+        SELECT 1 FROM aclexplode(p.proacl) ae
+         WHERE ae.grantee = (SELECT oid FROM pg_roles WHERE rolname = 'service_role')
+           AND ae.privilege_type = 'EXECUTE'
+           AND ae.grantor = v_owner_oid AND NOT ae.is_grantable)
+    UNION ALL
+    SELECT 'unexpected direct grantee' FROM pg_proc p
+      WHERE p.oid = v_oid AND EXISTS (
+        SELECT 1 FROM aclexplode(p.proacl) ae
+         WHERE ae.grantee <> v_owner_oid
+           AND ae.grantee <> (SELECT oid FROM pg_roles WHERE rolname = 'service_role'))
+    UNION ALL
+    SELECT 'grant option present' FROM pg_proc p
+      WHERE p.oid = v_oid AND EXISTS (
+        SELECT 1 FROM aclexplode(p.proacl) ae WHERE ae.is_grantable)
+  ) s;
+  IF v_detail IS NOT NULL THEN
+    RAISE EXCEPTION 'unexpected_runtime_verifier_authority: % — the live verifier authority state is not an explained start state. This patch never repairs unexplained verifier authority drift; no change was made. STOP and escalate.', v_detail;
+  END IF;
+
+  -- SEMANTIC / CALLABLE interface: shared by both explained states. Derived from
+  -- the reviewed migration in a disposable database, never guessed.
+  SELECT string_agg(fail, ', ') INTO v_detail FROM (
+    SELECT 'overload present' AS fail
+      WHERE (SELECT count(*) FROM pg_proc q JOIN pg_namespace qn ON qn.oid = q.pronamespace
+              WHERE qn.nspname = 'public' AND q.proname = 'qhub_verify_commercial_schema') <> 1
+    UNION ALL
+    SELECT 'callable-interface drift' FROM pg_proc p JOIN pg_language l ON l.oid = p.prolang
+      WHERE p.oid = v_oid AND NOT (
+        p.prorettype = 'jsonb'::regtype AND NOT p.proretset AND p.prokind = 'f'
+        AND p.pronargs = 0 AND p.pronargdefaults = 0 AND p.proargdefaults IS NULL
+        AND p.proargnames IS NULL AND p.proargmodes IS NULL AND p.proallargtypes IS NULL
+        AND p.proargtypes::text = '' AND p.provariadic = 0
+        AND l.lanname = 'plpgsql')
+    UNION ALL
+    SELECT 'semantic-attribute drift' FROM pg_proc p
+      WHERE p.oid = v_oid AND NOT (
+        p.provolatile = 's' AND NOT p.proisstrict AND p.proparallel = 'u'
+        AND NOT p.proleakproof AND p.procost = 100 AND p.prorows = 0)
+    UNION ALL
+    SELECT 'execution-metadata drift' FROM pg_proc p
+      WHERE p.oid = v_oid AND NOT (
+        p.prosupport::oid = 0 AND coalesce(cardinality(p.protrftypes), 0) = 0
+        AND p.probin IS NULL AND p.prosqlbody IS NULL)
+  ) s;
+  IF v_detail IS NOT NULL THEN
+    RAISE EXCEPTION 'unexpected_runtime_verifier_interface: % — the live verifier callable/semantic state is not an explained start state. No change was made. STOP and escalate.', v_detail;
   END IF;
 END;
-$r15_5_start$;
+$r15_6_start$;
 
 -- ---------------------------------------------------------------------------
--- THE R15.5 VERIFIER — verbatim extract of the reviewed migration's verifier.
+-- THE R15.6 VERIFIER — verbatim extract of the reviewed migration's verifier.
 -- ---------------------------------------------------------------------------
 CREATE OR REPLACE FUNCTION public.qhub_verify_commercial_schema()
 RETURNS JSONB
@@ -626,13 +731,22 @@ BEGIN
       AND (tg.tgtype & 8) <> 0          -- DELETE
       AND (tg.tgtype & 16) <> 0         -- UPDATE
       AND tg.tgenabled = 'O'            -- enabled (origin/always)
-      AND tg.tgfoid = 'public.qhub_row_immutable()'::regprocedure
+      -- R15.6: to_regprocedure, not a hard ::regprocedure cast — the cast raised
+      -- 42883 when the helper was dropped, turning fail-closed drift into an
+      -- ERROR instead of a NOT READY verdict. NULL matches no tgfoid, so the
+      -- r7_ack_immutable_trigger label fires exactly as intended.
+      AND tg.tgfoid = to_regprocedure('public.qhub_row_immutable()')
   ) THEN
     v_failed := v_failed || 'r7_ack_immutable_trigger'::text;
   END IF;
+  -- R15.6: pinned to the exact zero-argument signature. The bare-proname subquery
+  -- raised 21000 (more than one row) when an overload existed, turning the whole
+  -- verifier into an ERROR instead of a NOT READY verdict; to_regprocedure keeps
+  -- the identical digest semantics and lets the overload itself be reported by
+  -- row_immutable_callable_interface.
   IF NOT coalesce(
-       (SELECT md5(p.prosrc) FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace
-          WHERE n.nspname='public' AND p.proname='qhub_row_immutable')
+       (SELECT md5(p.prosrc) FROM pg_proc p
+          WHERE p.oid = to_regprocedure('public.qhub_row_immutable()'))
        IN ('41ae59dde9a471b580d28e2cb45984f5',   -- reviewed body, LF encoding
            '4936e3f58627dde5abc10d2b0ecf5b4f'),  -- reviewed body, CRLF encoding
      FALSE) THEN
@@ -736,13 +850,59 @@ BEGIN
    * Missing function fails closed: to_regprocedure() yields NULL, every EXISTS
    * below is false, and the identity/ACL labels fire rather than silently passing.
    */
+  /*
+   * R15.6 — the COMPLETE reviewed pg_proc contract, split into independently
+   * actionable labels. Every value below was derived from this migration in a
+   * disposable database (identical under plain PostgreSQL and Supabase default
+   * privileges), never guessed. Before R15.6, `ALTER FUNCTION ... IMMUTABLE
+   * STRICT PARALLEL SAFE LEAKPROOF COST 42` still reported ready=true
+   * (independently reproduced) — semantic drift on the helper was a false READY.
+   * Missing function fails closed: every PERFORM finds no row and all labels fire.
+   */
   PERFORM 1 FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace
     WHERE n.nspname='public' AND p.proname='qhub_row_immutable'
       AND NOT p.prosecdef AND p.proconfig IS NULL
-      AND p.prorettype = 'trigger'::regtype AND p.prokind = 'f'
-      AND p.pronargs = 0 AND p.pronargdefaults = 0 AND p.provariadic = 0
       AND p.proowner = (SELECT relowner FROM pg_class WHERE oid='public.qhub_acknowledgments'::regclass);
   IF NOT FOUND THEN v_failed := v_failed || 'row_immutable_identity'::text; END IF;
+  -- Callable interface: exactly one pg_proc row under this name, zero-argument
+  -- trigger function, no defaults, no variadic, no arg metadata, plpgsql.
+  PERFORM 1 FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace
+    JOIN pg_language l ON l.oid=p.prolang
+    WHERE n.nspname='public' AND p.proname='qhub_row_immutable'
+      AND p.prorettype = 'trigger'::regtype AND NOT p.proretset AND p.prokind = 'f'
+      AND p.pronargs = 0 AND p.pronargdefaults = 0 AND p.proargdefaults IS NULL
+      AND p.proargnames IS NULL AND p.proargmodes IS NULL AND p.proallargtypes IS NULL
+      AND p.proargtypes::text = '' AND p.provariadic = 0
+      AND pg_get_function_identity_arguments(p.oid) = ''
+      AND pg_get_function_arguments(p.oid) = ''
+      AND l.lanname = 'plpgsql'
+      AND (SELECT count(*) FROM pg_proc q JOIN pg_namespace qn ON qn.oid=q.pronamespace
+            WHERE qn.nspname='public' AND q.proname='qhub_row_immutable') = 1;
+  IF NOT FOUND THEN v_failed := v_failed || 'row_immutable_callable_interface'::text; END IF;
+  -- Semantic/planner attributes: the reviewed values are the CREATE FUNCTION
+  -- defaults, so a drift here is always an explicit ALTER someone must explain.
+  PERFORM 1 FROM pg_proc p
+    WHERE p.oid = to_regprocedure('public.qhub_row_immutable()')
+      AND p.provolatile = 'v' AND NOT p.proisstrict
+      AND p.proparallel = 'u' AND NOT p.proleakproof
+      AND p.procost = 100 AND p.prorows = 0;
+  IF NOT FOUND THEN v_failed := v_failed || 'row_immutable_semantic_attributes'::text; END IF;
+  -- Execution metadata: no support function, no transforms, no binary payload,
+  -- no SQL-standard body substitution.
+  PERFORM 1 FROM pg_proc p
+    WHERE p.oid = to_regprocedure('public.qhub_row_immutable()')
+      AND p.prosupport::oid = 0
+      AND coalesce(cardinality(p.protrftypes), 0) = 0
+      AND p.probin IS NULL AND p.prosqlbody IS NULL;
+  IF NOT FOUND THEN v_failed := v_failed || 'row_immutable_execution_metadata'::text; END IF;
+  -- Body: exact raw digest, reviewed LF or CRLF encoding only. The known live
+  -- mojibake digest is deliberately NOT accepted here — R15.3's restoration is
+  -- the only sanctioned path out of that state.
+  PERFORM 1 FROM pg_proc p
+    WHERE p.oid = to_regprocedure('public.qhub_row_immutable()')
+      AND md5(p.prosrc) IN ('41ae59dde9a471b580d28e2cb45984f5',
+                            '4936e3f58627dde5abc10d2b0ecf5b4f');
+  IF NOT FOUND THEN v_failed := v_failed || 'row_immutable_body_digest'::text; END IF;
 
   IF (SELECT count(*) FROM pg_proc p, aclexplode(p.proacl) ae
        WHERE p.oid = to_regprocedure('public.qhub_row_immutable()')) IS DISTINCT FROM 1 THEN
@@ -772,10 +932,17 @@ BEGIN
    * trigger-creation loop: trg_<table>_immutable BEFORE UPDATE OR DELETE FOR EACH
    * ROW on qhub_acknowledgments, qhub_usage_ledger and qhub_entitlement_audit, each
    * bound to EXACTLY public.qhub_row_immutable() and enabled ('O'). The binding is
-   * checked by exact name + table + function OID + timing/event bits, so a renamed,
+   * checked by exact name + table + function OID + EXACT tgtype, so a renamed,
    * rebound or replacement trigger cannot satisfy a count, and an unrelated extra
-   * trigger satisfies nothing. tgtype bits: 1=FOR EACH ROW, 2=BEFORE, 8=DELETE,
-   * 16=UPDATE.
+   * trigger satisfies nothing.
+   *
+   * R15.6: tgtype must EQUAL 27 (1 FOR EACH ROW + 2 BEFORE + 8 DELETE + 16 UPDATE),
+   * derived from this migration's own CREATE TRIGGER statements. Bit containment
+   * was insufficient — a trigger broadened to BEFORE INSERT OR UPDATE OR DELETE
+   * (tgtype 31) still contained every required bit and reported ready=true
+   * (independently reproduced). Equality forbids INSERT (4), TRUNCATE (32),
+   * INSTEAD OF (64), AFTER (bit 2 absent), statement-level (bit 1 absent) and any
+   * other extra or missing timing/event bit.
    */
   FOR t IN SELECT unnest(ARRAY['qhub_acknowledgments','qhub_usage_ledger','qhub_entitlement_audit']) LOOP
     IF NOT EXISTS (
@@ -784,8 +951,7 @@ BEGIN
         AND tg.tgrelid = to_regclass('public.' || t)
         AND NOT tg.tgisinternal
         AND tg.tgfoid = to_regprocedure('public.qhub_row_immutable()')
-        AND (tg.tgtype & 1) <> 0 AND (tg.tgtype & 2) <> 0
-        AND (tg.tgtype & 8) <> 0 AND (tg.tgtype & 16) <> 0
+        AND tg.tgtype = 27
     ) THEN
       IF NOT EXISTS (
         SELECT 1 FROM pg_trigger tg
@@ -861,27 +1027,108 @@ REVOKE ALL PRIVILEGES ON FUNCTION public.qhub_verify_commercial_schema() FROM se
 GRANT EXECUTE ON FUNCTION public.qhub_verify_commercial_schema() TO service_role;
 
 -- ---------------------------------------------------------------------------
--- R15.5 BODY GATE BEFORE COMMIT — the installed verifier must be byte-identical
--- to a reviewed R15.5 encoding, and must carry the exact schema version. If the
--- transfer channel mangled THIS file, the whole transaction rolls back.
+-- R15.6 COMPLETE FINAL-CONTRACT GATE BEFORE COMMIT — re-asserts the ENTIRE final
+-- verifier contract after the replacement and the authority reassertion: exact
+-- reviewed body encoding, exact schema version, exact owner, SECURITY DEFINER,
+-- exact search_path, the exact two-row owner+service_role ACL (owner-granted,
+-- non-grantable, no third row), no overload, and the exact semantic/callable
+-- attributes. There is no third acceptable state. If anything fails — including
+-- a transfer channel that mangled THIS file — the whole transaction rolls back.
 -- ---------------------------------------------------------------------------
-DO $r15_5_body$
+DO $r15_6_final$
 DECLARE
+  v_oid oid;
   v_md5 text;
   v_src text;
+  v_owner_oid oid;
+  v_detail text;
 BEGIN
-  SELECT md5(p.prosrc), p.prosrc INTO v_md5, v_src
-    FROM pg_proc p WHERE p.oid = to_regprocedure('public.qhub_verify_commercial_schema()');
+  v_oid := to_regprocedure('public.qhub_verify_commercial_schema()');
+  IF v_oid IS NULL THEN
+    RAISE EXCEPTION 'R15.6 POST: verifier missing after replacement — rolling back.';
+  END IF;
 
-  IF v_md5 NOT IN ('83c8cd60a96e44e6cb8d66db93daf403', 'f3c181abf13b54087eaf802ce11a29a4') THEN
-    RAISE EXCEPTION 'R15.5 POST: the installed verifier body (md5=%) is not a reviewed R15.5 encoding. Transferred through a non-UTF-8 channel? Rolling back. Re-copy with: Get-Content -Raw -Encoding UTF8 <file> | Set-Clipboard', v_md5;
+  SELECT md5(p.prosrc), p.prosrc INTO v_md5, v_src FROM pg_proc p WHERE p.oid = v_oid;
+
+  IF v_md5 NOT IN ('1c6f85b4cb410dc4ca307ed22ee1de47', '42b43aaa01a770dc7d4a2a0d2f7f33b6') THEN
+    RAISE EXCEPTION 'R15.6 POST: the installed verifier body (md5=%) is not a reviewed encoding. Transferred through a non-UTF-8 channel? Rolling back. Re-copy with: Get-Content -Raw -Encoding UTF8 <file> | Set-Clipboard', v_md5;
   END IF;
 
   IF position('2026-07-30.commercial-launch-r8' IN v_src) = 0 THEN
-    RAISE EXCEPTION 'R15.5 POST: the installed verifier does not carry the exact schema version. Rolling back.';
+    RAISE EXCEPTION 'R15.6 POST: the installed verifier does not carry the exact schema version. Rolling back.';
+  END IF;
+
+  SELECT c.relowner INTO v_owner_oid FROM pg_class c
+   WHERE c.oid = to_regclass('public.qhub_manual_review_requests');
+  IF v_owner_oid IS NULL THEN
+    RAISE EXCEPTION 'R15.6 POST: cannot resolve the contract owner — rolling back.';
+  END IF;
+
+  SELECT string_agg(fail, ', ') INTO v_detail FROM (
+    SELECT 'not SECURITY DEFINER' AS fail FROM pg_proc p
+      WHERE p.oid = v_oid AND NOT p.prosecdef
+    UNION ALL
+    SELECT 'search_path drift' FROM pg_proc p
+      WHERE p.oid = v_oid
+        AND (p.proconfig IS NULL OR p.proconfig <> ARRAY['search_path=pg_catalog, public'])
+    UNION ALL
+    SELECT 'owner drift' FROM pg_proc p
+      WHERE p.oid = v_oid AND p.proowner <> v_owner_oid
+    UNION ALL
+    SELECT 'direct ACL cardinality <> 2' FROM pg_proc p
+      WHERE p.oid = v_oid
+        AND (SELECT count(*) FROM aclexplode(p.proacl)) IS DISTINCT FROM 2
+    UNION ALL
+    SELECT 'owner EXECUTE row missing or wrong' FROM pg_proc p
+      WHERE p.oid = v_oid AND NOT EXISTS (
+        SELECT 1 FROM aclexplode(p.proacl) ae
+         WHERE ae.grantee = v_owner_oid AND ae.privilege_type = 'EXECUTE'
+           AND ae.grantor = v_owner_oid AND NOT ae.is_grantable)
+    UNION ALL
+    SELECT 'service_role EXECUTE row missing or wrong' FROM pg_proc p
+      WHERE p.oid = v_oid AND NOT EXISTS (
+        SELECT 1 FROM aclexplode(p.proacl) ae
+         WHERE ae.grantee = (SELECT oid FROM pg_roles WHERE rolname = 'service_role')
+           AND ae.privilege_type = 'EXECUTE'
+           AND ae.grantor = v_owner_oid AND NOT ae.is_grantable)
+    UNION ALL
+    SELECT 'unexpected direct grantee' FROM pg_proc p
+      WHERE p.oid = v_oid AND EXISTS (
+        SELECT 1 FROM aclexplode(p.proacl) ae
+         WHERE ae.grantee <> v_owner_oid
+           AND ae.grantee <> (SELECT oid FROM pg_roles WHERE rolname = 'service_role'))
+    UNION ALL
+    SELECT 'grant option present' FROM pg_proc p
+      WHERE p.oid = v_oid AND EXISTS (
+        SELECT 1 FROM aclexplode(p.proacl) ae WHERE ae.is_grantable)
+    UNION ALL
+    SELECT 'overload present'
+      WHERE (SELECT count(*) FROM pg_proc q JOIN pg_namespace qn ON qn.oid = q.pronamespace
+              WHERE qn.nspname = 'public' AND q.proname = 'qhub_verify_commercial_schema') <> 1
+    UNION ALL
+    SELECT 'callable-interface drift' FROM pg_proc p JOIN pg_language l ON l.oid = p.prolang
+      WHERE p.oid = v_oid AND NOT (
+        p.prorettype = 'jsonb'::regtype AND NOT p.proretset AND p.prokind = 'f'
+        AND p.pronargs = 0 AND p.pronargdefaults = 0 AND p.proargdefaults IS NULL
+        AND p.proargnames IS NULL AND p.proargmodes IS NULL AND p.proallargtypes IS NULL
+        AND p.proargtypes::text = '' AND p.provariadic = 0
+        AND l.lanname = 'plpgsql')
+    UNION ALL
+    SELECT 'semantic-attribute drift' FROM pg_proc p
+      WHERE p.oid = v_oid AND NOT (
+        p.provolatile = 's' AND NOT p.proisstrict AND p.proparallel = 'u'
+        AND NOT p.proleakproof AND p.procost = 100 AND p.prorows = 0)
+    UNION ALL
+    SELECT 'execution-metadata drift' FROM pg_proc p
+      WHERE p.oid = v_oid AND NOT (
+        p.prosupport::oid = 0 AND coalesce(cardinality(p.protrftypes), 0) = 0
+        AND p.probin IS NULL AND p.prosqlbody IS NULL)
+  ) s;
+  IF v_detail IS NOT NULL THEN
+    RAISE EXCEPTION 'R15.6 POST: final verifier contract not met (%) — rolling back the entire patch.', v_detail;
   END IF;
 END;
-$r15_5_body$;
+$r15_6_final$;
 
 -- ---------------------------------------------------------------------------
 -- R15.2C AUTHORITATIVE POST-PATCH EFFECTIVE-ACL RECHECK (verbatim).
