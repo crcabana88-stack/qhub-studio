@@ -1,6 +1,6 @@
 # QHUB R15.3 — Encoding-Safe Protected-Body Restoration Runbook
 
-Human-operated. Restores **two** live function bodies to their exact reviewed text so the R15.5 runtime-
+Human-operated. Restores **two** live function bodies to their exact reviewed text so the R15.6 runtime-
 verifier package can proceed. Nothing else on the database is touched.
 
 ## Why this exists
@@ -37,7 +37,7 @@ reviewed migration is correct and is **not** changed by this package.
 | Schema version | `2026-07-30.commercial-launch-r8` |
 | Live project reference | `jsjsanmaahvmynblmzkq` |
 | This package | `docs/release/r15-3-body-restoration/` |
-| Verifier package (runs after) | `docs/release/r15-5-runtime-verifier/` (supersedes `r15-2-verifier-patch/`) |
+| Verifier package (runs after) | `docs/release/r15-6-runtime-verifier/` (supersedes R15.5 and `r15-2-verifier-patch/`) |
 
 The release commit hash is deliberately **not** printed here — a commit cannot contain its own hash. Take
 it from the final review report and verify it in Step 1.
@@ -296,24 +296,24 @@ was verified before the contract was adopted — so no other grant exists or is 
 | `R15_3_REVIEWED_BODIES_RESTORED` | Continue to Step 5. |
 | `R15_3_BODY_RESTORE_NOT_READY` | **STOP.** Capture both rows and escalate. |
 
-## Step 5 — Run the R15.5 runtime-verifier package
+## Step 5 — Run the R15.6 runtime-verifier package
 
-**R15.5 supersedes R15.2C (`07/08/09`) as the operational verifier patch.** The R15.2C package
-remains reviewed history and its discipline is carried forward verbatim inside R15.5, but its
-verifier body predates the R15.4 trigger-ACL contract and must not be installed after it.
+**R15.6 supersedes R15.5 (`13/14/15`) and R15.2C (`07/08/09`) as the operational verifier
+patch.** Both earlier packages remain reviewed history, but their verifier bodies predate the
+complete R15.6 contract and must not be installed after this one.
 
-Now, and only now, proceed through `docs/release/r15-5-runtime-verifier/` exactly as its own runbook
+Now, and only now, proceed through `docs/release/r15-6-runtime-verifier/` exactly as its own runbook
 specifies — same encoding-safe copy command for every file:
 
-1. `13_PRE_PATCH_RUNTIME_VERIFIER_VERIFY.sql` → require `SAFE_TO_APPLY_RUNTIME_VERIFIER_PATCH`
-2. `14_LIVE_RUNTIME_VERIFIER_TRIGGER_ACL_PATCH.sql` → run once
-3. `15_POST_PATCH_RUNTIME_VERIFIER_VERIFY.sql` → require **`R15_5_VERIFIER_READY`**
+1. `16_PRE_PATCH_RUNTIME_VERIFIER_VERIFY.sql` → require `SAFE_TO_APPLY_RUNTIME_VERIFIER_PATCH`
+2. `17_LIVE_RUNTIME_VERIFIER_SEMANTIC_AUTHORITY_PATCH.sql` → run once
+3. `18_POST_PATCH_RUNTIME_VERIFIER_VERIFY.sql` → require **`R15_6_VERIFIER_READY`**
 
-`14` installs the verifier whose **own** body `15` digest-pins, and additionally verifies its own
+`17` installs the verifier whose **own** body `18` digest-pins, and additionally verifies its own
 installed digest before COMMIT — if the transfer channel mangles it, the whole transaction rolls
 back. Use the encoding-safe command anyway.
 
-## Step 6 — Mark migration history (only after Step 5 returns `R15_5_VERIFIER_READY`)
+## Step 6 — Mark migration history (only after Step 5 returns `R15_6_VERIFIER_READY`)
 
 ```bash
 npx --yes supabase@2.110.0 migration repair --status applied 20260729
@@ -347,7 +347,7 @@ founder UUID, email, org ID and roles before any seed.
   `R15.3 PRE: ... drifted` (attribute drift; escalate) or `R15.3 POST: ... STILL the mojibake body`
   (bad transfer channel; re-copy with `-Encoding UTF8`)
 - `12` is not exactly `R15_3_REVIEWED_BODIES_RESTORED`
-- `13` is not `SAFE_TO_APPLY_RUNTIME_VERIFIER_PATCH`, or `15` is not `R15_5_VERIFIER_READY`
+- `16` is not `SAFE_TO_APPLY_RUNTIME_VERIFIER_PATCH`, or `18` is not `R15_6_VERIFIER_READY`
 - Any SQL error while running any file — do not retry fragments
 - Any prompt for `--include-all`, reset, force, or replay of prior migrations
 

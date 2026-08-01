@@ -15,10 +15,10 @@
  *
  * R15.6 binds the COMPLETE derived pg_proc contract for the helper (labels
  * row_immutable_identity / _callable_interface / _semantic_attributes /
- * _execution_metadata / _body_digest), requires tgtype EXACTLY 27, gives 13/15
+ * _execution_metadata / _body_digest), requires tgtype EXACTLY 27, gives 16/18
  * the exact normalized two-row verifier ACL (owner row mandatory, grantors
  * bound, no grant option anywhere) plus the exact semantic/callable contract,
- * and makes 14 fail with a deterministic exception BEFORE replacement on every
+ * and makes 17 fail with a deterministic exception BEFORE replacement on every
  * unexplained authority/interface/body state.
  */
 
@@ -28,13 +28,13 @@ import { PGlite } from '@electric-sql/pglite';
 import { describe, expect, it } from 'vitest';
 
 const REPO = fileURLToPath(new URL('../../', import.meta.url));
-const R5 = `${REPO}docs/release/r15-5-runtime-verifier/`;
+const R6 = `${REPO}docs/release/r15-6-runtime-verifier/`;
 
 const MIGRATION = readFileSync(`${REPO}supabase/migrations/20260729_commercial_launch_foundation.sql`, 'utf8');
 const LIVE_VERIFIER_644 = readFileSync(`${REPO}app/test/fixtures/r8-644b5c6-live-verifier.sql`, 'utf8');
-const PRE13 = readFileSync(`${R5}13_PRE_PATCH_RUNTIME_VERIFIER_VERIFY.sql`, 'utf8');
-const PATCH14 = readFileSync(`${R5}14_LIVE_RUNTIME_VERIFIER_TRIGGER_ACL_PATCH.sql`, 'utf8');
-const POST15 = readFileSync(`${R5}15_POST_PATCH_RUNTIME_VERIFIER_VERIFY.sql`, 'utf8');
+const PRE13 = readFileSync(`${R6}16_PRE_PATCH_RUNTIME_VERIFIER_VERIFY.sql`, 'utf8');
+const PATCH14 = readFileSync(`${R6}17_LIVE_RUNTIME_VERIFIER_SEMANTIC_AUTHORITY_PATCH.sql`, 'utf8');
+const POST15 = readFileSync(`${R6}18_POST_PATCH_RUNTIME_VERIFIER_VERIFY.sql`, 'utf8');
 
 const RI = 'public.qhub_row_immutable()';
 const VF = 'public.qhub_verify_commercial_schema()';
@@ -393,9 +393,9 @@ describe('R15.6 — trigger checks require tgtype EXACTLY 27, not bit containmen
   }
 });
 
-// ─── §5 — PRE 13 exact verifier start-state authority ─────────────────────────
+// ─── §5 — PRE 16 exact verifier start-state authority ─────────────────────────
 
-describe('R15.6 — PRE 13 authorizes only the complete exact verifier contract', () => {
+describe('R15.6 — PRE 16 authorizes only the complete exact verifier contract', () => {
   it('a0 — untouched live-like start AND patched final state are both SAFE', async () => {
     const db = await openLiveLike();
 
@@ -454,9 +454,9 @@ describe('R15.6 — PRE 13 authorizes only the complete exact verifier contract'
   }
 });
 
-// ─── §6 — PATCH 14 fails BEFORE replacement, never repairs, evidence intact ───
+// ─── §6 — PATCH 17 fails BEFORE replacement, never repairs, evidence intact ───
 
-describe('R15.6 — PATCH 14 refuses every unexplained start state before replacement', () => {
+describe('R15.6 — PATCH 17 refuses every unexplained start state before replacement', () => {
   const PATCH_STOPS: Array<[string, string, RegExp]> = [
     [
       'p1 — the exact P1-4 vector: SECURITY INVOKER start',
@@ -521,7 +521,7 @@ describe('R15.6 — PATCH 14 refuses every unexplained start state before replac
     }, 120_000);
   }
 
-  it('p9 — the full sequence still reaches R15_5_VERIFIER_READY and 14 is idempotent', async () => {
+  it('p9 — PATCH 17 is idempotent and POST remains closed until helper restoration', async () => {
     const db = await openLiveLike();
 
     try {
@@ -535,7 +535,7 @@ describe('R15.6 — PATCH 14 refuses every unexplained start state before replac
       await db.exec(POST15);
 
       const r = (await db.query<Record<string, unknown>>(V15)).rows[0];
-      expect(r.final_status).toBe('R15_5_VERIFIER_NOT_READY');
+      expect(r.final_status).toBe('R15_6_VERIFIER_NOT_READY');
       expect(r.body_approved).toBe(true);
 
       /*
@@ -553,9 +553,9 @@ describe('R15.6 — PATCH 14 refuses every unexplained start state before replac
   }, 240_000);
 });
 
-// ─── §7 — POST 15 complete final certification ────────────────────────────────
+// ─── §7 — POST 18 complete final certification ────────────────────────────────
 
-describe('R15.6 — POST 15 certifies the complete final verifier authority', () => {
+describe('R15.6 — POST 18 certifies the complete final verifier authority', () => {
   const POST_FAILS: Array<[string, string]> = [
     ['f1 — verifier missing owner ACL row', `REVOKE EXECUTE ON FUNCTION ${VF} FROM postgres;`],
     ['f2 — verifier SECURITY INVOKER', `ALTER FUNCTION ${VF} SECURITY INVOKER;`],
@@ -566,31 +566,31 @@ describe('R15.6 — POST 15 certifies the complete final verifier authority', ()
   ];
 
   for (const [name, drift] of POST_FAILS) {
-    it(`${name} => R15_5_VERIFIER_NOT_READY`, async () => {
+    it(`${name} => R15_6_VERIFIER_NOT_READY`, async () => {
       const db = await open(MIGRATION, true);
 
       try {
         await db.exec(drift);
         await db.exec(POST15);
-        expect((await db.query<Record<string, unknown>>(V15)).rows[0].final_status).toBe('R15_5_VERIFIER_NOT_READY');
+        expect((await db.query<Record<string, unknown>>(V15)).rows[0].final_status).toBe('R15_6_VERIFIER_NOT_READY');
       } finally {
         await db.close();
       }
     }, 120_000);
   }
 
-  it('f7 — helper semantic drift and extra INSERT event each fail 15 through the product verdict', async () => {
+  it('f7 — helper semantic drift and extra INSERT event each fail POST 18 through the product verdict', async () => {
     const db = await open(MIGRATION, true);
 
     try {
       await db.exec(POST15);
-      expect((await db.query<Record<string, unknown>>(V15)).rows[0].final_status).toBe('R15_5_VERIFIER_READY');
+      expect((await db.query<Record<string, unknown>>(V15)).rows[0].final_status).toBe('R15_6_VERIFIER_READY');
 
       await db.exec(`ALTER FUNCTION ${RI} COST 42;`);
       await db.exec(POST15);
 
       let r = (await db.query<Record<string, unknown>>(V15)).rows[0];
-      expect(r.final_status).toBe('R15_5_VERIFIER_NOT_READY');
+      expect(r.final_status).toBe('R15_6_VERIFIER_NOT_READY');
       expect(r.product_ready).toBe('false');
 
       await db.exec(`ALTER FUNCTION ${RI} COST 100;`);
@@ -599,7 +599,7 @@ describe('R15.6 — POST 15 certifies the complete final verifier authority', ()
           ON public.qhub_usage_ledger FOR EACH ROW EXECUTE FUNCTION public.qhub_row_immutable();`);
       await db.exec(POST15);
       r = (await db.query<Record<string, unknown>>(V15)).rows[0];
-      expect(r.final_status).toBe('R15_5_VERIFIER_NOT_READY');
+      expect(r.final_status).toBe('R15_6_VERIFIER_NOT_READY');
       expect(r.product_ready).toBe('false');
     } finally {
       await db.close();
@@ -623,7 +623,7 @@ describe('R15.6 — POST 15 certifies the complete final verifier authority', ()
 // ─── §8 — wrong-grantor coverage ──────────────────────────────────────────────
 
 describe('R15.6 — wrong-grantor ACL coverage', () => {
-  it('g1 — LIVE MUTATION (verifier): a service_role row granted by a non-owner via SET ROLE STOPs PRE 13', async () => {
+  it('g1 — LIVE MUTATION (verifier): a service_role row granted by a non-owner via SET ROLE STOPs PRE 16', async () => {
     const db = await openLiveLike();
 
     try {
@@ -646,7 +646,7 @@ describe('R15.6 — wrong-grantor ACL coverage', () => {
     }
   }, 120_000);
 
-  it('g2 — CATALOG FIXTURE (verifier): equal-cardinality ACL whose ONLY defect is a wrong grantor STOPs PRE 13', async () => {
+  it('g2 — CATALOG FIXTURE (verifier): equal-cardinality ACL whose ONLY defect is a wrong grantor STOPs PRE 16', async () => {
     const db = await openLiveLike();
 
     try {

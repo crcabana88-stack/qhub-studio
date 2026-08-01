@@ -36,9 +36,7 @@ const POST15 = readFileSync(`${R5}15_POST_PATCH_RUNTIME_VERIFIER_VERIFY.sql`, 'u
 
 const RI = 'public.qhub_row_immutable()';
 const LIVE_START = 'a35d8320d4a9804725a95f76534fe5a2';
-
-// R15.6: the reviewed final verifier body (semantic + authority exactness closure).
-const NEW_LF = '1c6f85b4cb410dc4ca307ed22ee1de47';
+const NEW_LF = '83c8cd60a96e44e6cb8d66db93daf403';
 
 const SUPABASE_DEFAULT_PRIVILEGES = `ALTER DEFAULT PRIVILEGES IN SCHEMA public
   GRANT EXECUTE ON FUNCTIONS TO anon, authenticated, service_role;`;
@@ -376,7 +374,7 @@ describe('R15.5 — the live package authorizes and installs the new verifier', 
       // run the R15.4 restoration first so only the verifier transfer is at fault
       await db.exec(RESTORE11);
 
-      await expect(db.exec(mangle(PATCH14))).rejects.toThrow(/R15\.[56] POST|unexpected_runtime_verifier_state/);
+      await expect(db.exec(mangle(PATCH14))).rejects.toThrow(/R15\.5 POST|unexpected_runtime_verifier_state/);
       await rollback(db);
       expect(await verifierMd5(db), 'the live verifier is untouched').toBe(LIVE_START);
     } finally {
