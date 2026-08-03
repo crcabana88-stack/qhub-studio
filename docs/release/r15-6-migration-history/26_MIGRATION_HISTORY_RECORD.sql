@@ -65,9 +65,17 @@
 --   unexpected_runtime_verifier_state      verifier missing, overloaded, or body
 --                                          not an approved digest
 --   unexpected_runtime_verifier_authority  verifier signature/return/language/
---                                          kind/volatility/security/owner/
---                                          search_path/ACL/effective-executor
---                                          drift
+--                                          kind/volatility/parallel/strictness/
+--                                          security/owner/search_path/ACL/
+--                                          effective-executor drift
+--   unexpected_migration_history_privilege schema/table privilege drift: schema
+--                                          or table owner drift, any explicit
+--                                          nspacl/relacl entry, or any
+--                                          non-superuser non-owner role (anon,
+--                                          authenticated, service_role, or any
+--                                          other) holding schema USAGE/CREATE
+--                                          or any table privilege, directly or
+--                                          via role membership
 --   migration_history_product_not_ready    verifier result not exactly
 --                                          ready=true + exact version +
 --                                          failed=[] (NULL-safe: a NULL or
@@ -327,13 +335,17 @@ BEGIN
     SELECT 'body digest not approved' AS fail FROM pg_catalog.pg_proc p
       WHERE p.oid = v_oid AND (pg_catalog.md5(p.prosrc) IN (c_lf_digest, c_crlf_digest)) IS DISTINCT FROM TRUE
     UNION ALL
-    SELECT 'signature/return/language/kind/volatility drift' FROM pg_catalog.pg_proc p
+    -- R15.6.2: proparallel and proisstrict pinned from the approved verifier
+    -- artifact (STABLE, CALLED ON NULL INPUT, PARALLEL UNSAFE). NULL-safe: an
+    -- unresolvable attribute fails closed.
+    SELECT 'signature/return/language/kind/volatility/parallel/strictness drift' FROM pg_catalog.pg_proc p
       JOIN pg_catalog.pg_language l ON l.oid = p.prolang
       WHERE p.oid = v_oid AND (
         pg_catalog.pg_get_function_identity_arguments(p.oid) = ''
         AND p.prorettype = 'pg_catalog.jsonb'::pg_catalog.regtype
         AND NOT p.proretset AND p.prokind = 'f' AND l.lanname = 'plpgsql'
         AND p.provolatile = 's'
+        AND p.proparallel = 'u' AND NOT p.proisstrict
       ) IS DISTINCT FROM TRUE
     UNION ALL
     SELECT 'not SECURITY DEFINER' FROM pg_catalog.pg_proc p
@@ -454,6 +466,62 @@ BEGIN
   ) s;
   IF v_detail IS NOT NULL THEN
     RAISE EXCEPTION 'unexpected_migration_history_shape: % - the live history table does not match the pinned CLI contract. Nothing was changed - STOP and escalate.', v_detail;
+  END IF;
+
+  -- ==========================================================================
+  -- STEP 4b — POST-LOCK (R15.6.2): the pinned privilege contract. The CLI's
+  -- own DDL creates the schema and table WITHOUT any grant, as the contract
+  -- owner, and the platform's default privileges are scoped to schema public.
+  -- Pinned state: schema owner = table owner = contract owner; nspacl NULL and
+  -- relacl NULL (ZERO explicit ACL entries — any materialized entry, including
+  -- a redundant owner self-grant, is drift); and NO role other than superusers
+  -- and the owner holds schema USAGE/CREATE or ANY table privilege (SELECT,
+  -- INSERT, UPDATE, DELETE, TRUNCATE, REFERENCES, TRIGGER). Privilege functions
+  -- follow role membership, so inherited access is caught. Browser-facing roles
+  -- (anon, authenticated) and service_role must have NO path to migration
+  -- history. Runs AFTER the lock under READ COMMITTED, so every grant committed
+  -- before the lock was acquired is seen and refused. (GRANT itself does not
+  -- conflict with SHARE ROW EXCLUSIVE — empirically verified — so a grant
+  -- committed after this recheck is possible; it cannot alter the recorded row,
+  -- and the mandatory, separately authorized POST 27 certification evaluates
+  -- the privilege contract again in its own snapshot and refuses it.)
+  -- ==========================================================================
+  SELECT pg_catalog.string_agg(fail, ', ') INTO v_detail FROM (
+    SELECT 'schema missing' AS fail
+      WHERE NOT EXISTS (SELECT 1 FROM pg_catalog.pg_namespace n
+                         WHERE n.nspname = 'supabase_migrations')
+    UNION ALL
+    SELECT 'schema owner drift' FROM pg_catalog.pg_namespace n
+      WHERE n.nspname = 'supabase_migrations'
+        AND (n.nspowner = v_owner_oid) IS DISTINCT FROM TRUE
+    UNION ALL
+    SELECT 'schema ACL not empty (explicit entries present)' FROM pg_catalog.pg_namespace n
+      WHERE n.nspname = 'supabase_migrations'
+        AND (n.nspacl IS NULL) IS DISTINCT FROM TRUE
+    UNION ALL
+    SELECT 'table ACL not empty (explicit entries present)' FROM pg_catalog.pg_class c
+      WHERE c.oid = v_reloid
+        AND (c.relacl IS NULL) IS DISTINCT FROM TRUE
+    UNION ALL
+    -- Browser/application roles must exist and hold nothing, directly or via
+    -- ANY role membership (privilege functions are inheritance-aware, so
+    -- membership in a capability role such as pg_read_all_data is caught).
+    -- Direct grants to any OTHER role are caught by the NULL-ACL checks above.
+    SELECT 'browser role missing'
+      WHERE (SELECT pg_catalog.count(*) FROM pg_catalog.pg_roles r
+              WHERE r.rolname IN ('anon', 'authenticated', 'service_role')) IS DISTINCT FROM 3
+    UNION ALL
+    SELECT 'unexpected effective privilege: ' || r.rolname
+      FROM pg_catalog.pg_roles r
+     WHERE r.rolname IN ('anon', 'authenticated', 'service_role')
+       AND (pg_catalog.has_schema_privilege(r.oid,
+              (SELECT n.oid FROM pg_catalog.pg_namespace n WHERE n.nspname = 'supabase_migrations'),
+              'USAGE, CREATE')
+            OR pg_catalog.has_table_privilege(r.oid, v_reloid,
+              'SELECT, INSERT, UPDATE, DELETE, TRUNCATE, REFERENCES, TRIGGER'))
+  ) s;
+  IF v_detail IS NOT NULL THEN
+    RAISE EXCEPTION 'unexpected_migration_history_privilege: % - the migration-history privilege contract is not met; a browser or unexpected role may be able to read or mutate history. Nothing was changed - STOP and escalate.', v_detail;
   END IF;
 
   -- ==========================================================================

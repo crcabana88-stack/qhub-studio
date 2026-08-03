@@ -77,9 +77,9 @@ prohibited. The commercial migration is never re-executed anywhere by this packa
 | `docs/release/r15-6-runtime-verifier/21_PRE_PROTECTED_FUNCTION_RESTORATION.sql` | `9a4bbcae4bdba6e78355d89ae91e98b31d3b2192c66c88e7455a4a17a769cff1` |
 | `docs/release/r15-6-runtime-verifier/22_PATCH_PROTECTED_FUNCTION_RESTORATION.sql` | `f0062b2dd1b59deb768c78f54155a69515a4e28bdf6f714aed8c1e9277d00303` |
 | `docs/release/r15-6-runtime-verifier/23_POST_PROTECTED_FUNCTION_RESTORATION_VERIFY.sql` | `9ff28bc78b4083064e5794925922866eba22b392c3c51daa05b6ca4ebead6f0f` |
-| `docs/release/r15-6-migration-history/25_PRE_MIGRATION_HISTORY_VERIFY.sql` | `ecc21963ea44555132d87e89edffce45b40745b36c57a139f23d66a6d4f096a4` |
-| `docs/release/r15-6-migration-history/26_MIGRATION_HISTORY_RECORD.sql` | `6d1605e7cb45195f8312098e1258e322648c6fbce10cb956c8ada82bab7274c8` |
-| `docs/release/r15-6-migration-history/27_POST_MIGRATION_HISTORY_VERIFY.sql` | `e63e12ec60c4d84277aedbb855923b8fa0aed06309c554194820e2567db084bc` |
+| `docs/release/r15-6-migration-history/25_PRE_MIGRATION_HISTORY_VERIFY.sql` | `2d0ffe30573433a23c60e57108f88af1d3ba1e4fd303e50de5ef79ce68c58c16` |
+| `docs/release/r15-6-migration-history/26_MIGRATION_HISTORY_RECORD.sql` | `0b234627bd749258aed52c54c71c15836df2319a4dacafe8bcb57e966ecbc726` |
+| `docs/release/r15-6-migration-history/27_POST_MIGRATION_HISTORY_VERIFY.sql` | `2427520caade2dc07e3c23842f8aff884fa9be5fc5d46f13f70e07542d8a2d5f` |
 | `app/test/fixtures/r8-20260729-cli-statements.json` | `d2e85b8c5f68735ff9cf817a5cdcfb9751a980f913ebff1c5886bab56ef9999d` |
 
 ## Sequence
@@ -111,6 +111,27 @@ EXCLUSIVE) and with itself, so concurrent `26` runs and any concurrent CLI repai
 proven by two-independent-session tests against a real PostgreSQL 16 server
 (`app/test/commercial-r15-6-history-concurrency.test.ts`).
 
+## Privilege and verifier-metadata contracts (second correction)
+
+All three artifacts additionally bind, into their verdicts and gates:
+
+- **The migration-history privilege contract** (derivation in the analysis §4c): schema owner =
+  table owner = the contract owner; `pg_namespace.nspacl` **NULL** and `pg_class.relacl`
+  **NULL** — zero explicit ACL entries, so any grantee/grantor/grantability/PUBLIC entry at all
+  is drift; and the browser/application roles `anon`, `authenticated`, `service_role` must exist
+  and hold **no** schema USAGE/CREATE and **no** table SELECT/INSERT/UPDATE/DELETE/TRUNCATE/
+  REFERENCES/TRIGGER privilege, directly or through any role membership (the checks are
+  inheritance-aware). PRE additionally displays, clearly labeled informational, the full
+  inventory of non-superuser non-owner roles with any effective access (on a healthy deployment
+  this contains at most PostgreSQL's predefined `pg_*` capability bundles) for human review.
+- **The verifier metadata pins** `proparallel = 'u'` (PARALLEL UNSAFE) and `proisstrict = false`
+  (CALLED ON NULL INPUT), from the approved verifier artifact, NULL-safe.
+
+`26` re-checks both contracts inside its transaction, after the SHARE ROW EXCLUSIVE lock and
+before the verifier call and any durable DML. `27` — run separately, in its own snapshot — is
+the final certification and refuses any privilege or metadata drift, including one that lands
+after `26`'s recheck.
+
 ## Exact authorized mutation inventory
 
 - **Durable:** at most ONE row inserted into `supabase_migrations.schema_migrations` —
@@ -135,12 +156,16 @@ supplemental SQL:
 - `25` returns `UNEXPECTED_MIGRATION_HISTORY_STOP` — including: target under another name,
   NULL-name row, target with NULL/incomplete/different statements, name under another version,
   any malformed recorded version, any newer version, any table-contract drift (columns, PK,
-  constraints, indexes, triggers, rules, policies, RLS, inheritance, owner, kind), verifier
-  authority or readiness drift, missing history table
+  constraints, indexes, triggers, rules, policies, RLS, inheritance, owner, kind), **any
+  schema/table privilege drift** (schema or table owner drift, any explicit `nspacl`/`relacl`
+  entry — the pinned state is NULL/zero entries — or `anon`/`authenticated`/`service_role`
+  holding schema USAGE/CREATE or any table privilege, directly or through role membership),
+  **verifier `proparallel` or `proisstrict` drift** (pinned: PARALLEL UNSAFE, CALLED ON NULL
+  INPUT), any other verifier authority or readiness drift, or a missing history table
 - `26` raises any exception (`migration_history_payload_integrity`,
   `unexpected_runtime_verifier_state`, `unexpected_runtime_verifier_authority`,
   `migration_history_product_not_ready`, `unexpected_migration_history_shape`,
-  `migration_history_conflict`, or any SQL error)
+  `unexpected_migration_history_privilege`, `migration_history_conflict`, or any SQL error)
 - `26`'s final SELECT shows anything other than the exact expected values
 - `27` is not exactly `MIGRATION_20260729_HISTORY_RECONCILED`
 - **any notice, warning, unexpected result row, SQL error, timeout, cancellation, connection

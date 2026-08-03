@@ -209,7 +209,12 @@ describe('R15.6 history package — static contracts', () => {
     );
     expect(inserts.sort()).toEqual(['pg_temp.r15_6_migration_history_audit', 'supabase_migrations.schema_migrations']);
 
-    expect(exec).not.toMatch(/\b(UPDATE|DELETE|TRUNCATE)\b/i);
+    /*
+     * Statement-anchored: the privilege-name string literals passed to
+     * has_table_privilege ('SELECT, INSERT, UPDATE, ...') are data, not DML.
+     */
+    expect(exec).not.toMatch(/^\s*(UPDATE|DELETE|TRUNCATE)\b/im);
+    expect(exec).not.toMatch(/\b(UPDATE|DELETE|TRUNCATE)\s+(supabase_migrations|pg_temp|public)\./i);
     expect(exec).not.toMatch(/ON CONFLICT/i);
     expect(exec).not.toMatch(/^\s*(GRANT|REVOKE)\b/im);
 
@@ -405,6 +410,42 @@ describe('R15.6 history package — PRE 25 verdicts', () => {
          AS $f$ BEGIN RETURN jsonb_build_object('ready', true, 'failed', '[]'::jsonb,
            'expected_version', '2026-07-30.commercial-launch-r8'); END $f$;`,
     ],
+
+    /*
+     * R15.6.2 — history privilege contract (second-review P1-1; each case below
+     * produced a reproducible false SAFE before the fix).
+     */
+    [
+      'anon direct SELECT + schema USAGE on history',
+      `GRANT USAGE ON SCHEMA supabase_migrations TO anon;
+       GRANT SELECT ON supabase_migrations.schema_migrations TO anon;`,
+    ],
+    [
+      'anon direct INSERT/UPDATE/DELETE on history',
+      `GRANT INSERT, UPDATE, DELETE ON supabase_migrations.schema_migrations TO anon;`,
+    ],
+    ['authenticated ALL on history', `GRANT ALL ON supabase_migrations.schema_migrations TO authenticated;`],
+    ['PUBLIC SELECT on history', `GRANT SELECT ON supabase_migrations.schema_migrations TO PUBLIC;`],
+    [
+      'history privilege via role membership',
+      `CREATE ROLE r156p1 NOLOGIN;
+       GRANT SELECT ON supabase_migrations.schema_migrations TO r156p1;
+       GRANT r156p1 TO anon;`,
+    ],
+    [
+      'materialized owner self-grant (relacl no longer NULL)',
+      `GRANT SELECT ON supabase_migrations.schema_migrations TO postgres;`,
+    ],
+    ['schema USAGE drift only', `GRANT USAGE ON SCHEMA supabase_migrations TO authenticated;`],
+
+    // R15.6.2 — verifier metadata contract (second-review P1-2).
+    ['verifier PARALLEL SAFE', `ALTER FUNCTION public.qhub_verify_commercial_schema() PARALLEL SAFE;`],
+    ['verifier PARALLEL RESTRICTED', `ALTER FUNCTION public.qhub_verify_commercial_schema() PARALLEL RESTRICTED;`],
+    ['verifier STRICT', `ALTER FUNCTION public.qhub_verify_commercial_schema() STRICT;`],
+    [
+      'verifier PARALLEL SAFE + STRICT together',
+      `ALTER FUNCTION public.qhub_verify_commercial_schema() PARALLEL SAFE STRICT;`,
+    ],
   ];
 
   for (const [name, setup] of STOPS) {
@@ -591,6 +632,63 @@ describe('R15.6 history package — RECORD 26', () => {
        CREATE POLICY sneaky_pol ON supabase_migrations.schema_migrations FOR SELECT USING (true);`,
       /unexpected_migration_history_shape/,
     ],
+
+    // R15.6.2 — history privilege contract inside the mutation transaction.
+    [
+      'privilege: anon SELECT + schema USAGE',
+      `GRANT USAGE ON SCHEMA supabase_migrations TO anon;
+       GRANT SELECT ON supabase_migrations.schema_migrations TO anon;`,
+      /unexpected_migration_history_privilege/,
+    ],
+    [
+      'privilege: anon DML',
+      `GRANT INSERT, UPDATE, DELETE ON supabase_migrations.schema_migrations TO anon;`,
+      /unexpected_migration_history_privilege/,
+    ],
+    [
+      'privilege: authenticated ALL',
+      `GRANT ALL ON supabase_migrations.schema_migrations TO authenticated;`,
+      /unexpected_migration_history_privilege/,
+    ],
+    [
+      'privilege: PUBLIC SELECT',
+      `GRANT SELECT ON supabase_migrations.schema_migrations TO PUBLIC;`,
+      /unexpected_migration_history_privilege/,
+    ],
+    [
+      'privilege: via role membership',
+      `CREATE ROLE r156p2 NOLOGIN;
+       GRANT SELECT ON supabase_migrations.schema_migrations TO r156p2;
+       GRANT r156p2 TO anon;`,
+      /unexpected_migration_history_privilege/,
+    ],
+    [
+      'privilege: materialized owner self-grant',
+      `GRANT SELECT ON supabase_migrations.schema_migrations TO postgres;`,
+      /unexpected_migration_history_privilege/,
+    ],
+    [
+      'privilege: schema USAGE drift',
+      `GRANT USAGE ON SCHEMA supabase_migrations TO authenticated;`,
+      /unexpected_migration_history_privilege/,
+    ],
+
+    // R15.6.2 — verifier metadata contract inside the mutation transaction.
+    [
+      'verifier metadata: PARALLEL SAFE',
+      `ALTER FUNCTION public.qhub_verify_commercial_schema() PARALLEL SAFE;`,
+      /unexpected_runtime_verifier_authority/,
+    ],
+    [
+      'verifier metadata: STRICT',
+      `ALTER FUNCTION public.qhub_verify_commercial_schema() STRICT;`,
+      /unexpected_runtime_verifier_authority/,
+    ],
+    [
+      'verifier metadata: both drifts together',
+      `ALTER FUNCTION public.qhub_verify_commercial_schema() PARALLEL SAFE STRICT;`,
+      /unexpected_runtime_verifier_authority/,
+    ],
   ];
 
   for (const [name, setup, rx] of FAILS) {
@@ -760,6 +858,32 @@ describe('R15.6 history package — POST 27', () => {
       `ALTER TABLE supabase_migrations.schema_migrations ADD COLUMN extra text;`,
     ],
     ['product no longer READY', `GRANT EXECUTE ON FUNCTION public.qhub_row_immutable() TO anon;`],
+
+    // R15.6.2 — history privilege drift after recording.
+    [
+      'anon granted SELECT on history',
+      `GRANT USAGE ON SCHEMA supabase_migrations TO anon;
+       GRANT SELECT ON supabase_migrations.schema_migrations TO anon;`,
+    ],
+    [
+      'authenticated granted DML on history',
+      `GRANT INSERT, UPDATE, DELETE ON supabase_migrations.schema_migrations TO authenticated;`,
+    ],
+    [
+      'history privilege via role membership',
+      `CREATE ROLE r156p3 NOLOGIN;
+       GRANT SELECT ON supabase_migrations.schema_migrations TO r156p3;
+       GRANT r156p3 TO anon;`,
+    ],
+    [
+      'materialized table ACL (relacl no longer NULL)',
+      `GRANT SELECT ON supabase_migrations.schema_migrations TO postgres;`,
+    ],
+
+    // R15.6.2 — verifier metadata drift after recording.
+    ['verifier PARALLEL SAFE', `ALTER FUNCTION public.qhub_verify_commercial_schema() PARALLEL SAFE;`],
+    ['verifier STRICT', `ALTER FUNCTION public.qhub_verify_commercial_schema() STRICT;`],
+    ['verifier both metadata drifts', `ALTER FUNCTION public.qhub_verify_commercial_schema() PARALLEL SAFE STRICT;`],
   ];
 
   for (const [name, drift] of FAILS) {

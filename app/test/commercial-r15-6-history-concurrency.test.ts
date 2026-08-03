@@ -218,26 +218,45 @@ describe.skipIf(!HAVE_PG)('R15.6 RECORD — SHARE ROW EXCLUSIVE serialization on
     ).toBe('0');
   }, 120_000);
 
-  const RACES: Array<[string, string]> = [
+  const RACES: Array<[string, string, RegExp]> = [
+    /*
+     * R15.6.2 — a GRANT committed while 26 waits on the lock must be refused by
+     * the post-lock privilege recheck. NOTE (empirically verified): GRANT does
+     * NOT conflict with SHARE ROW EXCLUSIVE, so the guarantee here is
+     * visibility, not serialization — 26 makes NO pre-lock authorization
+     * decision, and its post-lock READ COMMITTED recheck sees every grant
+     * committed up to lock acquisition. A grant committed after the recheck
+     * cannot alter the recorded row and is refused by the mandatory POST 27
+     * certification in its own snapshot.
+     */
+    [
+      'anon SELECT granted during the wait',
+      `GRANT SELECT ON supabase_migrations.schema_migrations TO anon;`,
+      /unexpected_migration_history_privilege/,
+    ],
     [
       'wrong-name target row committed during the wait',
       `INSERT INTO supabase_migrations.schema_migrations (version, name) VALUES ('20260729', 'something_else');`,
+      /migration_history_conflict/,
     ],
     [
       'same name under another version committed during the wait',
       `INSERT INTO supabase_migrations.schema_migrations (version, name) VALUES ('20260728', 'commercial_launch_foundation');`,
+      /migration_history_conflict/,
     ],
     [
       'newer version committed during the wait',
       `INSERT INTO supabase_migrations.schema_migrations (version, name) VALUES ('20260801', 'mystery');`,
+      /migration_history_conflict/,
     ],
     [
       'malformed version committed during the wait',
       `INSERT INTO supabase_migrations.schema_migrations (version, name) VALUES ('2026x729', 'weird');`,
+      /migration_history_conflict/,
     ],
   ];
 
-  for (const [label, conflictSql] of RACES) {
+  for (const [label, conflictSql, refusalRx] of RACES) {
     it(`c3 — race: ${label} => 26 blocks, then its post-lock recheck refuses`, async () => {
       resetHistory();
 
@@ -264,7 +283,7 @@ describe.skipIf(!HAVE_PG)('R15.6 RECORD — SHARE ROW EXCLUSIVE serialization on
           await a.waitFor('A_DONE');
 
           await b.waitFor('B_FINISHED', 30000);
-          expect(b.buf).toMatch(/migration_history_conflict/);
+          expect(b.buf).toMatch(refusalRx);
         } finally {
           b.end();
         }

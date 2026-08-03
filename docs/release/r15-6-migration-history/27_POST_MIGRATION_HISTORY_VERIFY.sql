@@ -89,8 +89,11 @@ checks AS (
     ((SELECT count(*) FROM pg_proc p2 JOIN pg_namespace n2 ON n2.oid = p2.pronamespace
        WHERE n2.nspname = 'public' AND p2.proname = 'qhub_verify_commercial_schema') = 1)
                                                                                  AS single_function_no_overload,
+    -- R15.6.2: proparallel and proisstrict pinned from the approved verifier
+    -- artifact (STABLE, CALLED ON NULL INPUT, PARALLEL UNSAFE). NULL-safe.
     coalesce((SELECT (p.prorettype = 'jsonb'::regtype AND NOT p.proretset AND p.prokind = 'f'
-                  AND l.lanname = 'plpgsql' AND p.provolatile = 's')
+                  AND l.lanname = 'plpgsql' AND p.provolatile = 's'
+                  AND p.proparallel = 'u' AND NOT p.proisstrict)
                FROM pg_proc p JOIN pg_language l ON l.oid = p.prolang
               WHERE p.oid = b.oid), FALSE)                                       AS semantic_callable_exact,
     coalesce(b.proowner = (SELECT c.relowner FROM pg_class c
@@ -202,6 +205,61 @@ hist_shape AS (
                 WHERE i.inhrelid = h.reloid OR i.inhparent = h.reloid)
                 FROM hist h), FALSE)                                             AS no_inheritance
 ),
+-- R15.6.2 — the pinned privilege contract (see 25 for the derivation): schema
+-- owner = table owner = contract owner, nspacl NULL, relacl NULL (zero explicit
+-- entries), and no role other than superusers and the owner holding schema
+-- USAGE/CREATE or any table privilege — evaluated per pg_roles role through the
+-- inheritance-aware privilege functions, so membership-derived access is caught.
+hist_priv AS (
+  SELECT
+    coalesce((SELECT n.nspowner = (SELECT c2.relowner FROM pg_class c2
+                 WHERE c2.oid = to_regclass('public.qhub_manual_review_requests'))
+                FROM pg_namespace n WHERE n.nspname = 'supabase_migrations'), FALSE)
+                                                                                 AS schema_owner_ok,
+    coalesce((SELECT n.nspacl IS NULL FROM pg_namespace n
+               WHERE n.nspname = 'supabase_migrations'), FALSE)                  AS schema_acl_empty,
+    coalesce((SELECT c.relacl IS NULL FROM pg_class c, hist h
+               WHERE c.oid = h.reloid), FALSE)                                   AS table_acl_empty,
+    -- Browser/application roles established by authoritative evidence (anon,
+    -- authenticated, service_role) must EXIST and must hold NO schema or table
+    -- privilege, directly or through any role membership (the privilege
+    -- functions are inheritance-aware, so access inherited from a capability
+    -- role such as pg_read_all_data is caught here too).
+    coalesce(((SELECT count(*) FROM pg_roles r
+                WHERE r.rolname IN ('anon', 'authenticated', 'service_role')) = 3), FALSE)
+                                                                                 AS browser_roles_present,
+    coalesce((SELECT h.reloid IS NOT NULL AND ns.oid IS NOT NULL
+                 AND NOT EXISTS (
+                   SELECT 1 FROM pg_roles r
+                    WHERE r.rolname IN ('anon', 'authenticated', 'service_role')
+                      AND (has_schema_privilege(r.oid, ns.oid, 'USAGE, CREATE')
+                           OR has_table_privilege(r.oid, h.reloid,
+                                'SELECT, INSERT, UPDATE, DELETE, TRUNCATE, REFERENCES, TRIGGER')))
+                FROM hist h
+                LEFT JOIN LATERAL (SELECT n.oid FROM pg_namespace n
+                                    WHERE n.nspname = 'supabase_migrations') ns ON TRUE), FALSE)
+                                                                                 AS no_browser_role_privilege,
+    -- INFORMATIONAL ONLY (deliberately non-gating, and named accordingly): the
+    -- complete inventory of non-superuser, non-owner roles holding any effective
+    -- schema/table access. On a healthy deployment this contains at most
+    -- PostgreSQL's predefined pg_* capability bundles (e.g. pg_read_all_data),
+    -- which hold read/write on EVERY table by design and whose live membership
+    -- inventory cannot be pinned offline; gating them would make the healthy
+    -- state unsatisfiable. Direct grants to ANY role are gated by the
+    -- cardinality-zero nspacl/relacl checks above, and browser/app roles are
+    -- gated inheritance-aware — this column exists so the human reviewer sees
+    -- the full picture at PRE time.
+    (SELECT array_agg(r.rolname ORDER BY r.rolname)
+       FROM pg_roles r, hist h,
+            LATERAL (SELECT n.oid FROM pg_namespace n WHERE n.nspname = 'supabase_migrations') ns
+      WHERE h.reloid IS NOT NULL AND NOT r.rolsuper
+        AND r.oid IS DISTINCT FROM (SELECT c2.relowner FROM pg_class c2
+              WHERE c2.oid = to_regclass('public.qhub_manual_review_requests'))
+        AND (has_schema_privilege(r.oid, ns.oid, 'USAGE, CREATE')
+             OR has_table_privilege(r.oid, h.reloid,
+                  'SELECT, INSERT, UPDATE, DELETE, TRUNCATE, REFERENCES, TRIGGER')))
+                                                                                 AS roles_with_access_informational
+),
 hist_rows AS (
   SELECT
     CASE WHEN (SELECT h.reloid IS NOT NULL AND h.cols_ok FROM hist h) THEN
@@ -265,6 +323,8 @@ SELECT
   s.table_present, s.kind_ok, s.table_owner_ok, s.rls_off,
   s.columns_exact, s.constraints_exact, s.pk_exact, s.indexes_exact,
   s.no_triggers, s.no_rules, s.no_policies, s.no_inheritance,
+  v.schema_owner_ok, v.schema_acl_empty, v.table_acl_empty,
+  v.browser_roles_present, v.no_browser_role_privilege, v.roles_with_access_informational,
   r.malformed_rows, r.newer_version_rows, r.name_conflict_rows,
   r.target_rows, r.target_exact_rows, r.target_row_detail,
   CASE
@@ -278,6 +338,10 @@ SELECT
      AND coalesce(s.pk_exact, FALSE) AND coalesce(s.indexes_exact, FALSE)
      AND coalesce(s.no_triggers, FALSE) AND coalesce(s.no_rules, FALSE)
      AND coalesce(s.no_policies, FALSE) AND coalesce(s.no_inheritance, FALSE)
+     AND coalesce(v.schema_owner_ok, FALSE) AND coalesce(v.schema_acl_empty, FALSE)
+     AND coalesce(v.table_acl_empty, FALSE)
+     AND coalesce(v.browser_roles_present, FALSE)
+     AND coalesce(v.no_browser_role_privilege, FALSE)
      AND r.malformed_rows IS NOT DISTINCT FROM '0'
      AND r.newer_version_rows IS NOT DISTINCT FROM '0'
      AND r.name_conflict_rows IS NOT DISTINCT FROM '0'
@@ -288,6 +352,7 @@ SELECT
   END                                                              AS final_status
 FROM product p
 CROSS JOIN hist_shape s
+CROSS JOIN hist_priv v
 CROSS JOIN hist_rows r;
 
 COMMIT;

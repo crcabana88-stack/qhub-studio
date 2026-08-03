@@ -14,7 +14,7 @@ from the locally installed, pinned CLI binary — nothing was fetched.
 | SHA-256 | `1509eb59056764b0b6500aa8bfbb2df65eb330a1ff363758bff0e4797427a755` |
 | Migration version | `20260729` |
 | Migration name | `commercial_launch_foundation` |
-| Expected history representation | one row `(version='20260729', name='commercial_launch_foundation')` in `supabase_migrations.schema_migrations` |
+| Expected history representation | one complete row in `supabase_migrations.schema_migrations(version, statements, name)`: `version='20260729'`, `name='commercial_launch_foundation'`, `statements` = the exact 89-element CLI-derived `text[]` payload (124,959 bytes, canonical digest `7b28ccf3ba7cae3e29c17bc5c3be60b6`). The statements are INSERT data only and are never executed. There is no two-field or NULL-statements insert; the only permitted durable mutation is one explicit three-column INSERT, and an already-exact state is a no-op. |
 
 Version and name are not guessed: they are the output of the pinned CLI's own filename parser
 (§2) applied to the committed filename.
@@ -89,7 +89,7 @@ So `supabase migration repair --status applied 20260729` would: (1) require the 
 
 | Criterion | CLI `migration repair --status applied` | Narrow SQL transaction (chosen) |
 |---|---|---|
-| Exact mutation scope | one upsert row (proven) — but may **UPDATE** an existing row | at most one INSERT of `(version, name)`; can never update or delete |
+| Exact mutation scope | one upsert row (proven) — but may **UPDATE** an existing row | at most one explicit three-column INSERT into `supabase_migrations.schema_migrations(version, statements, name)` carrying the exact CLI-derived statements payload; can never update or delete; already-exact state is a no-op |
 | Duplicate/conflict protection | **none** — `ON CONFLICT (version) DO UPDATE` silently overwrites a conflicting name/statements | refuses: wrong-name row, NULL-name (partial/legacy) row, same name under another version, any version newer than `20260729` |
 | Verifier-READY gating | impossible | mandatory in-transaction gate: verifier digest + authority + `ready=true`, exact version, `failed=[]` |
 | Transaction behavior | BEGIN/COMMIT with rollback (proven) | explicit BEGIN/COMMIT; every gate raises before the insert; any exception rolls back everything |
@@ -164,6 +164,41 @@ INSERT both block; conflicts committed while `26` waits are refused by the post-
 (wrong-name, same-name-other-version, newer-version, malformed-version races); of two concurrent
 runs exactly one records and the other no-ops. Isolation is explicitly READ COMMITTED so
 post-lock reads observe the newest committed state.
+
+## 4c. The migration-history privilege contract (CORRECTED — second review P1-1)
+
+The pinned privilege state is derived from the same authoritative evidence as the table shape:
+the CLI's own extracted DDL contains **no GRANT of any kind** and runs as the connecting role
+(the contract owner), and the platform's default-privilege statements are scoped to schema
+`public` — they never touch `supabase_migrations`. PostgreSQL grants PUBLIC nothing on a new
+non-public schema or a new table. The pinned deployment state is therefore:
+
+| Item | Pinned value |
+|---|---|
+| `supabase_migrations` schema owner | the contract owner (owner of the migration-created tables) |
+| `schema_migrations` table owner | the contract owner |
+| `pg_namespace.nspacl` | **NULL** — zero explicit entries |
+| `pg_class.relacl` | **NULL** — zero explicit entries |
+| Effective schema USAGE/CREATE | owner and superusers only |
+| Effective table SELECT/INSERT/UPDATE/DELETE/TRUNCATE/REFERENCES/TRIGGER | owner and superusers only |
+| anon / authenticated / service_role | **no privilege of any kind, direct or inherited** |
+
+Because the pinned explicit ACLs are NULL, *any* materialized entry — an extra grantee, a
+redundant owner self-grant, a different grantor, a grantable bit, a PUBLIC grant — changes
+`nspacl`/`relacl` away from NULL and fails the cardinality-zero contract; there is no NULL
+ambiguity because NULL is asserted affirmatively (`acl IS NULL` must be TRUE, NULL-safely).
+Effective privileges are enumerated per `pg_roles` role with
+`has_schema_privilege`/`has_table_privilege`, which follow role membership, so
+membership-derived access fails closed too. All three artifacts bind this contract into their
+verdicts: PRE 25 STOPs, RECORD 26 raises `unexpected_migration_history_privilege` **after** the
+SHARE ROW EXCLUSIVE lock and before any durable DML — there is no pre-lock authorization
+decision, and the post-lock READ COMMITTED recheck sees every grant committed up to lock
+acquisition (GRANT itself does not conflict with SHARE ROW EXCLUSIVE — empirically verified — so
+a grant landing after the recheck is possible; it cannot alter the recorded row and is refused by
+the mandatory, separately authorized POST 27 in its own snapshot). POST 27 returns
+NOT_RECONCILED on any privilege drift. The verifier metadata contract was simultaneously
+completed with `proparallel = 'u'` and `proisstrict = false`, pinned from the approved verifier
+artifact; both feed the same verdicts and gates.
 
 ## 5. What could not be proven offline, and how the package closes it
 
