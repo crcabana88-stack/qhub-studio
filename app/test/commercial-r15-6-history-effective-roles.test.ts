@@ -115,6 +115,59 @@ const preVerdict = () =>
 const postVerdict = () =>
   /MIGRATION_20260729_HISTORY_RECONCILED|MIGRATION_HISTORY_NOT_RECONCILED/.exec(runFile(POST27))?.[0] ?? 'NO_VERDICT';
 
+/**
+ * POST 27's single result row as a name->value map. Runs psql WITH headers so
+ * columns are addressed by name rather than by fragile position.
+ */
+function postRow(): Record<string, string> {
+  const out = execFileSync(
+    PSQL,
+    [
+      '-h',
+      '127.0.0.1',
+      '-p',
+      PORT,
+      '-U',
+      'scratch',
+      '-X',
+      '-A',
+      '-F',
+      '|',
+      '-v',
+      'ON_ERROR_STOP=1',
+      '-d',
+      DB,
+      '-f',
+      POST27,
+    ],
+    { encoding: 'utf8', timeout: 180000 },
+  );
+  const lines = out.split(/\r?\n/).filter((l) => l.includes('|'));
+  const headerIdx = lines.findIndex((l) => l.startsWith('verifier_present|'));
+  const header = lines[headerIdx].split('|');
+  const values = lines[headerIdx + 1].split('|');
+
+  return Object.fromEntries(header.map((h, i) => [h, values[i]]));
+}
+
+/**
+ * Records the EXACT target row by running the reviewed RECORD 26 against a
+ * clean, undrifted database — so a later POST assertion can isolate a single
+ * predicate instead of also tripping the statements-array contract.
+ * (Corrects the previously reported non-blocking P2 test-isolation weakness:
+ * the earlier fixture seeded statements = ARRAY['x'], which made POST fail for
+ * two independent reasons at once.)
+ */
+function recordExactRowOnCleanState(): void {
+  resetHistory();
+
+  const rec = runFile(REC26);
+
+  if (!/RECORDED_NOW/.test(rec)) {
+    throw new Error(`precondition failed: clean-state RECORD did not record: ${rec.slice(0, 300)}`);
+  }
+}
+
 describe.skipIf(!HAVE_PG)('R15.6 — mandatory effective-role coverage on real PostgreSQL', () => {
   beforeAll(() => {
     for (const role of ['anon NOLOGIN', 'authenticated NOLOGIN', 'service_role NOLOGIN BYPASSRLS']) {
@@ -241,11 +294,35 @@ describe.skipIf(!HAVE_PG)('R15.6 — mandatory effective-role coverage on real P
         expect(rec).not.toMatch(/RECORDED_NOW/);
         expect(fingerprint(), 'durable history must be byte-identical').toBe(before);
 
-        // Seed the exact-looking target row so POST is judged on privilege, not absence.
-        run(`INSERT INTO ${TBL} (version, name, statements)
-             SELECT '20260729', 'commercial_launch_foundation', ARRAY['x']
-              WHERE NOT EXISTS (SELECT 1 FROM ${TBL} WHERE version = '20260729');`);
-        expect(postVerdict(), 'POST must not certify').toBe('MIGRATION_HISTORY_NOT_RECONCILED');
+        /*
+         * POST isolation: record the EXACT 89-element row on a fully clean
+         * database first, then re-apply ONLY the privilege drift, so the sole
+         * unsatisfied predicate is the privilege gate. target_exact_rows = 1
+         * then proves the history row itself (version, name, and the complete
+         * statements array) is exact. Order matters: the schema must be dropped
+         * before the roles, or DROP ROLE fails on dependent grants.
+         */
+        resetHistory();
+        run(teardown);
+        recordExactRowOnCleanState();
+        run(setup);
+
+        /*
+         * psql unaligned output renders booleans as t/f; xpath-derived product
+         * columns and the verdict are text.
+         */
+        const post = postRow();
+        expect(post.target_rows, 'exactly one target row').toBe('1');
+        expect(post.target_exact_rows, 'the row is the exact 89-element record').toBe('1');
+        expect(post.product_ready, 'product verifier still READY').toBe('true');
+        expect(post.product_failed_count, 'product verifier reports no failures').toBe('0');
+        expect(post.columns_exact, 'table contract still exact').toBe('t');
+        expect(post.constraints_exact, 'constraint contract still exact').toBe('t');
+        expect(post.name_conflict_rows, 'no name conflict').toBe('0');
+        expect(post.newer_version_rows, 'no newer version').toBe('0');
+        expect(post.malformed_rows, 'no malformed version').toBe('0');
+        expect(post.no_unauthorized_access_path, 'the isolated failing predicate').toBe('f');
+        expect(post.final_status, 'POST must not certify').toBe('MIGRATION_HISTORY_NOT_RECONCILED');
       } finally {
         resetHistory();
         run(teardown);
