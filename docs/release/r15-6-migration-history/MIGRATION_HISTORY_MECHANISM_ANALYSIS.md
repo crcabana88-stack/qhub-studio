@@ -25,8 +25,9 @@ The project's only established history mechanism is the Supabase CLI pinned by e
 runbook (`npx --yes supabase@2.110.0`, in `docs/release/r15-2-verifier-patch/`,
 `r15-3-body-restoration/`, `r15-5-runtime-verifier/`, `r15-6-runtime-verifier/`). That exact
 version is present offline in the local npx cache
-(`npm-cache/_npx/7960735060baecd3/node_modules/supabase`, package.json version `2.110.0`, Go/JS
-binary `@supabase/cli-windows-x64/bin/supabase.exe`). The following was extracted **verbatim**
+(`npm-cache/_npx/7960735060baecd3/node_modules/supabase`, package.json version `2.110.0`;
+platform binary `@supabase/cli-windows-x64/bin/supabase.exe`, package version `2.110.0`, SHA-256
+`14814afa6fe59081eb9f24709fc077226bf89bc25cf77ee3bcb19565f3ef8899`). The following was extracted **verbatim**
 from that binary; no network access and no execution against any project occurred.
 
 Filename parsing:
@@ -93,7 +94,7 @@ So `supabase migration repair --status applied 20260729` would: (1) require the 
 | Verifier-READY gating | impossible | mandatory in-transaction gate: verifier digest + authority + `ready=true`, exact version, `failed=[]` |
 | Transaction behavior | BEGIN/COMMIT with rollback (proven) | explicit BEGIN/COMMIT; every gate raises before the insert; any exception rolls back everything |
 | Auditability | prints `Repaired migration history: [20260729] => applied`; inserted values depend on the operator's local checkout at run time | the artifact is committed, hash-pinned, reviewed; the final SELECT returns the exact action taken and the resulting row |
-| Metadata preservation | records `statements` (CLI statement split of the local file) | records `statements = NULL` (see §4) |
+| Metadata preservation | records `statements` (CLI statement split of the local file) | records the **identical** CLI-derived statements array, fixed at review time and digest-gated (see §4 — corrected) |
 | Wrong-project protection | linked project ref only | runs only inside the project's SQL Editor per runbook, and the in-transaction gates require this exact database's verifier digest + READY state — a different project fails closed |
 | Offline provability | behavior proven from the installed binary, but execution needs network + link + credentials, and `npx --yes` may re-contact the registry | fully self-contained SQL |
 | Established live-mutation channel | never used live in this project so far | **every** prior live mutation in this release went through hash-pinned SQL Editor artifacts with PRE/PATCH/POST gates |
@@ -105,23 +106,64 @@ The SQL artifact produces the identical single-row outcome using the CLI's own d
 table contract, adds every refusal the CLI lacks, and travels the project's established, reviewed
 live-mutation channel.
 
-## 4. The `statements` field — explicitly NULL, not guessed
+## 4. The `statements` field — the exact CLI array, derived offline (CORRECTED)
 
-The CLI would record `statements` as its own parser's statement split of the 125,186-byte
-migration. That split is implemented inside the minified binary and is **not reproducible offline
-with byte certainty**; fabricating an approximation would violate the derive-don't-guess rule.
-The chosen mutation therefore records `statements = NULL`, which is safe and honest because:
+> The first revision of this package recorded `statements = NULL`. The independent review
+> rejected that (P2-1: NULL is incompatible with reliable CLI fetch/reconstruction), and an
+> authorized local-PostgreSQL validation environment made the exact derivation possible. The
+> corrected package records the complete CLI-compatible row.
 
-- the column is nullable in the CLI's own DDL (added via `ADD COLUMN IF NOT EXISTS`);
-- the CLI's version-comparison paths (`migration list`, `db push` preflight) key on `version`
-  (`SELECT version FROM … ORDER BY version`);
-- the CLI's read path tolerates missing metadata (`coalesce(name, '')`), and the R15.2 runbook
-  already documents blank remote metadata as a known, tolerated condition in this project;
-- the row can later be upgraded to carry `statements` by an explicitly authorized CLI run — that
-  decision is deliberately left to a future human gate, not smuggled into this one.
+The exact array was derived by invoking the **installed pinned binary by explicit local path**
+(never `npx`, no registry contact, no live project) against an isolated localhost-only scratch
+PostgreSQL 16 server:
 
-`name` **is** recorded, exactly, because it is fully derivable (§2) and because leaving it NULL
-would create precisely the "partial/legacy metadata" state this package treats as a STOP.
+```
+supabase.exe migration repair --status applied 20260729
+  --db-url postgresql://…@127.0.0.1:54329/<scratch-db>?sslmode=disable
+```
+
+run from a scratch project directory containing a byte-exact copy of the committed migration.
+The CLI's own parser wrote the row; the array was then read back with `psql`.
+
+**Derivation record (all against PostgreSQL 16.4, localhost only):**
+
+| Proof | Result |
+|---|---|
+| Run 1 (scratch db 1) | cardinality **89**, total statement bytes **124,959**, canonical digest **`7b28ccf3ba7cae3e29c17bc5c3be60b6`** |
+| Run 2 (scratch db 2, independent) | identical |
+| Run 3 (db 1, row deleted, re-repaired) | identical |
+| Canonical digest definition | `md5( concat over elements of octet_length(elem) ‖ ':' ‖ elem, in order )` — length-prefixed, delimiter-unambiguous; reproduced independently in Node.js over the fixture with the identical value |
+| Verbatim containment | all 89 statements are verbatim substrings of the committed migration, in order (residual 227 bytes = inter-statement whitespace/comments the parser strips) |
+| CLI fetch reconstruction | `supabase.exe migration fetch --db-url …` regenerated `supabase/migrations/20260729_commercial_launch_foundation.sql` from the stored row — non-empty, correct CLI-derived filename, 125,137 bytes, md5 `bd2bf7144c7f675bf403672765c342ca`, containing all 89 statements verbatim in order |
+
+The array is committed as `app/test/fixtures/r8-20260729-cli-statements.json`
+(SHA-256 `d2e85b8c5f68735ff9cf817a5cdcfb9751a980f913ebff1c5886bab56ef9999d`) and embedded in `26`
+as single-line base64 **INSERT data**: decoded and digest-gated inside the transaction, never
+interpreted, never executed, no dynamic SQL or `EXECUTE` path anywhere in the artifact. Base64 is
+line-ending-inert, so a CRLF-normalizing transfer channel cannot corrupt the payload — and the
+digest gate would refuse it if anything else did.
+
+An existing target row with NULL, incomplete, or different statements is a **STOP**, never an
+update.
+
+## 4b. Concurrency design (CORRECTED — review P1-1)
+
+`26` acquires `LOCK TABLE supabase_migrations.schema_migrations IN SHARE ROW EXCLUSIVE MODE`
+inside its single explicit transaction **before trusting any database state**, and holds it
+through COMMIT. Per the PostgreSQL conflict matrix, SHARE ROW EXCLUSIVE conflicts with ROW
+EXCLUSIVE (every INSERT/UPDATE/DELETE writer — including the CLI's own repair upsert) and with
+itself (two concurrent `26` runs serialize), while permitting plain readers. It is the
+least-permissive table lock with both properties (SHARE does not self-conflict for this purpose:
+two SHARE holders could each validate and then deadlock or interleave on upgrade; EXCLUSIVE
+additionally blocks ROW SHARE readers unnecessarily). Advisory locks were rejected because
+noncooperating writers do not honor them. Every gate — verifier authority, product readiness,
+table contract, conflicts — runs **after** the lock, so nothing can change between validation and
+the INSERT. Proven with two independent psql sessions against real PostgreSQL 16
+(`app/test/commercial-r15-6-history-concurrency.test.ts`): a second SRE lock and a concurrent
+INSERT both block; conflicts committed while `26` waits are refused by the post-lock recheck
+(wrong-name, same-name-other-version, newer-version, malformed-version races); of two concurrent
+runs exactly one records and the other no-ops. Isolation is explicitly READ COMMITTED so
+post-lock reads observe the newest committed state.
 
 ## 5. What could not be proven offline, and how the package closes it
 

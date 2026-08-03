@@ -1,25 +1,40 @@
 -- ============================================================================
 -- QHUB R15.6 — 27 POST MIGRATION-HISTORY VERIFY (READ-ONLY, SINGLE SNAPSHOT)
 --
--- Run this file IN FULL, as one unit, immediately after
--- 26_MIGRATION_HISTORY_RECORD.sql (or directly after a PRE verdict of
--- ALREADY_RECORDED_EXACTLY). It performs NO writes.
+-- Run this file IN FULL, as one unit, in a FRESH SESSION, after a separately
+-- authorized 26_MIGRATION_HISTORY_RECORD.sql run (or directly after a PRE
+-- verdict of ALREADY_RECORDED_EXACTLY). It performs NO writes — REPEATABLE READ
+-- + READ ONLY, no temporary or persistent object of any kind. This file — not
+-- RECORD's audit display — is the final certification of durable state.
 --
--- Certifies, from ONE REPEATABLE READ snapshot with every displayed check
--- feeding the verdict:
---   * exactly ONE history row exists for version 20260729 and its name is
---     exactly commercial_launch_foundation (values derived from the committed
---     migration filename through the pinned CLI's own parse contract)
---   * no conflicting row: the name under no other version, no version newer
---     than 20260729, and the version-PK table shape still matches the pinned
---     CLI contract
---   * the commercial verifier still has its complete reviewed authority (18
---     contract: approved body digest, owner, SECURITY DEFINER, search_path,
---     exact two-row owner+service_role ACL, effective-executor contract) and,
---     invoked ONLY behind that authority through the guarded query_to_xml
---     pattern, still returns product_ready=true with the exact schema version
---     and zero failed labels — proving no application object or state the
---     verifier binds was changed by the history-only reconciliation.
+-- Certifies, from ONE snapshot, with every displayed check feeding the verdict
+-- and all logic NULL-safe (success requires every condition affirmatively TRUE):
+--
+--   * exactly ONE history row exists for version 20260729, and its name AND
+--     complete statements array are exact: name commercial_launch_foundation,
+--     statements cardinality 89, total bytes 124,959, canonical digest
+--     7b28ccf3ba7cae3e29c17bc5c3be60b6 — the array the pinned supabase@2.110.0
+--     CLI (binary sha256 14814afa6fe59081eb9f24709fc077226bf89bc25cf77ee3
+--     bcb19565f3ef8899) deterministically records for the committed migration
+--     (sha256 1509eb59056764b0b6500aa8bfbb2df65eb330a1ff363758bff0e4797427a755).
+--     A missing, NULL, incomplete or different statements array is
+--     NOT_RECONCILED.
+--   * no conflicting row: the name under no other version, no malformed
+--     (non-numeric) recorded version anywhere — checked BEFORE any ordered
+--     comparison — and no version newer than 20260729
+--   * the COMPLETE pinned CLI table contract still holds: ordinary permanent
+--     non-partition table, exact owner, exact columns/positions/types/
+--     nullability/defaults/identity/generated (statements and name nullable
+--     exactly as the CLI defines), PK schema_migrations_pkey on (version) as
+--     the only constraint, its index as the only index, no triggers, no rules,
+--     no policies, RLS off, no inheritance
+--   * the commercial verifier still holds its complete reviewed authority
+--     (approved body digest, signature, jsonb/plpgsql/STABLE, SECURITY DEFINER,
+--     owner, search_path, exact two-row owner+service_role ACL, effective-
+--     executor contract) and — invoked ONLY behind that authority through the
+--     guarded query_to_xml pattern — returns product_ready=true, the exact
+--     schema version, and zero failed labels, proving no application object or
+--     state the verifier binds was changed by the history-only reconciliation.
 --
 --   MIGRATION_20260729_HISTORY_RECONCILED   every condition above holds
 --   MIGRATION_HISTORY_NOT_RECONCILED        anything else — capture the full
@@ -29,6 +44,7 @@
 
 BEGIN;
 SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY;
+SET LOCAL search_path = pg_catalog;
 
 WITH approved(lf_digest, crlf_digest, expected_search_path, expected_version) AS (
   VALUES (
@@ -73,6 +89,10 @@ checks AS (
     ((SELECT count(*) FROM pg_proc p2 JOIN pg_namespace n2 ON n2.oid = p2.pronamespace
        WHERE n2.nspname = 'public' AND p2.proname = 'qhub_verify_commercial_schema') = 1)
                                                                                  AS single_function_no_overload,
+    coalesce((SELECT (p.prorettype = 'jsonb'::regtype AND NOT p.proretset AND p.prokind = 'f'
+                  AND l.lanname = 'plpgsql' AND p.provolatile = 's')
+               FROM pg_proc p JOIN pg_language l ON l.oid = p.prolang
+              WHERE p.oid = b.oid), FALSE)                                       AS semantic_callable_exact,
     coalesce(b.proowner = (SELECT c.relowner FROM pg_class c
                             WHERE c.oid = to_regclass('public.qhub_manual_review_requests')), FALSE)
                                                                                  AS owner_exact,
@@ -101,6 +121,7 @@ authority AS (
     e.effective_acl_ok,
     e.unexpected_effective_executor_roles,
     (c.verifier_present AND c.zero_argument_signature AND c.single_function_no_overload
+     AND c.semantic_callable_exact
      AND c.owner_exact AND c.security_definer AND c.search_path_exact
      AND c.acl_cardinality_exact AND c.owner_execute_row_exact
      AND c.service_role_owner_granted AND c.no_unexpected_grantee AND c.no_grant_option
@@ -130,86 +151,141 @@ product AS (
   FROM authority a
 ),
 hist AS (
-  SELECT to_regclass('supabase_migrations.schema_migrations') AS reloid
+  SELECT t.reloid,
+         coalesce((SELECT count(*) = 3 FROM pg_attribute a
+                    WHERE a.attrelid = t.reloid AND NOT a.attisdropped
+                      AND a.attname IN ('version', 'name', 'statements')), FALSE) AS cols_ok
+    FROM (SELECT to_regclass('supabase_migrations.schema_migrations') AS reloid) t
 ),
 hist_shape AS (
   SELECT
     ((SELECT reloid FROM hist) IS NOT NULL)                                      AS table_present,
-    coalesce((SELECT a.atttypid = 'text'::regtype AND a.attnotnull
-                FROM pg_attribute a, hist h
-               WHERE a.attrelid = h.reloid AND a.attname = 'version'
-                 AND NOT a.attisdropped), FALSE)                                 AS version_column_exact,
-    coalesce((SELECT a.atttypid = 'text'::regtype
-                FROM pg_attribute a, hist h
-               WHERE a.attrelid = h.reloid AND a.attname = 'name'
-                 AND NOT a.attisdropped), FALSE)                                 AS name_column_exact,
-    coalesce((SELECT (SELECT array_agg(att.attname::text ORDER BY k.ord)
+    coalesce((SELECT c.relkind = 'r' AND c.relpersistence = 'p' AND NOT c.relispartition
+                FROM pg_class c, hist h WHERE c.oid = h.reloid), FALSE)          AS kind_ok,
+    coalesce((SELECT c.relowner = (SELECT c2.relowner FROM pg_class c2
+                 WHERE c2.oid = to_regclass('public.qhub_manual_review_requests'))
+                FROM pg_class c, hist h WHERE c.oid = h.reloid), FALSE)          AS table_owner_ok,
+    coalesce((SELECT NOT c.relrowsecurity AND NOT c.relforcerowsecurity
+                FROM pg_class c, hist h WHERE c.oid = h.reloid), FALSE)          AS rls_off,
+    coalesce((SELECT (SELECT string_agg(a.attname || ':' || a.attnum::text || ':'
+                        || format_type(a.atttypid, a.atttypmod)
+                        || ':' || a.attnotnull::text || ':' || a.atthasdef::text
+                        || ':' || a.attidentity::text || ':' || a.attgenerated::text, '|' ORDER BY a.attnum)
+                        FROM pg_attribute a
+                       WHERE a.attrelid = h.reloid AND a.attnum > 0 AND NOT a.attisdropped)
+                 = 'version:1:text:true:false::|statements:2:text[]:false:false::|name:3:text:false:false::'
+                FROM hist h), FALSE)                                             AS columns_exact,
+    coalesce((SELECT (SELECT string_agg(c.conname || ':' || c.contype::text, '|' ORDER BY c.conname)
+                        FROM pg_constraint c WHERE c.conrelid = h.reloid)
+                 = 'schema_migrations_pkey:p'
+                FROM hist h), FALSE)                                             AS constraints_exact,
+    coalesce((SELECT EXISTS (SELECT 1 FROM pg_constraint c
+               WHERE c.conrelid = h.reloid AND c.contype = 'p'
+                 AND (SELECT array_agg(att.attname::text ORDER BY k.ord)
                         FROM unnest(c.conkey) WITH ORDINALITY k(attnum, ord)
                         JOIN pg_attribute att
                           ON att.attrelid = c.conrelid AND att.attnum = k.attnum)
-                     = ARRAY['version']
-                FROM pg_constraint c, hist h
-               WHERE c.conrelid = h.reloid AND c.contype = 'p'), FALSE)          AS version_primary_key
+                     = ARRAY['version'])
+                FROM hist h), FALSE)                                             AS pk_exact,
+    coalesce((SELECT (SELECT string_agg(ic.relname || ':' || i.indisprimary::text, '|' ORDER BY ic.relname)
+                        FROM pg_index i JOIN pg_class ic ON ic.oid = i.indexrelid
+                       WHERE i.indrelid = h.reloid)
+                 = 'schema_migrations_pkey:true'
+                FROM hist h), FALSE)                                             AS indexes_exact,
+    coalesce((SELECT NOT EXISTS (SELECT 1 FROM pg_trigger t WHERE t.tgrelid = h.reloid)
+                FROM hist h), FALSE)                                             AS no_triggers,
+    coalesce((SELECT NOT EXISTS (SELECT 1 FROM pg_rewrite w WHERE w.ev_class = h.reloid)
+                FROM hist h), FALSE)                                             AS no_rules,
+    coalesce((SELECT NOT EXISTS (SELECT 1 FROM pg_policy pol WHERE pol.polrelid = h.reloid)
+                FROM hist h), FALSE)                                             AS no_policies,
+    coalesce((SELECT NOT EXISTS (SELECT 1 FROM pg_inherits i
+                WHERE i.inhrelid = h.reloid OR i.inhparent = h.reloid)
+                FROM hist h), FALSE)                                             AS no_inheritance
 ),
 hist_rows AS (
   SELECT
-    CASE WHEN (SELECT reloid FROM hist) IS NOT NULL THEN
+    CASE WHEN (SELECT h.reloid IS NOT NULL AND h.cols_ok FROM hist h) THEN
       (xpath('/row/c/text()', query_to_xml(
         $q$SELECT count(*)::text AS c FROM supabase_migrations.schema_migrations
-            WHERE version = '20260729'$q$, false, true, '')))[1]::text
-    END AS target_rows,
-    CASE WHEN (SELECT reloid FROM hist) IS NOT NULL THEN
+            WHERE (version ~ '^[0-9]+$') IS DISTINCT FROM TRUE$q$, false, true, '')))[1]::text
+    END AS malformed_rows,
+    CASE WHEN (SELECT h.reloid IS NOT NULL AND h.cols_ok FROM hist h) THEN
       (xpath('/row/c/text()', query_to_xml(
         $q$SELECT count(*)::text AS c FROM supabase_migrations.schema_migrations
-            WHERE version = '20260729' AND name = 'commercial_launch_foundation'$q$,
-        false, true, '')))[1]::text
-    END AS target_exact_rows,
-    CASE WHEN (SELECT reloid FROM hist) IS NOT NULL THEN
-      (xpath('/row/c/text()', query_to_xml(
-        $q$SELECT coalesce(string_agg(version || '=' || coalesce(name, '(null)'), ' | ' ORDER BY version), '(absent)') AS c
-             FROM supabase_migrations.schema_migrations WHERE version = '20260729'$q$,
-        false, true, '')))[1]::text
-    END AS target_row_detail,
-    CASE WHEN (SELECT reloid FROM hist) IS NOT NULL THEN
+            WHERE version ~ '^[0-9]+$' AND version::numeric > 20260729$q$, false, true, '')))[1]::text
+    END AS newer_version_rows,
+    CASE WHEN (SELECT h.reloid IS NOT NULL AND h.cols_ok FROM hist h) THEN
       (xpath('/row/c/text()', query_to_xml(
         $q$SELECT count(*)::text AS c FROM supabase_migrations.schema_migrations
             WHERE name = 'commercial_launch_foundation' AND version <> '20260729'$q$,
         false, true, '')))[1]::text
     END AS name_conflict_rows,
-    CASE WHEN (SELECT reloid FROM hist) IS NOT NULL THEN
+    CASE WHEN (SELECT h.reloid IS NOT NULL AND h.cols_ok FROM hist h) THEN
       (xpath('/row/c/text()', query_to_xml(
         $q$SELECT count(*)::text AS c FROM supabase_migrations.schema_migrations
-            WHERE version > '20260729'$q$, false, true, '')))[1]::text
-    END AS newer_version_rows
+            WHERE version = '20260729'$q$, false, true, '')))[1]::text
+    END AS target_rows,
+    CASE WHEN (SELECT h.reloid IS NOT NULL AND h.cols_ok FROM hist h) THEN
+      (xpath('/row/c/text()', query_to_xml(
+        $q$SELECT count(*)::text AS c FROM supabase_migrations.schema_migrations m
+            WHERE m.version = '20260729'
+              AND m.name = 'commercial_launch_foundation'
+              AND m.statements IS NOT NULL
+              AND cardinality(m.statements) = 89
+              AND (SELECT sum(octet_length(s)) FROM unnest(m.statements) t(s)) = 124959
+              AND (SELECT md5(string_agg(octet_length(s)::text || ':' || s, '' ORDER BY ord))
+                     FROM unnest(m.statements) WITH ORDINALITY t(s, ord))
+                  = '7b28ccf3ba7cae3e29c17bc5c3be60b6'$q$,
+        false, true, '')))[1]::text
+    END AS target_exact_rows,
+    CASE WHEN (SELECT h.reloid IS NOT NULL AND h.cols_ok FROM hist h) THEN
+      (xpath('/row/c/text()', query_to_xml(
+        $q$SELECT coalesce(string_agg(
+                  version || '=' || coalesce(name, '(null)')
+                  || ' [stmts: ' || coalesce(cardinality(statements)::text, 'null')
+                  || ' digest: ' || coalesce((SELECT md5(string_agg(octet_length(s)::text || ':' || s, '' ORDER BY ord))
+                                               FROM unnest(statements) WITH ORDINALITY t(s, ord)), 'null') || ']',
+                  ' | ' ORDER BY version), '(absent)') AS c
+             FROM supabase_migrations.schema_migrations WHERE version = '20260729'$q$,
+        false, true, '')))[1]::text
+    END AS target_row_detail
 )
 SELECT
   p.verifier_present, p.zero_argument_signature, p.single_function_no_overload,
+  p.semantic_callable_exact,
   p.owner_exact, p.security_definer, p.search_path_exact,
   p.acl_cardinality_exact, p.owner_execute_row_exact, p.service_role_owner_granted,
   p.no_unexpected_grantee, p.no_grant_option, p.body_approved,
   p.effective_acl_ok, p.unexpected_effective_executor_roles,
   p.authority_ok,
   p.product_ready, p.product_version, p.product_failed_count,
-  (p.product_ready = 'true')                       AS product_ready_true,
-  (p.product_version = p.expected_version)         AS product_version_exact,
-  (p.product_failed_count = '0')                   AS product_failed_empty,
-  s.table_present, s.version_column_exact, s.name_column_exact, s.version_primary_key,
+  (p.product_ready IS NOT DISTINCT FROM 'true')                    AS product_ready_true,
+  (p.product_version IS NOT DISTINCT FROM p.expected_version)      AS product_version_exact,
+  (p.product_failed_count IS NOT DISTINCT FROM '0')                AS product_failed_empty,
+  s.table_present, s.kind_ok, s.table_owner_ok, s.rls_off,
+  s.columns_exact, s.constraints_exact, s.pk_exact, s.indexes_exact,
+  s.no_triggers, s.no_rules, s.no_policies, s.no_inheritance,
+  r.malformed_rows, r.newer_version_rows, r.name_conflict_rows,
   r.target_rows, r.target_exact_rows, r.target_row_detail,
-  r.name_conflict_rows, r.newer_version_rows,
   CASE
-    WHEN p.authority_ok
-     AND p.product_ready = 'true'
-     AND p.product_version = p.expected_version
-     AND p.product_failed_count = '0'
-     AND s.table_present AND s.version_column_exact AND s.name_column_exact
-     AND s.version_primary_key
-     AND r.target_rows = '1'
-     AND r.target_exact_rows = '1'
-     AND r.name_conflict_rows = '0'
-     AND r.newer_version_rows = '0'
+    WHEN coalesce(p.authority_ok, FALSE)
+     AND p.product_ready IS NOT DISTINCT FROM 'true'
+     AND p.product_version IS NOT DISTINCT FROM p.expected_version
+     AND p.product_failed_count IS NOT DISTINCT FROM '0'
+     AND coalesce(s.table_present, FALSE) AND coalesce(s.kind_ok, FALSE)
+     AND coalesce(s.table_owner_ok, FALSE) AND coalesce(s.rls_off, FALSE)
+     AND coalesce(s.columns_exact, FALSE) AND coalesce(s.constraints_exact, FALSE)
+     AND coalesce(s.pk_exact, FALSE) AND coalesce(s.indexes_exact, FALSE)
+     AND coalesce(s.no_triggers, FALSE) AND coalesce(s.no_rules, FALSE)
+     AND coalesce(s.no_policies, FALSE) AND coalesce(s.no_inheritance, FALSE)
+     AND r.malformed_rows IS NOT DISTINCT FROM '0'
+     AND r.newer_version_rows IS NOT DISTINCT FROM '0'
+     AND r.name_conflict_rows IS NOT DISTINCT FROM '0'
+     AND r.target_rows IS NOT DISTINCT FROM '1'
+     AND r.target_exact_rows IS NOT DISTINCT FROM '1'
       THEN 'MIGRATION_20260729_HISTORY_RECONCILED'
     ELSE 'MIGRATION_HISTORY_NOT_RECONCILED'
-  END                                              AS final_status
+  END                                                              AS final_status
 FROM product p
 CROSS JOIN hist_shape s
 CROSS JOIN hist_rows r;

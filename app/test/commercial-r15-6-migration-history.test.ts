@@ -1,17 +1,26 @@
 /**
- * QHUB R15.6 — MIGRATION-HISTORY RECONCILIATION PACKAGE (PGlite, fully offline)
+ * QHUB R15.6 — MIGRATION-HISTORY RECONCILIATION PACKAGE, CORRECTED (PGlite)
  * app/test/commercial-r15-6-migration-history.test.ts
  *
- * Verifies docs/release/r15-6-migration-history/ (25 PRE / 26 RECORD / 27 POST):
- * the package records EXACTLY one history row (20260729,
- * commercial_launch_foundation) — values derived through the pinned CLI's own
- * filename-parse contract — refuses every conflicting/ambiguous/not-READY
- * state, is idempotent on an already-correct entry, mutates nothing but the
- * history row, and keeps all package hashes and cross-references consistent.
+ * Verifies the corrected docs/release/r15-6-migration-history/ package
+ * (25 PRE / 26 RECORD / 27 POST) against the independent review findings:
+ *   P1-1 RECORD serializes via LOCK TABLE ... SHARE ROW EXCLUSIVE and re-checks
+ *        everything post-lock (two-session proof lives in
+ *        commercial-r15-6-history-concurrency.test.ts against real PostgreSQL).
+ *   P1-2 RECORD enforces the complete pinned verifier-authority contract inside
+ *        the mutation transaction.
+ *   P1-3 the complete pinned CLI table contract and mutation boundary are
+ *        enforced by PRE, RECORD and POST alike.
+ *   P2-1 the row is complete: statements is the exact CLI-derived array
+ *        (fixture app/test/fixtures/r8-20260729-cli-statements.json — 89
+ *        elements, 124,959 bytes, canonical digest
+ *        7b28ccf3ba7cae3e29c17bc5c3be60b6).
+ *   P2-2/3 the temp audit table is created inside the transaction, without
+ *        IF NOT EXISTS; same-session reruns fail closed; exactly one row.
  *
- * The history-table fixture is created with the EXACT DDL the pinned
- * supabase@2.110.0 CLI embeds (extracted verbatim offline from the installed
- * binary — see MIGRATION_HISTORY_MECHANISM_ANALYSIS.md §2).
+ * The history-table fixture uses the EXACT DDL the pinned supabase@2.110.0 CLI
+ * embeds (extracted verbatim from the installed binary, sha256
+ * 14814afa6fe59081eb9f24709fc077226bf89bc25cf77ee3bcb19565f3ef8899).
  */
 
 import { createHash } from 'node:crypto';
@@ -30,9 +39,15 @@ const REC26 = readFileSync(`${DIR}26_MIGRATION_HISTORY_RECORD.sql`, 'utf8');
 const POST27 = readFileSync(`${DIR}27_POST_MIGRATION_HISTORY_VERIFY.sql`, 'utf8');
 const RUNBOOK = readFileSync(`${DIR}R15_6_MIGRATION_HISTORY_RUNBOOK.md`, 'utf8');
 const ANALYSIS = readFileSync(`${DIR}MIGRATION_HISTORY_MECHANISM_ANALYSIS.md`, 'utf8');
+const STATEMENTS: string[] = JSON.parse(
+  readFileSync(`${REPO}app/test/fixtures/r8-20260729-cli-statements.json`, 'utf8'),
+);
 
 const VERSION = '20260729';
 const NAME = 'commercial_launch_foundation';
+const STMT_COUNT = 89;
+const STMT_DIGEST = '7b28ccf3ba7cae3e29c17bc5c3be60b6';
+const STMT_BYTES = 124959;
 
 /** The exact CLI 2.110.0 DDL, extracted verbatim from the installed binary. */
 const CLI_DDL = `CREATE SCHEMA IF NOT EXISTS supabase_migrations;
@@ -55,7 +70,7 @@ function lastStatement(sql: string): string {
         .trim(),
     )
     .filter(Boolean)
-    .filter((s) => !/^(BEGIN|COMMIT|SET TRANSACTION)/i.test(s))
+    .filter((s) => !/^(BEGIN|COMMIT|SET TRANSACTION|SET LOCAL)/i.test(s))
     .at(-1)!;
 }
 
@@ -80,17 +95,35 @@ async function fresh(withHistory = true): Promise<PGlite> {
   return db;
 }
 
+/** Insert the exact target row (including the fixture statements) directly. */
+async function insertExactRow(db: PGlite): Promise<void> {
+  await db.query(
+    `INSERT INTO supabase_migrations.schema_migrations (version, name, statements)
+     VALUES ($1, $2, $3)`,
+    [VERSION, NAME, STATEMENTS],
+  );
+}
+
 const row = async (db: PGlite, sql: string) => (await db.query<Record<string, unknown>>(sql)).rows[0];
 
 const histRows = async (db: PGlite) =>
   (
     await db.query<{ s: string }>(
-      `select version || '=' || coalesce(name, '(null)') s
-       from supabase_migrations.schema_migrations order by version`,
+      `select version || '=' || coalesce(name, '(null)') || ':' || coalesce(cardinality(statements)::text, 'null') s
+         from supabase_migrations.schema_migrations order by version`,
     )
   ).rows
     .map((r) => r.s)
     .join('|');
+
+/** Shape-agnostic byte-identity fingerprint (survives dropped/added columns). */
+const histFingerprint = async (db: PGlite) =>
+  (
+    await db.query<{ f: string }>(
+      `select coalesce(md5(string_agg(to_jsonb(m.*)::text, '|' order by m.version)), 'empty') f
+         from supabase_migrations.schema_migrations m`,
+    )
+  ).rows[0].f;
 
 async function rollback(db: PGlite): Promise<void> {
   try {
@@ -100,10 +133,58 @@ async function rollback(db: PGlite): Promise<void> {
   }
 }
 
+async function dropAudit(db: PGlite): Promise<void> {
+  await db.exec('DROP TABLE IF EXISTS pg_temp.r15_6_migration_history_audit;');
+}
+
+// ─── fixture integrity ────────────────────────────────────────────────────────
+
+describe('R15.6 history package — CLI statements fixture', () => {
+  it('fx1 — cardinality, per-element bytes, total bytes and canonical digest match the pinned CLI derivation', () => {
+    expect(STATEMENTS.length).toBe(STMT_COUNT);
+
+    const total = STATEMENTS.reduce((a, s) => a + Buffer.byteLength(s), 0);
+    expect(total).toBe(STMT_BYTES);
+
+    const h = createHash('md5');
+
+    for (const s of STATEMENTS) {
+      h.update(`${Buffer.byteLength(s)}:`);
+      h.update(s);
+    }
+
+    expect(h.digest('hex')).toBe(STMT_DIGEST);
+  });
+
+  it('fx2 — every statement is a verbatim, in-order substring of the committed migration', () => {
+    let pos = 0;
+
+    for (const s of STATEMENTS) {
+      const i = MIGRATION.indexOf(s, pos);
+      expect(i, 'statement must appear in order').toBeGreaterThanOrEqual(0);
+      pos = i + s.length;
+    }
+  });
+
+  it('fx3 — the base64 payload embedded in 26 decodes to exactly the fixture, element by element', () => {
+    const embedded = [...REC26.matchAll(/pg_catalog\.decode\('([A-Za-z0-9+/=]+)', 'base64'\)/g)].map((m) =>
+      Buffer.from(m[1], 'base64').toString('utf8'),
+    );
+    expect(embedded.length).toBe(STMT_COUNT);
+    expect(embedded).toEqual(STATEMENTS);
+  });
+
+  it('fx4 — 26 pins the exact cardinality, digest and byte constants', () => {
+    expect(REC26).toContain(`c_stmt_count  CONSTANT int    := ${STMT_COUNT};`);
+    expect(REC26).toContain(`c_stmt_digest CONSTANT text   := '${STMT_DIGEST}';`);
+    expect(REC26).toContain(`c_stmt_bytes  CONSTANT bigint := ${STMT_BYTES};`);
+  });
+});
+
 // ─── static contracts ─────────────────────────────────────────────────────────
 
 describe('R15.6 history package — static contracts', () => {
-  it('st1 — PRE and POST are read-only: READ ONLY transactions and no mutating statement', () => {
+  it('st1 — PRE and POST are read-only: READ ONLY transactions and no mutating or temporary statement', () => {
     for (const [name, sql] of [
       ['25', PRE25],
       ['27', POST27],
@@ -112,36 +193,49 @@ describe('R15.6 history package — static contracts', () => {
       expect(sql, `${name} must not INSERT`).not.toMatch(/^\s*INSERT/im);
       expect(sql, `${name} must not UPDATE`).not.toMatch(/^\s*UPDATE/im);
       expect(sql, `${name} must not DELETE`).not.toMatch(/^\s*DELETE/im);
-      expect(sql, `${name} must not CREATE/ALTER/DROP`).not.toMatch(/^\s*(CREATE|ALTER|DROP|TRUNCATE|GRANT|REVOKE)/im);
+      expect(sql, `${name} must not CREATE/ALTER/DROP/LOCK`).not.toMatch(
+        /^\s*(CREATE|ALTER|DROP|TRUNCATE|GRANT|REVOKE|LOCK)\b/im,
+      );
     }
   });
 
-  it('st2 — 26 mutates ONLY migration history: exactly one target INSERT plus the pg_temp audit', () => {
-    const withoutComments = REC26.split('\n')
+  it('st2 — 26 durable writes are exactly one history INSERT; temp DDL is in-transaction without IF NOT EXISTS', () => {
+    const exec = REC26.split('\n')
       .filter((l) => !/^\s*--/.test(l))
       .join('\n');
 
-    // The only INSERT targets are the history table and the temp audit table.
-    const inserts = withoutComments.match(/INSERT INTO\s+([a-z0-9_.]+)/gi) ?? [];
-    expect(inserts.map((s) => s.replace(/INSERT INTO\s+/i, '').toLowerCase()).sort()).toEqual([
-      'r15_6_history_audit',
-      'r15_6_history_audit',
-      'supabase_migrations.schema_migrations',
-    ]);
+    const inserts = (exec.match(/INSERT INTO\s+([a-z0-9_.]+)/gi) ?? []).map((s) =>
+      s.replace(/INSERT INTO\s+/i, '').toLowerCase(),
+    );
+    expect(inserts.sort()).toEqual(['pg_temp.r15_6_migration_history_audit', 'supabase_migrations.schema_migrations']);
 
-    // No UPDATE/DELETE/TRUNCATE anywhere; the only CREATE is the TEMP audit table.
-    expect(withoutComments).not.toMatch(/\b(UPDATE|DELETE|TRUNCATE)\b/i);
+    expect(exec).not.toMatch(/\b(UPDATE|DELETE|TRUNCATE)\b/i);
+    expect(exec).not.toMatch(/ON CONFLICT/i);
+    expect(exec).not.toMatch(/^\s*(GRANT|REVOKE)\b/im);
 
-    const creates = withoutComments.match(/^\s*CREATE\s+\w+(\s+\w+)?/gim) ?? [];
-    expect(creates.map((s) => s.trim())).toEqual(['CREATE TEMP TABLE']);
+    /*
+     * No dynamic-SQL path: no plpgsql EXECUTE statement anywhere. (The string
+     * literal 'EXECUTE' inside privilege comparisons is data, not code.)
+     */
+    expect(exec).not.toMatch(/^\s*EXECUTE\b/im);
+    expect(exec).not.toMatch(/EXECUTE\s+(format|'|\$|v_|c_)/i);
+    expect(exec).not.toMatch(/IF NOT EXISTS/i);
 
-    // Never the CLI's overwriting upsert, and no re-execution of migration DDL.
-    expect(withoutComments).not.toMatch(/ON CONFLICT/i);
-    expect(withoutComments).not.toMatch(/CREATE (TABLE|POLICY|FUNCTION|TRIGGER|INDEX|SCHEMA)/i);
-    expect(withoutComments).not.toMatch(/\b(GRANT|REVOKE)\b/i);
+    const creates = (exec.match(/^\s*CREATE\s+\w+(\s+\w+)?/gim) ?? []).map((s) => s.trim());
+    expect(creates).toEqual(['CREATE TEMP TABLE']);
+
+    // The temp DDL sits after BEGIN (inside the explicit transaction).
+    expect(exec.indexOf('BEGIN;')).toBeGreaterThanOrEqual(0);
+    expect(exec.indexOf('CREATE TEMP TABLE')).toBeGreaterThan(exec.indexOf('BEGIN;'));
+    expect(exec.indexOf('CREATE TEMP TABLE')).toBeLessThan(exec.indexOf('COMMIT;'));
+
+    // Lock precedes every gate and the insert; restricted search_path is set.
+    expect(exec).toMatch(/LOCK TABLE supabase_migrations\.schema_migrations IN SHARE ROW EXCLUSIVE MODE;/);
+    expect(exec).toMatch(/SET LOCAL search_path = pg_catalog;/);
+    expect(exec).toMatch(/SET TRANSACTION ISOLATION LEVEL READ COMMITTED;/);
   });
 
-  it('st3 — exact derived version and name literals are used everywhere', () => {
+  it('st3 — exact derived literals and the complete-row INSERT shape', () => {
     for (const [name, sql] of [
       ['25', PRE25],
       ['26', REC26],
@@ -149,19 +243,14 @@ describe('R15.6 history package — static contracts', () => {
     ] as const) {
       expect(sql, `${name} version literal`).toContain(`'${VERSION}'`);
       expect(sql, `${name} name literal`).toContain(`'${NAME}'`);
+      expect(sql, `${name} statements digest`).toContain(STMT_DIGEST);
     }
 
-    expect(REC26).toContain(
-      `INSERT INTO supabase_migrations.schema_migrations (version, name)
-    VALUES ('${VERSION}', '${NAME}');`,
-    );
+    expect(REC26).toContain('INSERT INTO supabase_migrations.schema_migrations (version, name, statements)');
+    expect(REC26).toContain('VALUES (c_version, c_name, v_statements);');
   });
 
   it('st4 — no founder/entitlement/billing/stripe surface in any executable text', () => {
-    /*
-     * The words legitimately appear in the artifacts' own prohibition comments;
-     * the assertion is that no EXECUTABLE text touches those surfaces.
-     */
     const executable = [PRE25, REC26, POST27]
       .map((sql) =>
         sql
@@ -176,7 +265,6 @@ describe('R15.6 history package — static contracts', () => {
   it('st5 — all package hashes and cross-references are consistent', () => {
     const sha = (buf: Buffer | string) => createHash('sha256').update(buf).digest('hex');
 
-    // The six upstream authoritative artifacts still hash to the approved values.
     const upstream: Array<[string, string]> = [
       [
         'supabase/migrations/20260729_commercial_launch_foundation.sql',
@@ -208,28 +296,22 @@ describe('R15.6 history package — static contracts', () => {
       expect(sha(readFileSync(`${REPO}${rel}`)), rel).toBe(expected);
     }
 
-    // The runbook's hash table matches the actual package artifacts.
-    const packaged: Array<[string, string]> = [
-      ['25_PRE_MIGRATION_HISTORY_VERIFY.sql', sha(readFileSync(`${DIR}25_PRE_MIGRATION_HISTORY_VERIFY.sql`))],
-      ['26_MIGRATION_HISTORY_RECORD.sql', sha(readFileSync(`${DIR}26_MIGRATION_HISTORY_RECORD.sql`))],
-      ['27_POST_MIGRATION_HISTORY_VERIFY.sql', sha(readFileSync(`${DIR}27_POST_MIGRATION_HISTORY_VERIFY.sql`))],
-    ];
-
-    for (const [file, actual] of packaged) {
-      expect(RUNBOOK, `runbook must pin the current hash of ${file}`).toContain(actual);
+    for (const file of [
+      '25_PRE_MIGRATION_HISTORY_VERIFY.sql',
+      '26_MIGRATION_HISTORY_RECORD.sql',
+      '27_POST_MIGRATION_HISTORY_VERIFY.sql',
+    ]) {
+      expect(RUNBOOK, `runbook must pin the current hash of ${file}`).toContain(sha(readFileSync(`${DIR}${file}`)));
     }
 
-    /*
-     * Cross-references: analysis pins the migration identity; runbook pins the
-     * approved starting commit and both prior evidence commits.
-     */
-    expect(ANALYSIS).toContain('1509eb59056764b0b6500aa8bfbb2df65eb330a1ff363758bff0e4797427a755');
-    expect(ANALYSIS).toContain('125,186');
-    expect(RUNBOOK).toContain('5a88cbf54b4c3cdf7ce17d57b46c495ff8861b44');
-    expect(RUNBOOK).toContain('39f3ee077876fe94549e0c34eb073dba609e5559');
+    // Fixture digest is pinned by runbook and analysis; CLI binary identity too.
+    expect(RUNBOOK).toContain(STMT_DIGEST);
+    expect(ANALYSIS).toContain(STMT_DIGEST);
+    expect(ANALYSIS).toContain('14814afa6fe59081eb9f24709fc077226bf89bc25cf77ee3bcb19565f3ef8899');
+    expect(RUNBOOK).toContain('5c36883eed44b877733768649c805ef2c64f0c7f');
   });
 
-  it('st6 — the migration file identity the values were derived from is intact', () => {
+  it('st6 — the migration identity the values were derived from is intact', () => {
     const buf = readFileSync(MIGRATION_PATH);
     expect(buf.length).toBe(125186);
 
@@ -242,37 +324,79 @@ describe('R15.6 history package — static contracts', () => {
 // ─── PRE 25 ───────────────────────────────────────────────────────────────────
 
 describe('R15.6 history package — PRE 25 verdicts', () => {
-  const CASES: Array<[string, string | null, string]> = [
-    ['target absent (happy path)', null, 'SAFE_TO_RECORD_MIGRATION_HISTORY'],
-    [
-      'already recorded exactly',
-      `INSERT INTO supabase_migrations.schema_migrations (version, name) VALUES ('${VERSION}', '${NAME}');`,
-      'ALREADY_RECORDED_EXACTLY',
-    ],
+  it('p0 — happy path SAFE; exact recorded row ALREADY', async () => {
+    const db = await fresh();
+
+    try {
+      await db.exec(PRE25);
+      expect((await row(db, V25)).verdict).toBe('SAFE_TO_RECORD_MIGRATION_HISTORY');
+
+      await insertExactRow(db);
+      await db.exec(PRE25);
+      expect((await row(db, V25)).verdict).toBe('ALREADY_RECORDED_EXACTLY');
+    } finally {
+      await db.close();
+    }
+  }, 240_000);
+
+  const STOPS: Array<[string, string]> = [
     [
       'version under a different name',
       `INSERT INTO supabase_migrations.schema_migrations (version, name) VALUES ('${VERSION}', 'something_else');`,
-      'UNEXPECTED_MIGRATION_HISTORY_STOP',
     ],
     [
       'partial/legacy row (NULL name)',
       `INSERT INTO supabase_migrations.schema_migrations (version) VALUES ('${VERSION}');`,
-      'UNEXPECTED_MIGRATION_HISTORY_STOP',
+    ],
+    [
+      'target row with NULL statements',
+      `INSERT INTO supabase_migrations.schema_migrations (version, name) VALUES ('${VERSION}', '${NAME}');`,
     ],
     [
       'name under a different version',
       `INSERT INTO supabase_migrations.schema_migrations (version, name) VALUES ('20260728', '${NAME}');`,
-      'UNEXPECTED_MIGRATION_HISTORY_STOP',
     ],
     [
       'a version newer than the target',
       `INSERT INTO supabase_migrations.schema_migrations (version, name) VALUES ('20260801', 'mystery');`,
-      'UNEXPECTED_MIGRATION_HISTORY_STOP',
+    ],
+    [
+      'a malformed version sorting BEFORE the target',
+      `INSERT INTO supabase_migrations.schema_migrations (version, name) VALUES ('0x20260101', 'weird');`,
+    ],
+    [
+      'a malformed version sorting AFTER the target',
+      `INSERT INTO supabase_migrations.schema_migrations (version, name) VALUES ('9zzz', 'weird');`,
+    ],
+    ['an extra optional column', `ALTER TABLE supabase_migrations.schema_migrations ADD COLUMN extra text;`],
+    [
+      'an unexpected default on name',
+      `ALTER TABLE supabase_migrations.schema_migrations ALTER COLUMN name SET DEFAULT 'x';`,
+    ],
+    ['an unexpected additional index', `CREATE INDEX sneaky_idx ON supabase_migrations.schema_migrations (name);`],
+    [
+      'an unexpected additional unique constraint',
+      `ALTER TABLE supabase_migrations.schema_migrations ADD CONSTRAINT sneaky_u UNIQUE (name);`,
+    ],
+    [
+      'an unexpected trigger',
+      `CREATE FUNCTION public.r156h_noop() RETURNS trigger LANGUAGE plpgsql AS $f$ BEGIN RETURN NEW; END $f$;
+       CREATE TRIGGER sneaky_trg BEFORE INSERT ON supabase_migrations.schema_migrations
+         FOR EACH ROW EXECUTE FUNCTION public.r156h_noop();`,
+    ],
+    [
+      'an unexpected rewrite rule',
+      `CREATE RULE sneaky_rule AS ON DELETE TO supabase_migrations.schema_migrations DO INSTEAD NOTHING;`,
+    ],
+    ['row-level security enabled', `ALTER TABLE supabase_migrations.schema_migrations ENABLE ROW LEVEL SECURITY;`],
+    [
+      'an unexpected policy',
+      `ALTER TABLE supabase_migrations.schema_migrations ENABLE ROW LEVEL SECURITY;
+       CREATE POLICY sneaky_pol ON supabase_migrations.schema_migrations FOR SELECT USING (true);`,
     ],
     [
       'product verifier not READY (helper anon grant)',
       `GRANT EXECUTE ON FUNCTION public.qhub_row_immutable() TO anon;`,
-      'UNEXPECTED_MIGRATION_HISTORY_STOP',
     ],
     [
       'verifier body replaced (even one that fakes ready)',
@@ -280,21 +404,17 @@ describe('R15.6 history package — PRE 25 verdicts', () => {
          LANGUAGE plpgsql STABLE SECURITY DEFINER SET search_path = pg_catalog, public
          AS $f$ BEGIN RETURN jsonb_build_object('ready', true, 'failed', '[]'::jsonb,
            'expected_version', '2026-07-30.commercial-launch-r8'); END $f$;`,
-      'UNEXPECTED_MIGRATION_HISTORY_STOP',
     ],
   ];
 
-  for (const [name, setup, want] of CASES) {
-    it(`p-${name} => ${want}`, async () => {
+  for (const [name, setup] of STOPS) {
+    it(`p-${name} => UNEXPECTED_MIGRATION_HISTORY_STOP`, async () => {
       const db = await fresh();
 
       try {
-        if (setup) {
-          await db.exec(setup);
-        }
-
+        await db.exec(setup);
         await db.exec(PRE25);
-        expect((await row(db, V25)).verdict).toBe(want);
+        expect((await row(db, V25)).verdict).toBe('UNEXPECTED_MIGRATION_HISTORY_STOP');
       } finally {
         await db.close();
       }
@@ -316,7 +436,7 @@ describe('R15.6 history package — PRE 25 verdicts', () => {
 // ─── RECORD 26 ────────────────────────────────────────────────────────────────
 
 describe('R15.6 history package — RECORD 26', () => {
-  it('r1 — records exactly (20260729, commercial_launch_foundation) with NULL statements, then is idempotent', async () => {
+  it('r1 — records the COMPLETE row (version, name, exact statements); same-session rerun rejected; fresh-session rerun no-ops', async () => {
     const db = await fresh();
 
     try {
@@ -326,9 +446,29 @@ describe('R15.6 history package — RECORD 26', () => {
       expect(a.action).toBe('RECORDED_NOW');
       expect(a.history_version).toBe(VERSION);
       expect(a.history_name).toBe(NAME);
-      expect(a.history_statements_cardinality).toBe('null');
+      expect(a.statements_cardinality).toBe(STMT_COUNT);
+      expect(a.statements_digest).toBe(STMT_DIGEST);
+      expect(String(a.statements_total_bytes)).toBe(String(STMT_BYTES));
       expect(String(a.rows_for_version)).toBe('1');
 
+      const stored = (
+        await db.query<{ statements: string[] }>(
+          `select statements from supabase_migrations.schema_migrations where version = $1`,
+          [VERSION],
+        )
+      ).rows[0].statements;
+      expect(stored).toEqual(STATEMENTS);
+
+      /*
+       * Same-session rerun: the in-transaction CREATE TEMP TABLE (no IF NOT
+       * EXISTS) fails closed before any gate.
+       */
+      await expect(db.exec(REC26)).rejects.toThrow(/already exists/i);
+      await rollback(db);
+      expect(await histRows(db)).toContain(`${VERSION}=${NAME}:${STMT_COUNT}`);
+
+      // Fresh session (simulated by dropping the session-temp audit): clean no-op.
+      await dropAudit(db);
       await db.exec(REC26);
 
       const b = await row(db, A26);
@@ -337,7 +477,7 @@ describe('R15.6 history package — RECORD 26', () => {
     } finally {
       await db.close();
     }
-  }, 240_000);
+  }, 300_000);
 
   const FAILS: Array<[string, string, RegExp]> = [
     [
@@ -351,6 +491,11 @@ describe('R15.6 history package — RECORD 26', () => {
       /migration_history_conflict/,
     ],
     [
+      'target row with NULL statements (never updated)',
+      `INSERT INTO supabase_migrations.schema_migrations (version, name) VALUES ('${VERSION}', '${NAME}');`,
+      /migration_history_conflict/,
+    ],
+    [
       'name under a different version',
       `INSERT INTO supabase_migrations.schema_migrations (version, name) VALUES ('20260728', '${NAME}');`,
       /migration_history_conflict/,
@@ -361,16 +506,22 @@ describe('R15.6 history package — RECORD 26', () => {
       /migration_history_conflict/,
     ],
     [
+      'a malformed recorded version',
+      `INSERT INTO supabase_migrations.schema_migrations (version, name) VALUES ('2026x729', 'weird');`,
+      /migration_history_conflict/,
+    ],
+    [
       'product verifier not READY',
       `GRANT EXECUTE ON FUNCTION public.qhub_row_immutable() TO anon;`,
       /migration_history_product_not_ready/,
     ],
     [
-      'unknown verifier body',
+      'unknown verifier body (fake ready)',
       `CREATE OR REPLACE FUNCTION public.qhub_verify_commercial_schema() RETURNS jsonb
          LANGUAGE plpgsql STABLE SECURITY DEFINER SET search_path = pg_catalog, public
-         AS $f$ BEGIN RETURN '{}'::jsonb; END $f$;`,
-      /unexpected_runtime_verifier_state/,
+         AS $f$ BEGIN RETURN jsonb_build_object('ready', true, 'failed', '[]'::jsonb,
+           'expected_version', '2026-07-30.commercial-launch-r8'); END $f$;`,
+      /unexpected_runtime_verifier_authority/,
     ],
     [
       'verifier SECURITY INVOKER',
@@ -378,38 +529,90 @@ describe('R15.6 history package — RECORD 26', () => {
       /unexpected_runtime_verifier_authority/,
     ],
     [
-      'history shape drift (statements column missing)',
+      'verifier wrong volatility',
+      `ALTER FUNCTION public.qhub_verify_commercial_schema() VOLATILE;`,
+      /unexpected_runtime_verifier_authority/,
+    ],
+    [
+      'verifier unexpected effective executor (membership)',
+      `CREATE ROLE r156h_m NOLOGIN; GRANT service_role TO r156h_m;`,
+      /unexpected_runtime_verifier_authority/,
+    ],
+    [
+      'verifier unexpected direct grantee',
+      `CREATE ROLE r156h_g NOLOGIN; GRANT EXECUTE ON FUNCTION public.qhub_verify_commercial_schema() TO r156h_g;`,
+      /unexpected_runtime_verifier_authority/,
+    ],
+    [
+      'shape: statements column missing',
       `ALTER TABLE supabase_migrations.schema_migrations DROP COLUMN statements;`,
       /unexpected_migration_history_shape/,
     ],
     [
-      'history shape drift (unexpected mandatory column)',
-      `ALTER TABLE supabase_migrations.schema_migrations ADD COLUMN must_have text NOT NULL DEFAULT 'x';
-       ALTER TABLE supabase_migrations.schema_migrations ALTER COLUMN must_have DROP DEFAULT;`,
+      'shape: extra optional column',
+      `ALTER TABLE supabase_migrations.schema_migrations ADD COLUMN extra text;`,
+      /unexpected_migration_history_shape/,
+    ],
+    [
+      'shape: unexpected default',
+      `ALTER TABLE supabase_migrations.schema_migrations ALTER COLUMN name SET DEFAULT 'x';`,
+      /unexpected_migration_history_shape/,
+    ],
+    [
+      'shape: unexpected additional index',
+      `CREATE INDEX sneaky_idx ON supabase_migrations.schema_migrations (name);`,
+      /unexpected_migration_history_shape/,
+    ],
+    [
+      'shape: unexpected unique constraint',
+      `ALTER TABLE supabase_migrations.schema_migrations ADD CONSTRAINT sneaky_u UNIQUE (name);`,
+      /unexpected_migration_history_shape/,
+    ],
+    [
+      'shape: unexpected trigger',
+      `CREATE FUNCTION public.r156h_noop2() RETURNS trigger LANGUAGE plpgsql AS $f$ BEGIN RETURN NEW; END $f$;
+       CREATE TRIGGER sneaky_trg BEFORE INSERT ON supabase_migrations.schema_migrations
+         FOR EACH ROW EXECUTE FUNCTION public.r156h_noop2();`,
+      /unexpected_migration_history_shape/,
+    ],
+    [
+      'shape: unexpected rewrite rule',
+      `CREATE RULE sneaky_rule AS ON DELETE TO supabase_migrations.schema_migrations DO INSTEAD NOTHING;`,
+      /unexpected_migration_history_shape/,
+    ],
+    [
+      'shape: RLS enabled',
+      `ALTER TABLE supabase_migrations.schema_migrations ENABLE ROW LEVEL SECURITY;`,
+      /unexpected_migration_history_shape/,
+    ],
+    [
+      'shape: unexpected policy',
+      `ALTER TABLE supabase_migrations.schema_migrations ENABLE ROW LEVEL SECURITY;
+       CREATE POLICY sneaky_pol ON supabase_migrations.schema_migrations FOR SELECT USING (true);`,
       /unexpected_migration_history_shape/,
     ],
   ];
 
   for (const [name, setup, rx] of FAILS) {
-    it(`r-fail — ${name} => deterministic STOP, history untouched`, async () => {
+    it(`r-fail — ${name} => deterministic STOP, durable state byte-identical`, async () => {
       const db = await fresh();
 
       try {
         await db.exec(setup);
 
-        const before = await histRows(db);
+        const before = await histFingerprint(db);
 
         await expect(db.exec(REC26)).rejects.toThrow(rx);
         await rollback(db);
 
-        expect(await histRows(db)).toBe(before);
+        expect(await histFingerprint(db)).toBe(before);
       } finally {
         await db.close();
       }
     }, 120_000);
   }
 
-  it('r2 — history table absent => unexpected_migration_history_shape (it is never created here)', async () => {
+  it('r2 — history table absent => unexpected_migration_history_shape (never created here)', async () => {
     const db = await fresh(false);
 
     try {
@@ -419,7 +622,44 @@ describe('R15.6 history package — RECORD 26', () => {
     }
   }, 120_000);
 
-  it('r3 — mutation scope: nothing but the single history row changes', async () => {
+  it('r3 — corrupted embedded payload => migration_history_payload_integrity before any gate', async () => {
+    const db = await fresh();
+
+    try {
+      /*
+       * Flip the first base64 element's payload to another VALID base64 string
+       * of the same shape — the digest gate must refuse it.
+       */
+      const m = /pg_catalog\.decode\('([A-Za-z0-9+/=]+)', 'base64'\)/.exec(REC26)!;
+      const corrupted = REC26.replace(m[1], Buffer.from('corrupted statement', 'utf8').toString('base64'));
+      expect(corrupted).not.toBe(REC26);
+
+      await expect(db.exec(corrupted)).rejects.toThrow(/migration_history_payload_integrity/);
+      await rollback(db);
+      expect(await histRows(db)).not.toContain(VERSION);
+    } finally {
+      await db.close();
+    }
+  }, 120_000);
+
+  it('r4 — pg_temp cannot shadow the target: a temp schema_migrations is ignored and untouched', async () => {
+    const db = await fresh();
+
+    try {
+      await db.exec(`CREATE TEMP TABLE schema_migrations (version text, name text, statements text[]);`);
+      await db.exec(REC26);
+
+      expect((await row(db, A26)).action).toBe('RECORDED_NOW');
+      expect(await histRows(db)).toContain(`${VERSION}=${NAME}:${STMT_COUNT}`);
+
+      const temp = await row(db, `select count(*) c from pg_temp.schema_migrations`);
+      expect(String(temp.c)).toBe('0');
+    } finally {
+      await db.close();
+    }
+  }, 120_000);
+
+  it('r5 — mutation scope: nothing but the single history row changes', async () => {
     const db = await fresh();
 
     try {
@@ -427,8 +667,8 @@ describe('R15.6 history package — RECORD 26', () => {
         fns: (
           await db.query<{ s: string }>(
             `select p.proname || ':' || md5(p.prosrc) || ':' || coalesce(p.proacl::text, '-') s
-             from pg_proc p join pg_namespace n on n.oid = p.pronamespace
-            where n.nspname = 'public' order by 1`,
+               from pg_proc p join pg_namespace n on n.oid = p.pronamespace
+              where n.nspname = 'public' order by 1`,
           )
         ).rows
           .map((r) => r.s)
@@ -436,7 +676,7 @@ describe('R15.6 history package — RECORD 26', () => {
         triggers: (
           await db.query<{ t: string }>(
             `select tgname || ':' || tgtype::text || ':' || tgenabled::text t
-             from pg_trigger where not tgisinternal order by 1`,
+               from pg_trigger where not tgisinternal order by 1`,
           )
         ).rows
           .map((r) => r.t)
@@ -453,17 +693,17 @@ describe('R15.6 history package — RECORD 26', () => {
       await db.exec(REC26);
 
       expect(await snapshot()).toEqual(before);
-      expect(await histRows(db)).toBe(`${historyBefore}|${VERSION}=${NAME}`);
+      expect(await histRows(db)).toBe(`${historyBefore}|${VERSION}=${NAME}:${STMT_COUNT}`);
     } finally {
       await db.close();
     }
-  }, 240_000);
+  }, 300_000);
 });
 
 // ─── POST 27 ──────────────────────────────────────────────────────────────────
 
 describe('R15.6 history package — POST 27', () => {
-  it('q1 — after 26: MIGRATION_20260729_HISTORY_RECONCILED with READY product', async () => {
+  it('q1 — after 26: MIGRATION_20260729_HISTORY_RECONCILED with READY product and exact statements', async () => {
     const db = await fresh();
 
     try {
@@ -475,7 +715,7 @@ describe('R15.6 history package — POST 27', () => {
       expect(r.product_ready).toBe('true');
       expect(r.product_version).toBe('2026-07-30.commercial-launch-r8');
       expect(r.product_failed_count).toBe('0');
-      expect(r.target_row_detail).toBe(`${VERSION}=${NAME}`);
+      expect(r.target_exact_rows).toBe('1');
     } finally {
       await db.close();
     }
@@ -488,8 +728,36 @@ describe('R15.6 history package — POST 27', () => {
       `UPDATE supabase_migrations.schema_migrations SET name = 'x' WHERE version = '${VERSION}';`,
     ],
     [
+      'statements nulled out',
+      `UPDATE supabase_migrations.schema_migrations SET statements = NULL WHERE version = '${VERSION}';`,
+    ],
+    [
+      'statements truncated (one element removed)',
+      `UPDATE supabase_migrations.schema_migrations SET statements = statements[1:88] WHERE version = '${VERSION}';`,
+    ],
+    [
+      'one statement modified',
+      `UPDATE supabase_migrations.schema_migrations SET statements[1] = statements[1] || ' ' WHERE version = '${VERSION}';`,
+    ],
+    [
       'name duplicated under another version',
       `INSERT INTO supabase_migrations.schema_migrations (version, name) VALUES ('20260730', '${NAME}');`,
+    ],
+    [
+      'a newer version recorded',
+      `INSERT INTO supabase_migrations.schema_migrations (version, name) VALUES ('20260801', 'mystery');`,
+    ],
+    [
+      'a malformed version recorded',
+      `INSERT INTO supabase_migrations.schema_migrations (version, name) VALUES ('2026x729', 'weird');`,
+    ],
+    [
+      'statements column dropped (table-contract drift)',
+      `ALTER TABLE supabase_migrations.schema_migrations DROP COLUMN statements;`,
+    ],
+    [
+      'extra optional column added (table-contract drift)',
+      `ALTER TABLE supabase_migrations.schema_migrations ADD COLUMN extra text;`,
     ],
     ['product no longer READY', `GRANT EXECUTE ON FUNCTION public.qhub_row_immutable() TO anon;`],
   ];
