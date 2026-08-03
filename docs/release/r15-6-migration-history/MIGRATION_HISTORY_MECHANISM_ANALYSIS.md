@@ -179,24 +179,60 @@ non-public schema or a new table. The pinned deployment state is therefore:
 | `schema_migrations` table owner | the contract owner |
 | `pg_namespace.nspacl` | **NULL** — zero explicit entries |
 | `pg_class.relacl` | **NULL** — zero explicit entries |
-| Effective schema USAGE/CREATE | owner and superusers only |
-| Effective table SELECT/INSERT/UPDATE/DELETE/TRUNCATE/REFERENCES/TRIGGER | owner and superusers only |
-| anon / authenticated / service_role | **no privilege of any kind, direct or inherited** |
+| Permitted authority paths | the pinned owner and superusers only |
+| Every other login/application access path | **none may hold effective schema USAGE/CREATE or table SELECT/INSERT/UPDATE/DELETE/TRUNCATE/REFERENCES/TRIGGER** |
+| anon / authenticated / service_role | must **exist**, and must hold no such privilege by any route |
+| Dormant predefined `pg_*` capability roles | **may exist** — they are NOLOGIN and are not access paths by themselves |
 
 Because the pinned explicit ACLs are NULL, *any* materialized entry — an extra grantee, a
 redundant owner self-grant, a different grantor, a grantable bit, a PUBLIC grant — changes
 `nspacl`/`relacl` away from NULL and fails the cardinality-zero contract; there is no NULL
 ambiguity because NULL is asserted affirmatively (`acl IS NULL` must be TRUE, NULL-safely).
-Effective privileges are enumerated per `pg_roles` role with
-`has_schema_privilege`/`has_table_privilege`, which follow role membership, so
-membership-derived access fails closed too. All three artifacts bind this contract into their
-verdicts: PRE 25 STOPs, RECORD 26 raises `unexpected_migration_history_privilege` **after** the
-SHARE ROW EXCLUSIVE lock and before any durable DML — there is no pre-lock authorization
-decision, and the post-lock READ COMMITTED recheck sees every grant committed up to lock
-acquisition (GRANT itself does not conflict with SHARE ROW EXCLUSIVE — empirically verified — so
-a grant landing after the recheck is possible; it cannot alter the recorded row and is refused by
-the mandatory, separately authorized POST 27 in its own snapshot). POST 27 returns
-NOT_RECONCILED on any privilege drift. The verifier metadata contract was simultaneously
+
+### The mandatory effective-access predicate (corrected — third review P1)
+
+The earlier revision evaluated effective privileges only for the three hard-coded names
+`anon`, `authenticated`, `service_role`; every other role appeared in informational evidence
+that did not affect the verdict. That produced reproducible false successes — a `custom_app`
+LOGIN role inheriting `pg_read_all_data`, and an `authenticator` LOGIN role inheriting
+`pg_write_all_data`, both returned SAFE / RECORDED_NOW / RECONCILED on PostgreSQL 16. The
+mandatory predicate is now **catalog-derived and name-independent**, and no custom role name has
+to be known in advance:
+
+- **Candidate access path** — any role that is **not** a superuser, **not** the pinned owner,
+  and is either `rolcanlogin` (a real connection identity, discovered from `pg_roles`, whatever
+  it is called) **or** one of the required platform roles `anon` / `authenticated` /
+  `service_role` (evaluated even though they are NOLOGIN).
+- **Violation** — the candidate can assume **any** role that holds schema `USAGE`/`CREATE` or
+  table `SELECT`/`INSERT`/`UPDATE`/`DELETE`/`TRUNCATE`/`REFERENCES`/`TRIGGER`: itself, or any
+  role reachable through **transitive membership regardless of `INHERIT`**, tested with
+  `pg_has_role(candidate, role, 'MEMBER')` combined with
+  `has_schema_privilege`/`has_table_privilege` on each reachable role.
+
+Membership closure is used rather than inheritance alone because of a behavior established
+here from real PostgreSQL 16, not assumed: a **NOINHERIT** login that is a member of a role
+holding `SELECT` reports `has_table_privilege(...) = false`, yet can still `SET ROLE` to that
+role and read. Inheritance-only checking would have missed it; the closure catches it.
+
+**Predefined `pg_*` capability roles are treated precisely, not by name prefix.** They are never
+candidates themselves (they are NOLOGIN and not platform roles), so their mere existence — the
+normal state of every PostgreSQL 14+ cluster — never fails the check. What fails is a *login or
+application* role that can actually assume one: `GRANT pg_read_all_data TO some_login` is a real
+access path and is rejected. No blanket `pg_*` exemption exists: if a candidate can assume the
+capability role, the capability's privileges are counted against it.
+
+The informational inventory is retained (now derived from the same predicate and listing the
+offending role names) purely as operator evidence; it is **not** a substitute for the mandatory
+gate.
+
+All three artifacts bind this contract into their verdicts: PRE 25 STOPs, RECORD 26 raises
+`unexpected_migration_history_privilege` **after** the SHARE ROW EXCLUSIVE lock and before the
+verifier call and any durable DML — there is no pre-lock authorization decision, and the
+post-lock READ COMMITTED evaluation sees every grant committed up to lock acquisition.
+**SHARE ROW EXCLUSIVE does not block `GRANT`** (empirically verified), so a privilege change
+committed after that evaluation is simply later database state: it cannot alter the recorded
+row, and the mandatory, separately authorized POST 27 certifies its own later snapshot and
+refuses it. POST 27 returns NOT_RECONCILED on any privilege drift. The verifier metadata contract was simultaneously
 completed with `proparallel = 'u'` and `proisstrict = false`, pinned from the approved verifier
 artifact; both feed the same verdicts and gates.
 

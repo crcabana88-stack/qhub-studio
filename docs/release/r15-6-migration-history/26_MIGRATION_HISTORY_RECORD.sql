@@ -503,22 +503,40 @@ BEGIN
       WHERE c.oid = v_reloid
         AND (c.relacl IS NULL) IS DISTINCT FROM TRUE
     UNION ALL
-    -- Browser/application roles must exist and hold nothing, directly or via
-    -- ANY role membership (privilege functions are inheritance-aware, so
-    -- membership in a capability role such as pg_read_all_data is caught).
-    -- Direct grants to any OTHER role are caught by the NULL-ACL checks above.
-    SELECT 'browser role missing'
+    -- The required platform roles must exist (their absence would make the
+    -- named checks below vacuous).
+    SELECT 'required platform role missing (anon/authenticated/service_role)'
       WHERE (SELECT pg_catalog.count(*) FROM pg_catalog.pg_roles r
               WHERE r.rolname IN ('anon', 'authenticated', 'service_role')) IS DISTINCT FROM 3
     UNION ALL
-    SELECT 'unexpected effective privilege: ' || r.rolname
-      FROM pg_catalog.pg_roles r
-     WHERE r.rolname IN ('anon', 'authenticated', 'service_role')
-       AND (pg_catalog.has_schema_privilege(r.oid,
-              (SELECT n.oid FROM pg_catalog.pg_namespace n WHERE n.nspname = 'supabase_migrations'),
-              'USAGE, CREATE')
-            OR pg_catalog.has_table_privilege(r.oid, v_reloid,
-              'SELECT, INSERT, UPDATE, DELETE, TRUNCATE, REFERENCES, TRIGGER'))
+    -- MANDATORY, CATALOG-DERIVED, NAME-INDEPENDENT (R15.6.3). Candidate access
+    -- paths are every non-superuser, non-owner role that is rolcanlogin (any
+    -- real connection identity, discovered from the catalog — no fixed list) or
+    -- one of anon/authenticated/service_role (checked even though NOLOGIN). A
+    -- candidate has effective access if ANY role it can assume — itself or any
+    -- role reachable by transitive membership regardless of INHERIT, via
+    -- pg_has_role(..., 'MEMBER') — holds schema USAGE/CREATE or table SELECT/
+    -- INSERT/UPDATE/DELETE/TRUNCATE/REFERENCES/TRIGGER. Membership closure is
+    -- used rather than inheritance alone because a NOINHERIT login reports
+    -- FALSE from has_table_privilege yet can still SET ROLE to a privileged
+    -- role (verified on PostgreSQL 16). This catches direct grants, custom
+    -- NOLOGIN capability roles, chained memberships, and inheritance from
+    -- predefined roles such as pg_read_all_data / pg_write_all_data. Dormant
+    -- predefined roles are never candidates themselves, so their existence
+    -- alone never fails this gate.
+    SELECT 'unauthorized effective access path: ' || cand.rolname
+      FROM pg_catalog.pg_roles cand
+     WHERE NOT cand.rolsuper
+       AND cand.oid IS DISTINCT FROM v_owner_oid
+       AND (cand.rolcanlogin OR cand.rolname IN ('anon', 'authenticated', 'service_role'))
+       AND EXISTS (
+         SELECT 1 FROM pg_catalog.pg_roles r
+          WHERE (r.oid = cand.oid OR pg_catalog.pg_has_role(cand.oid, r.oid, 'MEMBER'))
+            AND (pg_catalog.has_schema_privilege(r.oid,
+                   (SELECT n.oid FROM pg_catalog.pg_namespace n
+                     WHERE n.nspname = 'supabase_migrations'), 'USAGE, CREATE')
+                 OR pg_catalog.has_table_privilege(r.oid, v_reloid,
+                      'SELECT, INSERT, UPDATE, DELETE, TRUNCATE, REFERENCES, TRIGGER')))
   ) s;
   IF v_detail IS NOT NULL THEN
     RAISE EXCEPTION 'unexpected_migration_history_privilege: % - the migration-history privilege contract is not met; a browser or unexpected role may be able to read or mutate history. Nothing was changed - STOP and escalate.', v_detail;

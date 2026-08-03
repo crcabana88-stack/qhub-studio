@@ -220,45 +220,64 @@ hist_priv AS (
                WHERE n.nspname = 'supabase_migrations'), FALSE)                  AS schema_acl_empty,
     coalesce((SELECT c.relacl IS NULL FROM pg_class c, hist h
                WHERE c.oid = h.reloid), FALSE)                                   AS table_acl_empty,
-    -- Browser/application roles established by authoritative evidence (anon,
-    -- authenticated, service_role) must EXIST and must hold NO schema or table
-    -- privilege, directly or through any role membership (the privilege
-    -- functions are inheritance-aware, so access inherited from a capability
-    -- role such as pg_read_all_data is caught here too).
+    -- The required platform roles must exist (their absence would make the
+    -- named platform-role coverage vacuous).
     coalesce(((SELECT count(*) FROM pg_roles r
                 WHERE r.rolname IN ('anon', 'authenticated', 'service_role')) = 3), FALSE)
                                                                                  AS browser_roles_present,
+    -- MANDATORY, CATALOG-DERIVED, NAME-INDEPENDENT (R15.6.3). A "login/
+    -- application access path" is any role that is NOT a superuser and NOT the
+    -- pinned owner, and is either rolcanlogin (a real connection identity,
+    -- whatever it is named — discovered from the catalog, never from a fixed
+    -- list) or one of the required platform roles anon / authenticated /
+    -- service_role (checked even though they are NOLOGIN). Such a path has
+    -- effective access if ANY role it can assume — itself, or any role reachable
+    -- through transitive membership regardless of INHERIT, via pg_has_role(...,
+    -- 'MEMBER') — holds schema USAGE/CREATE or table SELECT/INSERT/UPDATE/
+    -- DELETE/TRUNCATE/REFERENCES/TRIGGER. Membership closure is used, not
+    -- inheritance alone, because a NOINHERIT login reports FALSE from
+    -- has_table_privilege yet can still SET ROLE to a privileged role
+    -- (verified on PostgreSQL 16). This catches direct grants, custom NOLOGIN
+    -- capability roles, chained memberships, and inheritance from predefined
+    -- roles such as pg_read_all_data / pg_write_all_data. Dormant predefined
+    -- roles are NOT candidates themselves (they are NOLOGIN and unnamed here),
+    -- so their mere existence never fails the check — only a login/application
+    -- role that can actually assume one does.
     coalesce((SELECT h.reloid IS NOT NULL AND ns.oid IS NOT NULL
                  AND NOT EXISTS (
-                   SELECT 1 FROM pg_roles r
-                    WHERE r.rolname IN ('anon', 'authenticated', 'service_role')
-                      AND (has_schema_privilege(r.oid, ns.oid, 'USAGE, CREATE')
-                           OR has_table_privilege(r.oid, h.reloid,
-                                'SELECT, INSERT, UPDATE, DELETE, TRUNCATE, REFERENCES, TRIGGER')))
+                   SELECT 1 FROM pg_roles cand
+                    WHERE NOT cand.rolsuper
+                      AND cand.oid IS DISTINCT FROM (SELECT c2.relowner FROM pg_class c2
+                            WHERE c2.oid = to_regclass('public.qhub_manual_review_requests'))
+                      AND (cand.rolcanlogin
+                           OR cand.rolname IN ('anon', 'authenticated', 'service_role'))
+                      AND EXISTS (
+                        SELECT 1 FROM pg_roles r
+                         WHERE (r.oid = cand.oid OR pg_has_role(cand.oid, r.oid, 'MEMBER'))
+                           AND (has_schema_privilege(r.oid, ns.oid, 'USAGE, CREATE')
+                                OR has_table_privilege(r.oid, h.reloid,
+                                     'SELECT, INSERT, UPDATE, DELETE, TRUNCATE, REFERENCES, TRIGGER'))))
                 FROM hist h
                 LEFT JOIN LATERAL (SELECT n.oid FROM pg_namespace n
                                     WHERE n.nspname = 'supabase_migrations') ns ON TRUE), FALSE)
-                                                                                 AS no_browser_role_privilege,
-    -- INFORMATIONAL ONLY (deliberately non-gating, and named accordingly): the
-    -- complete inventory of non-superuser, non-owner roles holding any effective
-    -- schema/table access. On a healthy deployment this contains at most
-    -- PostgreSQL's predefined pg_* capability bundles (e.g. pg_read_all_data),
-    -- which hold read/write on EVERY table by design and whose live membership
-    -- inventory cannot be pinned offline; gating them would make the healthy
-    -- state unsatisfiable. Direct grants to ANY role are gated by the
-    -- cardinality-zero nspacl/relacl checks above, and browser/app roles are
-    -- gated inheritance-aware — this column exists so the human reviewer sees
-    -- the full picture at PRE time.
-    (SELECT array_agg(r.rolname ORDER BY r.rolname)
-       FROM pg_roles r, hist h,
+                                                                                 AS no_unauthorized_access_path,
+    -- Named inventory of every offending access path (empty on a healthy
+    -- deployment). Displayed for the operator AND derived from the same
+    -- predicate that gates the verdict.
+    (SELECT array_agg(DISTINCT cand.rolname ORDER BY cand.rolname)
+       FROM pg_roles cand, hist h,
             LATERAL (SELECT n.oid FROM pg_namespace n WHERE n.nspname = 'supabase_migrations') ns
-      WHERE h.reloid IS NOT NULL AND NOT r.rolsuper
-        AND r.oid IS DISTINCT FROM (SELECT c2.relowner FROM pg_class c2
+      WHERE h.reloid IS NOT NULL AND NOT cand.rolsuper
+        AND cand.oid IS DISTINCT FROM (SELECT c2.relowner FROM pg_class c2
               WHERE c2.oid = to_regclass('public.qhub_manual_review_requests'))
-        AND (has_schema_privilege(r.oid, ns.oid, 'USAGE, CREATE')
-             OR has_table_privilege(r.oid, h.reloid,
-                  'SELECT, INSERT, UPDATE, DELETE, TRUNCATE, REFERENCES, TRIGGER')))
-                                                                                 AS roles_with_access_informational
+        AND (cand.rolcanlogin OR cand.rolname IN ('anon', 'authenticated', 'service_role'))
+        AND EXISTS (
+          SELECT 1 FROM pg_roles r
+           WHERE (r.oid = cand.oid OR pg_has_role(cand.oid, r.oid, 'MEMBER'))
+             AND (has_schema_privilege(r.oid, ns.oid, 'USAGE, CREATE')
+                  OR has_table_privilege(r.oid, h.reloid,
+                       'SELECT, INSERT, UPDATE, DELETE, TRUNCATE, REFERENCES, TRIGGER'))))
+                                                                                 AS unauthorized_access_paths
 ),
 hist_rows AS (
   SELECT
@@ -324,7 +343,7 @@ SELECT
   s.columns_exact, s.constraints_exact, s.pk_exact, s.indexes_exact,
   s.no_triggers, s.no_rules, s.no_policies, s.no_inheritance,
   v.schema_owner_ok, v.schema_acl_empty, v.table_acl_empty,
-  v.browser_roles_present, v.no_browser_role_privilege, v.roles_with_access_informational,
+  v.browser_roles_present, v.no_unauthorized_access_path, v.unauthorized_access_paths,
   r.malformed_rows, r.newer_version_rows, r.name_conflict_rows,
   r.target_rows, r.target_exact_rows, r.target_row_detail,
   CASE
@@ -341,7 +360,7 @@ SELECT
      AND coalesce(v.schema_owner_ok, FALSE) AND coalesce(v.schema_acl_empty, FALSE)
      AND coalesce(v.table_acl_empty, FALSE)
      AND coalesce(v.browser_roles_present, FALSE)
-     AND coalesce(v.no_browser_role_privilege, FALSE)
+     AND coalesce(v.no_unauthorized_access_path, FALSE)
      AND r.malformed_rows IS NOT DISTINCT FROM '0'
      AND r.newer_version_rows IS NOT DISTINCT FROM '0'
      AND r.name_conflict_rows IS NOT DISTINCT FROM '0'
