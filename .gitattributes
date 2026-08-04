@@ -27,3 +27,10 @@
 # On Windows (core.autocrlf=true) a CRLF shebang breaks execution in Docker/Linux.
 *.sh text eol=lf
 bindings.sh text eol=lf
+
+# SQL artifacts are hash-pinned: release packages record and verify the exact
+# SHA-256 of the .sql files an operator pastes. Without this rule core.autocrlf
+# rewrites them with CRLF on checkout, which changes their bytes and breaks every
+# recorded hash while the committed blob is unchanged. Pinning eol=lf keeps SQL
+# artifacts byte-stable across checkouts on every platform.
+*.sql text eol=lf

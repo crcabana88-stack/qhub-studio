@@ -557,59 +557,280 @@ describe('R15.6.5 diagnostic 28 — static contract', () => {
     expect(exec).not.toMatch(/rolpassword|auth\.users|storage\.|secrets?|token|credential/i);
   });
 
-  it('d-st7 — the analysis document identifies the CURRENT diagnostic artifact', () => {
+  it('d-st7 — canonical artifact identity: machine-readable block, no prose heuristics', () => {
     /*
-     * R15.6.9: the analysis document must describe the artifact that actually
-     * exists. It records TWO hashes with distinct purposes — the whole-file
-     * hash identifies the complete operator-facing artifact including its
-     * safety contract, and the executable-body hash proves the executable SQL
-     * is unchanged. Both are enforced here, and the superseded R15.6.7 hash is
-     * only tolerated when explicitly labelled as superseded.
+     * R15.6.10 P1. The previous revision inferred identity from natural
+     * language — the words "current", "superseded", "R15.6.7" and a 200-char
+     * proximity window. That is bypassable, so it is GONE. Identity is now
+     * established solely by a machine-readable key=value block delimited by
+     * unique markers, parsed by ONE validator that both the real document and
+     * every adversarial regression below run through.
      */
     const CURRENT_FILE_SHA = '52acf699ed170ec4ded25301190676491e984e94ad963e13c3d33c6ae037ee60';
     const CURRENT_BODY_SHA = '20bee9767502087ae198dc28c54bfc048a52f290a43db177a3bf172bf89d1e23';
     const SUPERSEDED_FILE_SHA = '46953b5c95afe455313ec6279b86879aa36aff7b252c5e323f9456aa364c29e0';
+    const TRANSITION = 'R15.6.8_SQL_HEADER_COMMENTS_ONLY';
+    const BEGIN_MARKER = '<!-- DIAGNOSTIC_28_IDENTITY_V1_BEGIN -->';
+    const END_MARKER = '<!-- DIAGNOSTIC_28_IDENTITY_V1_END -->';
+    const REQUIRED_KEYS = [
+      'diagnostic_28.current_complete_artifact_sha256',
+      'diagnostic_28.current_executable_body_sha256',
+      'diagnostic_28.current_executable_body_bytes',
+      'diagnostic_28.superseded_r15_6_7_complete_artifact_sha256',
+      'diagnostic_28.complete_artifact_transition',
+    ] as const;
+
+    /**
+     * The single validator. Returns the reason for rejection, or null when the
+     * document is a valid identity record for the artifact actually on disk.
+     * It never reads prose, never uses a proximity window, and never accepts a
+     * hash because a nearby word looks reassuring.
+     */
+    const validateIdentity = (doc: string, fileSha: string, bodySha: string, bodyBytes: number): string | null => {
+      // (1)(2) exactly one begin and one end marker, correctly ordered, not nested
+      const begins = [...doc.matchAll(new RegExp(BEGIN_MARKER.replace(/[-[\]{}()*+?.,\\^$|#]/g, '\\$&'), 'g'))];
+      const ends = [...doc.matchAll(new RegExp(END_MARKER.replace(/[-[\]{}()*+?.,\\^$|#]/g, '\\$&'), 'g'))];
+
+      if (begins.length !== 1) {
+        return `expected exactly 1 begin marker, found ${begins.length}`;
+      }
+
+      if (ends.length !== 1) {
+        return `expected exactly 1 end marker, found ${ends.length}`;
+      }
+
+      if (ends[0].index! < begins[0].index!) {
+        return 'end marker precedes begin marker';
+      }
+
+      const inner = doc.slice(begins[0].index! + BEGIN_MARKER.length, ends[0].index!);
+
+      if (inner.includes(BEGIN_MARKER) || inner.includes(END_MARKER)) {
+        return 'nested markers';
+      }
+
+      // (3)(4) parse ONLY complete key=value records; reject anything malformed
+      const records = new Map<string, string>();
+
+      for (const raw of inner.split('\n')) {
+        const line = raw.trim();
+
+        if (line === '' || line === '```text' || line === '```') {
+          continue;
+        }
+
+        const m = /^([A-Za-z0-9_.]+)=(\S+)$/.exec(line);
+
+        if (m === null) {
+          return `malformed line inside identity block: ${line}`;
+        }
+
+        if (records.has(m[1])) {
+          return `duplicate key: ${m[1]}`;
+        }
+
+        records.set(m[1], m[2]);
+      }
+
+      // (4)(5) the exact five-key set — no unknown, missing or extra keys
+      for (const k of records.keys()) {
+        if (!(REQUIRED_KEYS as readonly string[]).includes(k)) {
+          return `unknown key: ${k}`;
+        }
+      }
+
+      for (const k of REQUIRED_KEYS) {
+        if (!records.has(k)) {
+          return `missing key: ${k}`;
+        }
+      }
+
+      if (records.size !== REQUIRED_KEYS.length) {
+        return `expected ${REQUIRED_KEYS.length} keys, found ${records.size}`;
+      }
+
+      /*
+       * (6)(7) each complete hash occurs exactly once in the WHOLE document, and
+       * no full hash or distinctive abbreviated prefix appears outside the block.
+       */
+      const outside = doc.slice(0, begins[0].index!) + doc.slice(ends[0].index! + END_MARKER.length);
+
+      for (const h of [CURRENT_FILE_SHA, CURRENT_BODY_SHA, SUPERSEDED_FILE_SHA]) {
+        const total = doc.split(h).length - 1;
+
+        if (total !== 1) {
+          return `hash ${h.slice(0, 8)} occurs ${total} times, expected exactly 1`;
+        }
+
+        if (outside.includes(h)) {
+          return `hash ${h.slice(0, 8)} appears outside the canonical block`;
+        }
+
+        if (outside.includes(h.slice(0, 8))) {
+          return `abbreviated hash ${h.slice(0, 8)} appears outside the canonical block`;
+        }
+      }
+
+      // (8) the recorded complete-artifact hash is the artifact actually on disk
+      if (records.get(REQUIRED_KEYS[0]) !== fileSha) {
+        return `current_complete_artifact_sha256 does not match the artifact on disk`;
+      }
+
+      // (10) executable body hash and raw byte length
+      if (records.get(REQUIRED_KEYS[1]) !== bodySha) {
+        return 'current_executable_body_sha256 does not match the extracted body';
+      }
+
+      if (records.get(REQUIRED_KEYS[2]) !== String(bodyBytes)) {
+        return 'current_executable_body_bytes does not match the extracted body length';
+      }
+
+      // (11)(12) superseded value and transition are the exact expected constants
+      if (records.get(REQUIRED_KEYS[3]) !== SUPERSEDED_FILE_SHA) {
+        return 'superseded_r15_6_7_complete_artifact_sha256 is not the R15.6.7 artifact hash';
+      }
+
+      if (records.get(REQUIRED_KEYS[4]) !== TRANSITION) {
+        return 'complete_artifact_transition is not the expected value';
+      }
+
+      return null;
+    };
+
     const analysis = readFileSync(`${DIR}MANAGED_ROLE_DIAGNOSTIC_ANALYSIS.md`, 'utf8');
 
-    // 1. the artifact on disk really is the current one
-    expect(createHash('sha256').update(readFileSync(DIAG)).digest('hex')).toBe(CURRENT_FILE_SHA);
+    // (9) the executable body: first exact BEGIN; through the final COMMIT;
+    const actualFileSha = createHash('sha256').update(readFileSync(DIAG)).digest('hex');
+    const actualBodySha = createHash('sha256').update(Buffer.from(executableBody, 'utf8')).digest('hex');
+    const actualBodyBytes = Buffer.byteLength(executableBody, 'utf8');
 
-    // 2. the document names that value as the CURRENT complete artifact
-    expect(analysis, 'the current whole-file hash must appear').toContain(CURRENT_FILE_SHA);
+    // The real document must validate against the real artifact.
+    expect(validateIdentity(analysis, actualFileSha, actualBodySha, actualBodyBytes)).toBeNull();
+    expect(actualFileSha).toBe(CURRENT_FILE_SHA);
+    expect(actualBodySha).toBe(CURRENT_BODY_SHA);
+    expect(actualBodyBytes).toBe(33_114);
 
-    const currentRow = analysis.split('\n').find((l) => l.includes(CURRENT_FILE_SHA) && /current/i.test(l));
-    expect(currentRow, 'the current hash must be labelled as the current artifact').toBeDefined();
+    /*
+     * PERSISTENT ADVERSARIAL REGRESSIONS — every mutation goes through the SAME
+     * validator. Each must be REJECTED. These are exactly the shapes the prose
+     * heuristics used to let through.
+     */
+    const reject = (label: string, mutate: (d: string) => string) => {
+      const reason = validateIdentity(mutate(analysis), actualFileSha, actualBodySha, actualBodyBytes);
+      expect(reason, `mutation must be rejected: ${label}`).not.toBeNull();
+    };
 
-    // 3. the document records the executable-body hash AND its byte length
-    expect(analysis, 'the executable-body hash must appear').toContain(CURRENT_BODY_SHA);
+    // 1. current hash followed by "is not current"
+    reject('current hash contradicted in prose', (d) =>
+      d.replace(END_MARKER, `${END_MARKER}\n\n${CURRENT_FILE_SHA} is not current.\n`),
+    );
 
-    const bodyRow = analysis.split('\n').find((l) => l.includes(CURRENT_BODY_SHA) || /33,114 bytes/.test(l));
-    expect(bodyRow, 'the executable body must be described').toBeDefined();
-    expect(analysis, 'the executable-body length must be stated').toMatch(/33,114\s*bytes/);
+    // 2. superseded hash assigned to the current key at end-of-line
+    reject('superseded hash as current key (EOL)', (d) =>
+      d.replace(`${REQUIRED_KEYS[0]}=${CURRENT_FILE_SHA}`, `${REQUIRED_KEYS[0]}=${SUPERSEDED_FILE_SHA}`),
+    );
 
-    // 4. the extracted body matches that hash, at that length
-    expect(createHash('sha256').update(Buffer.from(executableBody, 'utf8')).digest('hex')).toBe(CURRENT_BODY_SHA);
-    expect(Buffer.byteLength(executableBody, 'utf8')).toBe(33_114);
+    // 3. superseded hash as the current key before a closing parenthesis
+    reject('superseded hash as current key (before parenthesis)', (d) =>
+      d
+        .replace(`${REQUIRED_KEYS[0]}=${CURRENT_FILE_SHA}`, `${REQUIRED_KEYS[0]}=${SUPERSEDED_FILE_SHA})`)
+        .replace(`${REQUIRED_KEYS[3]}=${SUPERSEDED_FILE_SHA}`, `${REQUIRED_KEYS[3]}=${CURRENT_FILE_SHA}`),
+    );
 
-    // 5. the superseded hash is never presented as the current identity
-    for (const line of analysis.split('\n').filter((l) => l.includes(SUPERSEDED_FILE_SHA))) {
-      expect(line, `superseded hash must not be labelled current: ${line}`).not.toMatch(/\bcurrent\b(?!\)?\s*$)/i);
-    }
+    // 4. a second occurrence claiming the superseded hash is current
+    reject('second occurrence claiming superseded is current', (d) =>
+      d.replace(END_MARKER, `${END_MARKER}\n\nThe current artifact is ${SUPERSEDED_FILE_SHA}.\n`),
+    );
 
-    // 6. if it remains at all, it is explicitly marked superseded / R15.6.7
-    if (analysis.includes(SUPERSEDED_FILE_SHA)) {
-      const idx = analysis.indexOf(SUPERSEDED_FILE_SHA);
-      const window = analysis.slice(idx, idx + 200);
-      expect(window, 'the old hash must be labelled superseded or R15.6.7').toMatch(/superseded|R15\.6\.7/i);
-    }
+    // 5. contradiction wrapped in reassuring "superseded"/"R15.6.7" text
+    reject('contradiction padded with superseded/R15.6.7 wording', (d) =>
+      d.replace(
+        END_MARKER,
+        `${END_MARKER}\n\nNote on the superseded R15.6.7 artifact: the current complete artifact is ` +
+          `${SUPERSEDED_FILE_SHA}, superseded R15.6.7 context follows.\n`,
+      ),
+    );
 
-    // 7. the two hashes are documented as serving different purposes
-    expect(analysis).toMatch(/complete operator-facing artifact/i);
-    expect(analysis).toMatch(/executable SQL (itself )?is unchanged|proves the executable SQL/i);
+    // 6. duplicate canonical identity blocks
+    reject('duplicate identity blocks', (d) => {
+      const b = d.indexOf(BEGIN_MARKER);
+      const e = d.indexOf(END_MARKER) + END_MARKER.length;
 
-    // 8. the reason the whole-file hash moved is recorded, and it is comment-only
-    expect(analysis).toMatch(/exclusively by the reviewed SQL-header comment correction/i);
-    expect(analysis).toMatch(/executable body did not|No executable token\s*\n?moved/i);
+      return d.slice(0, e) + '\n' + d.slice(b, e) + d.slice(e);
+    });
+
+    // 7. duplicate keys with contradictory values
+    reject('duplicate contradictory key', (d) =>
+      d.replace(
+        `${REQUIRED_KEYS[0]}=${CURRENT_FILE_SHA}`,
+        `${REQUIRED_KEYS[0]}=${CURRENT_FILE_SHA}\n${REQUIRED_KEYS[0]}=${SUPERSEDED_FILE_SHA}`,
+      ),
+    );
+
+    // 8. a hash occurrence outside the canonical block
+    reject('hash outside the canonical block', (d) => `${d}\n\nSee also ${CURRENT_BODY_SHA}.\n`);
+
+    // 9. missing / renamed current-artifact key
+    reject('missing current-artifact key', (d) => d.replace(`${REQUIRED_KEYS[0]}=${CURRENT_FILE_SHA}\n`, ''));
+    reject('renamed current-artifact key', (d) => d.replace(`${REQUIRED_KEYS[0]}=`, 'diagnostic_28.some_other_key='));
+
+    // Structural rejections: markers must be exactly one each, ordered, unnested.
+    reject('missing begin marker', (d) => d.replace(BEGIN_MARKER, ''));
+    reject('missing end marker', (d) => d.replace(END_MARKER, ''));
+    reject('reversed markers', (d) =>
+      d.replace(BEGIN_MARKER, '@@B@@').replace(END_MARKER, BEGIN_MARKER).replace('@@B@@', END_MARKER),
+    );
+    reject('malformed record line', (d) =>
+      d.replace(`${REQUIRED_KEYS[2]}=33114`, 'diagnostic_28.current_executable_body_bytes 33114'),
+    );
+    reject('extra unknown key', (d) => d.replace(END_MARKER, `diagnostic_28.extra_key=1\n${END_MARKER}`));
+    reject('body byte length disagrees', (d) => d.replace(`${REQUIRED_KEYS[2]}=33114`, `${REQUIRED_KEYS[2]}=33115`));
+    reject('transition value altered', (d) => d.replace(TRANSITION, 'R15.6.8_EXECUTABLE_CHANGE'));
+
+    /*
+     * The exact contradictory in-memory example the review reported must now be
+     * rejected by the real validator, not merely renamed.
+     */
+    const contradictory = analysis.replace(
+      END_MARKER,
+      `${END_MARKER}\n\nThe current complete artifact is ${SUPERSEDED_FILE_SHA} (superseded, R15.6.7).\n`,
+    );
+    const currentRowAccepted = validateIdentity(contradictory, actualFileSha, actualBodySha, actualBodyBytes) === null;
+    const oldCurrentLineRejected =
+      validateIdentity(contradictory, actualFileSha, actualBodySha, actualBodyBytes) !== null;
+    const oldContextWindowAccepted = currentRowAccepted;
+
+    expect(currentRowAccepted).toBe(false);
+    expect(oldCurrentLineRejected).toBe(true);
+    expect(oldContextWindowAccepted).toBe(false);
+
+    /*
+     * P2 — SQL checkouts are pinned to LF. The rule must be ACTIVE: a commented
+     * copy or a mention inside prose must not satisfy this.
+     */
+    const attrs = readFileSync(`${REPO}.gitattributes`, 'utf8');
+    const activeSqlRules = attrs
+      .split('\n')
+      .map((l) => l.trim())
+      .filter((l) => !l.startsWith('#') && /^\*\.sql\s+text\s+eol=lf$/.test(l));
+    expect(activeSqlRules.length, 'exactly one active *.sql text eol=lf rule').toBe(1);
+
+    // Negative controls for the .gitattributes guard, through the same predicate.
+    const activeRuleCount = (text: string) =>
+      text
+        .split('\n')
+        .map((l) => l.trim())
+        .filter((l) => !l.startsWith('#') && /^\*\.sql\s+text\s+eol=lf$/.test(l)).length;
+    expect(activeRuleCount(attrs.replace('*.sql text eol=lf', '# *.sql text eol=lf')), 'commented rule').toBe(0);
+    expect(activeRuleCount(attrs.replace('*.sql text eol=lf', '*.sql text eol=crlf')), 'eol=crlf').toBe(0);
+
+    // Git itself must report the effective attributes for the diagnostic.
+    const checkAttr = execFileSync('git', ['check-attr', 'text', 'eol', '--', DIAG], {
+      cwd: REPO,
+      encoding: 'utf8',
+    });
+    expect(checkAttr).toMatch(/text: set/);
+    expect(checkAttr).toMatch(/eol: lf/);
   });
 
   it('d-doc1 — the analysis states the output bound honestly and never claims density is free', () => {

@@ -282,28 +282,56 @@ still holds — and really exercises — an inherited `SELECT`. `rolpassword` is
 
 ## 8. Artifact identity
 
-Two hashes describe this artifact, and they answer different questions. Both are recorded because
-neither alone is sufficient.
+### 8.1 Canonical identity record
 
-| Hash | Value | What it proves |
-|---|---|---|
-| **Current complete artifact** (whole file) | `52acf699ed170ec4ded25301190676491e984e94ad963e13c3d33c6ae037ee60` | Identifies the complete operator-facing artifact — the executable SQL **together with** the safety contract in its header. This is the identity of Diagnostic 28 as reviewed and as an operator receives it. |
-| **Executable body** (`BEGIN;` through the final `COMMIT;`, 33,114 bytes) | `20bee9767502087ae198dc28c54bfc048a52f290a43db177a3bf172bf89d1e23` | Proves the executable SQL itself is unchanged — every SELECT list, predicate, `ORDER BY`, transaction semantic, timeout behaviour and result-set schema. |
+The block below is the **canonical artifact-identity record** for Diagnostic 28. It is the single
+authoritative statement of which artifact this analysis describes, and it is machine-parsed by the
+committed regression test. Identity is established **only** by these `key=value` records — never by
+surrounding prose, and never by any word such as "current" or "superseded" appearing near a hash.
 
-**The whole-file hash changed in R15.6.8; the executable body did not.** The artifact moved from
+Each of the three complete SHA-256 values appears **exactly once in this entire document**, inside
+this block. Anywhere else, the analysis refers to an identity **key** or role by name and never
+repeats a hash value, whether in full or abbreviated. That rule exists so contradictory prose can
+never create a second, competing artifact identity.
 
+<!-- DIAGNOSTIC_28_IDENTITY_V1_BEGIN -->
+```text
+diagnostic_28.current_complete_artifact_sha256=52acf699ed170ec4ded25301190676491e984e94ad963e13c3d33c6ae037ee60
+diagnostic_28.current_executable_body_sha256=20bee9767502087ae198dc28c54bfc048a52f290a43db177a3bf172bf89d1e23
+diagnostic_28.current_executable_body_bytes=33114
+diagnostic_28.superseded_r15_6_7_complete_artifact_sha256=46953b5c95afe455313ec6279b86879aa36aff7b252c5e323f9456aa364c29e0
+diagnostic_28.complete_artifact_transition=R15.6.8_SQL_HEADER_COMMENTS_ONLY
 ```
-46953b5c95afe455313ec6279b86879aa36aff7b252c5e323f9456aa364c29e0   (superseded — R15.6.7 artifact)
-52acf699ed170ec4ded25301190676491e984e94ad963e13c3d33c6ae037ee60   (current)
-```
+<!-- DIAGNOSTIC_28_IDENTITY_V1_END -->
 
-and that change was caused **exclusively by the reviewed SQL-header comment correction** — the
-addition of the operator-facing output-bound qualification described in §4. No executable token
-moved: the executable body hashed to `20bee976…1e23` at 33,114 bytes both before and after, and a
-`git diff` of the change contains zero non-comment lines.
+**Parsing rules.** Exactly one begin marker and one end marker must exist. Only complete
+`key=value` lines between them are records; the fence lines are ignored. Duplicate keys, unknown
+keys, missing keys, extra keys, malformed lines, duplicated markers, reversed markers and nested
+markers are all rejected.
 
-`46953b5c…` is retained above **only as the superseded R15.6.7 artifact**. It is not the current
-identity of Diagnostic 28 and is not the artifact this analysis approves.
+### 8.2 What each key means
+
+| Key | Role |
+|---|---|
+| `current_complete_artifact_sha256` | Identity of the **complete operator-facing artifact** — the executable SQL **together with** the safety contract in its header. This is Diagnostic 28 as reviewed and as an operator receives and pastes it. |
+| `current_executable_body_sha256` | Proves the **executable SQL itself** is unchanged: every SELECT list, predicate, `ORDER BY`, transaction semantic, timeout behaviour and result-set schema. |
+| `current_executable_body_bytes` | Raw byte length of that executable body, extracted from the first `BEGIN;` through the final `COMMIT;`. |
+| `superseded_r15_6_7_complete_artifact_sha256` | The **superseded** R15.6.7 complete artifact. Historical only. It is not the current identity of Diagnostic 28 and is not the artifact this analysis approves. |
+| `complete_artifact_transition` | Why the complete-artifact hash moved between those two values. |
+
+### 8.3 Why the complete-artifact hash moved
+
+**The complete-artifact hash changed in R15.6.8; the executable body did not.** The transition is
+recorded as `R15.6.8_SQL_HEADER_COMMENTS_ONLY`, and that is the whole of it: the change was caused
+**exclusively by the reviewed SQL-header comment correction** — the addition of the operator-facing
+output-bound qualification described in §4. No executable token moved. The executable body hashed
+to the value recorded under `current_executable_body_sha256`, at the byte length recorded under
+`current_executable_body_bytes`, both before and after the change, and a `git diff` of that change
+contains zero non-comment lines.
+
+The two identities therefore answer different questions and neither alone is sufficient: the
+complete-artifact hash tells an operator they hold the reviewed artifact **including its safety
+contract**, while the executable-body hash tells a reviewer the executable SQL is untouched.
 
 ## 8a. What the diagnostic collects
 
