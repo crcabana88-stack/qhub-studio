@@ -27,7 +27,8 @@
 import { execFileSync, spawn, type ChildProcess } from 'node:child_process';
 import { existsSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
-import { beforeAll, describe, expect, it } from 'vitest';
+import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { acquireClusterLock, releaseClusterLock } from './helpers/pg-cluster-lock';
 
 const REPO = fileURLToPath(new URL('../../', import.meta.url));
 const P26 = `${REPO}docs/release/r15-6-migration-history/26_MIGRATION_HISTORY_RECORD.sql`;
@@ -143,7 +144,13 @@ const histDump = () =>
   ).trim();
 
 describe.skipIf(!HAVE_PG)('R15.6 RECORD — SHARE ROW EXCLUSIVE serialization on real PostgreSQL', () => {
-  beforeAll(() => {
+  beforeAll(async () => {
+    /*
+     * Roles are cluster-scoped: RECORD 26's privilege gate would otherwise see
+     * a sibling real-PG suite's fixture roles and refuse for an unrelated reason.
+     */
+    await acquireClusterLock();
+
     for (const role of ['anon NOLOGIN', 'authenticated NOLOGIN', 'service_role NOLOGIN BYPASSRLS']) {
       try {
         run('postgres', `CREATE ROLE ${role};`);
@@ -164,6 +171,16 @@ describe.skipIf(!HAVE_PG)('R15.6 RECORD — SHARE ROW EXCLUSIVE serialization on
       GRANT EXECUTE ON FUNCTIONS TO anon, authenticated, service_role;`,
     );
     runFile(DB, MIGRATION);
+  }, 300_000);
+
+  afterAll(() => {
+    try {
+      run('postgres', `DROP DATABASE IF EXISTS ${DB} WITH (FORCE);`);
+    } catch {
+      /* n/a */
+    }
+
+    releaseClusterLock();
   }, 300_000);
 
   it('c1 — SRE self-conflicts: a second SHARE ROW EXCLUSIVE lock times out while the first is held', async () => {

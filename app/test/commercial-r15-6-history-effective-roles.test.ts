@@ -35,7 +35,8 @@
 import { execFileSync } from 'node:child_process';
 import { existsSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
-import { beforeAll, describe, expect, it } from 'vitest';
+import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { acquireClusterLock, releaseClusterLock } from './helpers/pg-cluster-lock';
 
 const REPO = fileURLToPath(new URL('../../', import.meta.url));
 const DIR = `${REPO}docs/release/r15-6-migration-history/`;
@@ -169,7 +170,13 @@ function recordExactRowOnCleanState(): void {
 }
 
 describe.skipIf(!HAVE_PG)('R15.6 — mandatory effective-role coverage on real PostgreSQL', () => {
-  beforeAll(() => {
+  beforeAll(async () => {
+    /*
+     * Roles are cluster-scoped, so a sibling real-PG suite's fixture roles would
+     * otherwise appear here as genuine unauthorized access paths.
+     */
+    await acquireClusterLock();
+
     for (const role of ['anon NOLOGIN', 'authenticated NOLOGIN', 'service_role NOLOGIN BYPASSRLS']) {
       try {
         run(`CREATE ROLE ${role};`, 'postgres');
@@ -192,6 +199,16 @@ describe.skipIf(!HAVE_PG)('R15.6 — mandatory effective-role coverage on real P
       timeout: 300000,
     });
   }, 600_000);
+
+  afterAll(() => {
+    try {
+      run(`DROP DATABASE IF EXISTS ${DB} WITH (FORCE);`, 'postgres');
+    } catch {
+      /* n/a */
+    }
+
+    releaseClusterLock();
+  }, 300_000);
 
   it('e0 — healthy state: PRE SAFE, RECORD records, POST reconciled (dormant predefined roles present)', () => {
     resetHistory();

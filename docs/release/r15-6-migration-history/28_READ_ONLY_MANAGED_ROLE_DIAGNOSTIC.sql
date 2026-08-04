@@ -1,55 +1,83 @@
 -- ============================================================================
--- QHUB R15.6.4 — 28 READ-ONLY MANAGED-ROLE ACCESS DIAGNOSTIC
+-- QHUB R15.6.4 — READ-ONLY MANAGED-ROLE ACCESS DIAGNOSTIC (corrected)
 --
--- EVIDENCE ONLY. This file authorizes NOTHING. It declares no role trusted, it
--- does not relax any gate, and it must never be treated as permission to run
--- 26_MIGRATION_HISTORY_RECORD.sql. RECORD and POST remain unauthorized.
+-- EVIDENCE ONLY. This file authorizes NOTHING. It declares no role safe, it
+-- relaxes no gate, and it must never be read as permission to run
+-- 26_MIGRATION_HISTORY_RECORD.sql. PRE 25, RECORD 26, POST 27 and this file all
+-- remain unauthorized for further live execution.
 --
 -- WHY THIS EXISTS. The authorized live run of PRE 25 returned
 -- UNEXPECTED_MIGRATION_HISTORY_STOP with exactly one failing condition:
 --   no_unauthorized_access_path = false
 --   unauthorized_access_paths   = {cli_login_postgres, supabase_etl_admin,
 --                                  supabase_read_only_user}
--- Every other check passed (verifier authority + product READY, exact table
--- contract, empty nspacl/relacl, anon/authenticated/service_role clean, no
--- conflicting/malformed/newer rows, target absent). The three names look
--- platform-managed, but a name is not a capability: this diagnostic collects
--- the exact catalog evidence a human reviewer needs to decide whether each path
--- is genuinely benign managed infrastructure or a real exposure.
+-- Every other check passed. The three names look platform-managed, but a name
+-- is not a capability: this file collects the exact catalog evidence a human
+-- reviewer needs to decide whether each path is benign managed infrastructure
+-- or a real exposure.
+--
+-- ---------------------------------------------------------------------------
+-- CORRECTION (independent review): MEMBER != USAGE != SET.
+--
+-- The first revision used pg_has_role(candidate, role, 'MEMBER') as proof that
+-- a candidate could inherit privileges or execute SET ROLE. In PostgreSQL 16
+-- these are three distinct facts, verified here against a live PostgreSQL 16
+-- and against actual SET ROLE attempts:
+--
+--   membership (GRANT r TO c WITH ...)  MEMBER  USAGE  SET   priv?  SET ROLE?
+--   INHERIT FALSE, SET FALSE              t       f      f     no     DENIED
+--   INHERIT FALSE, SET TRUE               t       f      t     no     OK
+--   INHERIT TRUE,  SET FALSE              t       t      f     yes    DENIED
+--   INHERIT TRUE,  SET TRUE               t       t      t     yes    OK
+--   ADMIN TRUE, INHERIT/SET FALSE         t       f      f     no     DENIED
+--
+-- So MEMBER alone is an INACTIVE membership: it confers no privilege and no
+-- SET ROLE authority. ADMIN OPTION confers neither either — it only permits
+-- re-granting the membership. This file therefore reports, separately:
+--   * membership existence            — pg_has_role(..., 'MEMBER')
+--   * privileges usable WITHOUT SET ROLE — has_*_privilege(candidate, ...),
+--     which follows PostgreSQL's own inheritance (the USAGE property)
+--   * roles actually settable         — pg_has_role(..., 'SET')
+-- The word "assumable" is used ONLY for roles the candidate may actually SET
+-- ROLE to. Inactive memberships remain visible as membership evidence and are
+-- labelled as conferring no access.
+--
+-- NOTE ON THE GATE. PRE 25 / RECORD 26 / POST 27 use the MEMBER closure. Under
+-- these semantics that predicate is CONSERVATIVE — it can flag an inactive
+-- membership that confers nothing, so it may over-block, never under-block. It
+-- is therefore still fail-closed and is deliberately left unchanged here; this
+-- diagnostic supplies the precise picture a reviewer needs to interpret it.
+-- ---------------------------------------------------------------------------
 --
 -- SCOPE AND SAFETY.
---   * One explicit transaction: REPEATABLE READ + READ ONLY. No mutating SQL of
---     any kind — no INSERT/UPDATE/DELETE/TRUNCATE/CREATE/ALTER/DROP/GRANT/
---     REVOKE/LOCK, no temporary objects, no dynamic SQL, no function calls
---     other than PostgreSQL's own catalog/privilege inspection functions.
---   * Reads ONLY: pg_roles, pg_auth_members, pg_namespace, pg_class,
---     pg_default_acl (scoped), and the privilege functions. It never reads
---     application tables, user records, secrets, tokens, customer data, or any
---     schema other than supabase_migrations (plus the pinned owner lookup in
---     public.qhub_manual_review_requests, from pg_class metadata only — no row
---     is read from that table).
---   * nspacl / relacl are reported for exactly the two protected objects.
---   * Candidates are DISCOVERED from the catalog, never from a name list. The
---     three observed names are not special-cased anywhere in this file.
+--   * One explicit transaction: REPEATABLE READ + READ ONLY.
+--   * No DDL, no DML, no dynamic SQL, no DO block, no EXECUTE, no user-defined
+--     function call, no temporary object — only catalog reads and PostgreSQL's
+--     own privilege-inspection functions.
+--   * Reads pg_roles, pg_auth_members, pg_namespace, pg_class, pg_default_acl
+--     and the privilege functions. It reads NO application rows, NO
+--     migration-history rows, no secrets, credentials, tokens, password hashes
+--     or customer data, and no schema other than supabase_migrations (the
+--     pinned-owner lookup reads pg_class metadata for a public table, never a
+--     row from it).
+--   * Candidates are DISCOVERED from the catalog. The three observed live names
+--     appear nowhere in the executable SQL.
 --
--- CANDIDATE DEFINITION (identical to the PRE 25 / RECORD 26 / POST 27 gate):
---   any role that is NOT a superuser, NOT the pinned owner, and is either
---   rolcanlogin OR one of anon / authenticated / service_role.
+-- CANDIDATE DEFINITION (same population the gate considers): any role that is
+-- NOT a superuser, NOT the pinned owner, and is either rolcanlogin or one of
+-- anon / authenticated / service_role.
 --
--- ACCESS DEFINITION: a candidate reaches the protected objects if ANY role it
--- can assume — itself, or any role reachable by transitive membership
--- REGARDLESS OF INHERIT (pg_has_role(..., 'MEMBER')) — holds schema
--- USAGE/CREATE or table SELECT/INSERT/UPDATE/DELETE/TRUNCATE/REFERENCES/
--- TRIGGER. Membership closure is used because a NOINHERIT login reports FALSE
--- from has_table_privilege yet can still SET ROLE (verified on PostgreSQL 16).
---
--- OUTPUT: four result sets, deterministic and ordered.
---   QUERY 1 — protected-object identity: owners, nspacl, relacl, RLS.
---   QUERY 2 — candidate inventory with role attributes and headline access.
---   QUERY 3 — per-candidate, per-privilege route attribution (direct vs
---             inherited vs SET-ROLE-only) — the core evidence table.
---   QUERY 4 — membership edges and predefined-capability-role reachability.
--- Run the file IN FULL; read all four. Capture every row verbatim.
+-- OUTPUT: five deterministic, ordered result sets.
+--   QUERY 1 — protected-object identity.
+--   QUERY 2 — candidate inventory: attributes, validity, and the three
+--             separated reachability facts.
+--   QUERY 3 — per-privilege route evidence (usable-without-SET-ROLE vs
+--             reachable-only-via-SET-ROLE vs inactive membership).
+--   QUERY 4 — membership PATHS: every direct and transitive route with per-edge
+--             admin/inherit/set options, depth, deterministic path identity,
+--             and whether that specific path permits inheritance / SET ROLE.
+--   QUERY 5 — structured ACL evidence for the protected schema and table.
+-- Run the file IN FULL and read all five. Capture every row verbatim.
 --
 -- TRANSFER SAFELY OR NOT AT ALL:
 --   Get-Content -Raw -Encoding UTF8 <file> | Set-Clipboard
@@ -60,8 +88,8 @@ SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY;
 SET LOCAL search_path = pg_catalog;
 
 -- ---------------------------------------------------------------------------
--- QUERY 1 — the protected objects themselves: exact owners, explicit ACLs,
--- RLS state, and the pinned contract owner the gate compares against.
+-- QUERY 1 — the protected objects: exact owners, explicit ACLs, RLS state, and
+-- the pinned contract owner the gate compares against.
 -- ---------------------------------------------------------------------------
 SELECT
   'supabase_migrations'                                                          AS schema_name,
@@ -81,13 +109,22 @@ SELECT
     JOIN pg_namespace n ON n.oid = d.defaclnamespace
    WHERE n.nspname = 'supabase_migrations')                                      AS default_acl_entries_for_schema,
   (SELECT count(*) FROM pg_roles r WHERE r.rolsuper)                             AS superuser_count,
-  (SELECT count(*) FROM pg_roles)                                                AS total_role_count;
+  (SELECT count(*) FROM pg_roles)                                                AS total_role_count,
+  current_setting('server_version')                                              AS server_version;
 
 -- ---------------------------------------------------------------------------
--- QUERY 2 — candidate inventory. Every non-superuser, non-owner role that can
--- log in, plus anon/authenticated/service_role. Role attributes are reported in
--- full so a reviewer can judge what each identity is actually capable of.
--- reaches_protected_objects is the same predicate the PRE/RECORD/POST gate uses.
+-- QUERY 2 — candidate inventory.
+--
+-- Reachability is reported as THREE separate facts, never conflated:
+--   privileges_usable_without_set_role — has_*_privilege(candidate, ...) is
+--       true: the candidate holds the privilege directly, through PUBLIC,
+--       through ownership, or through an INHERIT-enabled membership chain.
+--   privileges_via_set_role_only       — the candidate holds nothing itself,
+--       but MAY SET ROLE (pg_has_role ... 'SET') to a role that does.
+--   inactive_memberships_with_access   — memberships that EXIST (MEMBER) to
+--       roles that hold access, but confer neither inheritance nor SET ROLE.
+--       Evidence only: these are NOT access.
+-- reaches_protected_objects is true only for the first two.
 -- ---------------------------------------------------------------------------
 WITH ids AS (
   SELECT
@@ -103,58 +140,99 @@ cand AS (
    WHERE NOT r.rolsuper
      AND r.oid IS DISTINCT FROM i.owner_oid
      AND (r.rolcanlogin OR r.rolname IN ('anon', 'authenticated', 'service_role'))
+),
+-- Does this role hold ANY relevant privilege on the protected objects?
+holds AS (
+  SELECT r.oid, r.rolname,
+         (has_schema_privilege(r.oid, i.nsp_oid, 'USAGE, CREATE')
+          OR has_table_privilege(r.oid, i.rel_oid,
+               'SELECT, INSERT, UPDATE, DELETE, TRUNCATE, REFERENCES, TRIGGER')) AS has_any
+    FROM pg_roles r, ids i
 )
 SELECT
   c.rolname                                                                      AS candidate_role,
   c.rolcanlogin                                                                  AS can_login,
   c.rolsuper                                                                     AS is_superuser,
-  c.rolinherit                                                                   AS inherits,
+  c.rolinherit                                                                   AS role_default_inherit,
   c.rolcreaterole                                                                AS createrole,
   c.rolcreatedb                                                                  AS createdb,
   c.rolreplication                                                               AS replication,
   c.rolbypassrls                                                                 AS bypassrls,
   c.rolconnlimit                                                                 AS conn_limit,
-  (c.rolvaliduntil IS NOT NULL)                                                  AS has_valid_until,
+  -- ROLE VALIDITY (exact, not a boolean reduction). No password material.
+  coalesce(c.rolvaliduntil::text, '(null)')                                      AS rolvaliduntil,
+  (c.rolvaliduntil IS NULL)                                                      AS never_expires,
+  (c.rolvaliduntil IS NULL OR c.rolvaliduntil > now())                           AS currently_valid,
+  (c.rolvaliduntil IS NOT NULL AND c.rolvaliduntil <= now())                     AS expired,
   (c.rolname IN ('anon', 'authenticated', 'service_role'))                       AS is_required_platform_role,
-  -- The gate predicate, reproduced verbatim for this candidate.
-  EXISTS (
-    SELECT 1 FROM pg_roles a, ids i
-     WHERE (a.oid = c.oid OR pg_has_role(c.oid, a.oid, 'MEMBER'))
-       AND (has_schema_privilege(a.oid, i.nsp_oid, 'USAGE, CREATE')
-            OR has_table_privilege(a.oid, i.rel_oid,
-                 'SELECT, INSERT, UPDATE, DELETE, TRUNCATE, REFERENCES, TRIGGER'))
-  )                                                                              AS reaches_protected_objects,
-  -- Can this candidate become the pinned owner, or any superuser?
-  EXISTS (SELECT 1 FROM ids i WHERE pg_has_role(c.oid, i.owner_oid, 'MEMBER'))   AS can_assume_pinned_owner,
-  EXISTS (SELECT 1 FROM pg_roles s
-           WHERE s.rolsuper AND pg_has_role(c.oid, s.oid, 'MEMBER'))             AS can_assume_a_superuser,
-  -- Predefined capability roles reachable by this candidate (empty = none).
+  -- THE THREE SEPARATED FACTS
+  (SELECT h.has_any FROM holds h WHERE h.oid = c.oid)                            AS privileges_usable_without_set_role,
+  EXISTS (SELECT 1 FROM holds h
+           WHERE h.oid <> c.oid AND h.has_any AND pg_has_role(c.oid, h.oid, 'SET'))
+                                                                                 AS privileges_via_set_role,
+  ((SELECT h.has_any FROM holds h WHERE h.oid = c.oid)
+   OR EXISTS (SELECT 1 FROM holds h
+               WHERE h.oid <> c.oid AND h.has_any AND pg_has_role(c.oid, h.oid, 'SET')))
+                                                                                 AS reaches_protected_objects,
+  -- Inactive memberships: MEMBER holds, but neither USAGE nor SET — no access.
+  (SELECT coalesce(array_agg(h.rolname ORDER BY h.rolname), '{}'::name[])
+     FROM holds h
+    WHERE h.oid <> c.oid AND h.has_any
+      AND pg_has_role(c.oid, h.oid, 'MEMBER')
+      AND NOT pg_has_role(c.oid, h.oid, 'USAGE')
+      AND NOT pg_has_role(c.oid, h.oid, 'SET'))                                  AS inactive_memberships_with_access,
+  -- Owner / superuser: SET authority and inheritance reported separately.
+  EXISTS (SELECT 1 FROM ids i WHERE pg_has_role(c.oid, i.owner_oid, 'SET'))      AS can_set_role_to_pinned_owner,
+  EXISTS (SELECT 1 FROM ids i WHERE pg_has_role(c.oid, i.owner_oid, 'USAGE'))    AS inherits_from_pinned_owner,
+  EXISTS (SELECT 1 FROM ids i
+           WHERE pg_has_role(c.oid, i.owner_oid, 'MEMBER')
+             AND NOT pg_has_role(c.oid, i.owner_oid, 'USAGE')
+             AND NOT pg_has_role(c.oid, i.owner_oid, 'SET'))                     AS inactive_membership_of_pinned_owner,
+  EXISTS (SELECT 1 FROM pg_roles s WHERE s.rolsuper AND pg_has_role(c.oid, s.oid, 'SET'))
+                                                                                 AS can_set_role_to_a_superuser,
+  EXISTS (SELECT 1 FROM pg_roles s WHERE s.rolsuper AND pg_has_role(c.oid, s.oid, 'USAGE'))
+                                                                                 AS inherits_from_a_superuser,
+  -- Role sets, split by what the membership actually permits.
+  (SELECT coalesce(array_agg(r.rolname ORDER BY r.rolname), '{}'::name[])
+     FROM pg_roles r WHERE r.oid <> c.oid AND pg_has_role(c.oid, r.oid, 'USAGE'))
+                                                                                 AS roles_inherited_from,
+  (SELECT coalesce(array_agg(r.rolname ORDER BY r.rolname), '{}'::name[])
+     FROM pg_roles r WHERE r.oid <> c.oid AND pg_has_role(c.oid, r.oid, 'SET'))
+                                                                                 AS roles_settable_via_set_role,
+  (SELECT coalesce(array_agg(r.rolname ORDER BY r.rolname), '{}'::name[])
+     FROM pg_roles r
+    WHERE r.oid <> c.oid AND pg_has_role(c.oid, r.oid, 'MEMBER')
+      AND NOT pg_has_role(c.oid, r.oid, 'USAGE')
+      AND NOT pg_has_role(c.oid, r.oid, 'SET'))                                  AS roles_inactive_membership_only,
+  -- Predefined capability roles, split the same way.
   (SELECT coalesce(array_agg(p.rolname ORDER BY p.rolname), '{}'::name[])
      FROM pg_roles p
-    WHERE p.rolname LIKE 'pg\_%' AND p.oid <> c.oid
-      AND pg_has_role(c.oid, p.oid, 'MEMBER'))                                   AS predefined_roles_reachable,
-  -- Every non-self role this candidate can assume (the full closure).
-  (SELECT coalesce(array_agg(a.rolname ORDER BY a.rolname), '{}'::name[])
-     FROM pg_roles a
-    WHERE a.oid <> c.oid AND pg_has_role(c.oid, a.oid, 'MEMBER'))                AS all_assumable_roles
+    WHERE p.rolname LIKE 'pg\_%' AND p.oid <> c.oid AND pg_has_role(c.oid, p.oid, 'USAGE'))
+                                                                                 AS predefined_roles_inherited,
+  (SELECT coalesce(array_agg(p.rolname ORDER BY p.rolname), '{}'::name[])
+     FROM pg_roles p
+    WHERE p.rolname LIKE 'pg\_%' AND p.oid <> c.oid AND pg_has_role(c.oid, p.oid, 'SET'))
+                                                                                 AS predefined_roles_settable,
+  (SELECT coalesce(array_agg(p.rolname ORDER BY p.rolname), '{}'::name[])
+     FROM pg_roles p
+    WHERE p.rolname LIKE 'pg\_%' AND p.oid <> c.oid AND pg_has_role(c.oid, p.oid, 'MEMBER')
+      AND NOT pg_has_role(c.oid, p.oid, 'USAGE') AND NOT pg_has_role(c.oid, p.oid, 'SET'))
+                                                                                 AS predefined_roles_inactive_membership
 FROM cand c
 ORDER BY reaches_protected_objects DESC, c.rolname;
 
 -- ---------------------------------------------------------------------------
--- QUERY 3 — THE CORE EVIDENCE TABLE. One row per (candidate, privilege), only
--- where the candidate actually reaches the privilege. Each row attributes the
--- route:
---   direct_or_inherited  = has_*_privilege(candidate, ...) — what the candidate
---                          holds without switching roles (direct grant, PUBLIC,
---                          ownership, or INHERIT-ed membership)
---   set_role_only        = NOT direct_or_inherited, but some assumable role has
---                          it — reachable exclusively via SET ROLE (the
---                          NOINHERIT case)
---   via_explicit_acl     = an explicit ACL entry names the candidate or a role
---                          it can assume
---   via_public_grant     = the privilege is granted to PUBLIC
---   via_predefined_role  = granted through a pg_* capability role
---   granting_roles       = exactly which assumable roles supply the privilege
+-- QUERY 3 — per-privilege route evidence. One row per (candidate, object,
+-- privilege) that the candidate can actually reach by SOME route, plus rows
+-- where only an inactive membership exists (reported with both reach flags
+-- false, so a reviewer sees the membership without it counting as access).
+--
+--   usable_without_set_role — has_*_privilege(candidate, ...) is true
+--   reachable_via_set_role  — some SET-settable role holds the privilege
+--   inheriting_roles        — roles supplying it WITHOUT SET ROLE (incl. self)
+--   settable_roles          — roles supplying it only AFTER SET ROLE
+--   inactive_membership_roles — roles that hold it but whose membership grants
+--                               neither inheritance nor SET ROLE (NOT access)
 -- ---------------------------------------------------------------------------
 WITH ids AS (
   SELECT
@@ -170,102 +248,199 @@ cand AS (
      AND r.oid IS DISTINCT FROM i.owner_oid
      AND (r.rolcanlogin OR r.rolname IN ('anon', 'authenticated', 'service_role'))
 ),
-privs(object_kind, priv) AS (
-  VALUES ('schema', 'USAGE'), ('schema', 'CREATE'),
-         ('table', 'SELECT'), ('table', 'INSERT'), ('table', 'UPDATE'),
-         ('table', 'DELETE'), ('table', 'TRUNCATE'), ('table', 'REFERENCES'),
-         ('table', 'TRIGGER')
+privs(object_kind, priv, ord) AS (
+  VALUES ('schema', 'USAGE', 0), ('schema', 'CREATE', 1),
+         ('table', 'SELECT', 2), ('table', 'INSERT', 3), ('table', 'UPDATE', 4),
+         ('table', 'DELETE', 5), ('table', 'TRUNCATE', 6), ('table', 'REFERENCES', 7),
+         ('table', 'TRIGGER', 8)
 ),
--- Every (candidate, assumable role) pair, including the candidate itself.
-reach AS (
-  SELECT c.oid AS cand_oid, c.rolname AS cand_name, a.oid AS via_oid, a.rolname AS via_name
-    FROM cand c
-    JOIN pg_roles a ON (a.oid = c.oid OR pg_has_role(c.oid, a.oid, 'MEMBER'))
+-- Which roles hold each privilege, evaluated per role by PostgreSQL itself.
+holder AS (
+  SELECT r.oid, r.rolname, p.object_kind, p.priv, p.ord
+    FROM pg_roles r
+    CROSS JOIN privs p
+    CROSS JOIN ids i
+   WHERE CASE p.object_kind
+           WHEN 'schema' THEN has_schema_privilege(r.oid, i.nsp_oid, p.priv)
+           ELSE has_table_privilege(r.oid, i.rel_oid, p.priv)
+         END
 ),
-hits AS (
+-- Classify every (candidate, privilege, holder) relationship.
+routed AS (
   SELECT
-    r.cand_oid, r.cand_name, p.object_kind, p.priv, r.via_oid, r.via_name,
-    (r.via_oid = r.cand_oid)                                                     AS is_self
-  FROM reach r
-  CROSS JOIN privs p
-  CROSS JOIN ids i
-  WHERE CASE p.object_kind
-          WHEN 'schema' THEN has_schema_privilege(r.via_oid, i.nsp_oid, p.priv)
-          ELSE has_table_privilege(r.via_oid, i.rel_oid, p.priv)
-        END
+    c.oid AS cand_oid, c.rolname AS cand_name, h.object_kind, h.priv, h.ord,
+    h.oid AS holder_oid, h.rolname AS holder_name,
+    (h.oid = c.oid)                                                              AS is_self,
+    (h.oid <> c.oid AND pg_has_role(c.oid, h.oid, 'USAGE'))                      AS inherited,
+    (h.oid <> c.oid AND pg_has_role(c.oid, h.oid, 'SET'))                        AS settable,
+    (h.oid <> c.oid AND pg_has_role(c.oid, h.oid, 'MEMBER')
+       AND NOT pg_has_role(c.oid, h.oid, 'USAGE')
+       AND NOT pg_has_role(c.oid, h.oid, 'SET'))                                 AS inactive_member
+  FROM cand c
+  JOIN holder h ON TRUE
 )
 SELECT
-  h.cand_name                                                                    AS candidate_role,
-  h.object_kind,
-  h.priv                                                                         AS privilege,
-  bool_or(h.is_self)                                                             AS direct_or_inherited,
-  NOT bool_or(h.is_self)                                                         AS set_role_only,
-  bool_or(h.via_name LIKE 'pg\_%' AND NOT h.is_self)                             AS via_predefined_role,
-  bool_or(h.via_oid = (SELECT owner_oid FROM ids) AND NOT h.is_self)             AS via_owner_role,
-  -- Explicit ACL attribution, evaluated against the object's own acl array.
+  r.cand_name                                                                    AS candidate_role,
+  r.object_kind,
+  r.priv                                                                         AS privilege,
+  bool_or(r.is_self OR r.inherited)                                              AS usable_without_set_role,
+  bool_or(r.settable)                                                            AS reachable_via_set_role,
+  bool_or(r.inactive_member)                                                     AS inactive_membership_only,
+  bool_or(r.is_self)                                                             AS held_directly_or_inherited_by_self,
+  (SELECT coalesce(array_agg(x.holder_name ORDER BY x.holder_name), '{}'::name[])
+     FROM routed x
+    WHERE x.cand_oid = r.cand_oid AND x.object_kind = r.object_kind AND x.priv = r.priv
+      AND (x.is_self OR x.inherited))                                            AS inheriting_roles,
+  (SELECT coalesce(array_agg(x.holder_name ORDER BY x.holder_name), '{}'::name[])
+     FROM routed x
+    WHERE x.cand_oid = r.cand_oid AND x.object_kind = r.object_kind AND x.priv = r.priv
+      AND x.settable)                                                            AS settable_roles,
+  (SELECT coalesce(array_agg(x.holder_name ORDER BY x.holder_name), '{}'::name[])
+     FROM routed x
+    WHERE x.cand_oid = r.cand_oid AND x.object_kind = r.object_kind AND x.priv = r.priv
+      AND x.inactive_member)                                                     AS inactive_membership_roles,
+  bool_or((r.is_self OR r.inherited) AND r.holder_name LIKE 'pg\_%')             AS via_predefined_role_inherited,
+  bool_or(r.settable AND r.holder_name LIKE 'pg\_%')                             AS via_predefined_role_settable,
+  bool_or((r.is_self OR r.inherited) AND r.holder_oid = (SELECT owner_oid FROM ids)
+          AND NOT r.is_self)                                                     AS via_owner_role_inherited,
+  bool_or(r.settable AND r.holder_oid = (SELECT owner_oid FROM ids))             AS via_owner_role_settable,
+  -- Explicit ACL / PUBLIC attribution against the object's own acl array.
   bool_or(
-    CASE h.object_kind
+    CASE r.object_kind
       WHEN 'schema' THEN EXISTS (
         SELECT 1 FROM pg_namespace n, aclexplode(n.nspacl) ae
          WHERE n.nspname = 'supabase_migrations'
-           AND ae.grantee = h.via_oid AND ae.privilege_type = h.priv)
+           AND ae.grantee = r.holder_oid AND ae.privilege_type = r.priv)
       ELSE EXISTS (
-        SELECT 1 FROM pg_class c, aclexplode(c.relacl) ae
-         WHERE c.oid = (SELECT rel_oid FROM ids)
-           AND ae.grantee = h.via_oid AND ae.privilege_type = h.priv)
+        SELECT 1 FROM pg_class c2, aclexplode(c2.relacl) ae
+         WHERE c2.oid = (SELECT rel_oid FROM ids)
+           AND ae.grantee = r.holder_oid AND ae.privilege_type = r.priv)
     END)                                                                         AS via_explicit_acl,
   bool_or(
-    CASE h.object_kind
+    CASE r.object_kind
       WHEN 'schema' THEN EXISTS (
         SELECT 1 FROM pg_namespace n, aclexplode(n.nspacl) ae
          WHERE n.nspname = 'supabase_migrations'
-           AND ae.grantee = 0 AND ae.privilege_type = h.priv)
+           AND ae.grantee = 0 AND ae.privilege_type = r.priv)
       ELSE EXISTS (
-        SELECT 1 FROM pg_class c, aclexplode(c.relacl) ae
-         WHERE c.oid = (SELECT rel_oid FROM ids)
-           AND ae.grantee = 0 AND ae.privilege_type = h.priv)
-    END)                                                                         AS via_public_grant,
-  array_agg(h.via_name ORDER BY h.via_name)                                      AS granting_roles
-FROM hits h
-GROUP BY h.cand_name, h.object_kind, h.priv
-ORDER BY h.cand_name,
-         CASE h.object_kind WHEN 'schema' THEN 0 ELSE 1 END,
-         CASE h.priv WHEN 'USAGE' THEN 0 WHEN 'CREATE' THEN 1 WHEN 'SELECT' THEN 2
-                     WHEN 'INSERT' THEN 3 WHEN 'UPDATE' THEN 4 WHEN 'DELETE' THEN 5
-                     WHEN 'TRUNCATE' THEN 6 WHEN 'REFERENCES' THEN 7 ELSE 8 END;
+        SELECT 1 FROM pg_class c2, aclexplode(c2.relacl) ae
+         WHERE c2.oid = (SELECT rel_oid FROM ids)
+           AND ae.grantee = 0 AND ae.privilege_type = r.priv)
+    END)                                                                         AS via_public_grant
+FROM routed r
+WHERE r.is_self OR r.inherited OR r.settable OR r.inactive_member
+GROUP BY r.cand_oid, r.cand_name, r.object_kind, r.priv, r.ord
+ORDER BY r.cand_name, r.ord;
 
 -- ---------------------------------------------------------------------------
--- QUERY 4 — membership edges for every candidate: the direct GRANT ... TO
--- edges (with admin option and inheritance semantics) plus whether the edge is
--- usable without SET ROLE. This is the raw graph behind QUERY 2/3, so a
--- reviewer can trace each path by hand.
+-- QUERY 4 — membership PATHS. Every direct and transitive route from a
+-- candidate to a granted role, with each edge's options and the path-level
+-- consequences. Conflicting paths are NOT collapsed: each path is its own row,
+-- so a candidate reachable by both an inheriting and a non-inheriting path
+-- shows both. Cycles are prevented by excluding any role already on the path;
+-- depth is capped at 16.
+--
+--   path_permits_inheritance — every edge on THIS path has inherit_option
+--   path_permits_set_role    — every edge on THIS path has set_option
+--   admin_option is reported but is NOT evidence of either.
+-- The authoritative per-role answers remain the pg_has_role columns, shown
+-- alongside so path evidence can be cross-checked against PostgreSQL itself.
 -- ---------------------------------------------------------------------------
-WITH ids AS (
+WITH RECURSIVE ids AS (
   SELECT (SELECT c.relowner FROM pg_class c
            WHERE c.oid = to_regclass('public.qhub_manual_review_requests'))      AS owner_oid
 ),
 cand AS (
-  SELECT r.oid, r.rolname, r.rolinherit
+  SELECT r.oid, r.rolname
     FROM pg_roles r, ids i
    WHERE NOT r.rolsuper
      AND r.oid IS DISTINCT FROM i.owner_oid
      AND (r.rolcanlogin OR r.rolname IN ('anon', 'authenticated', 'service_role'))
+),
+paths AS (
+  SELECT
+    c.oid                                        AS cand_oid,
+    c.rolname                                    AS cand_name,
+    m.member                                     AS member_oid,
+    m.roleid                                     AS granted_oid,
+    1                                            AS depth,
+    ARRAY[c.oid, m.roleid]                       AS path_oids,
+    c.rolname::text || ' -> ' || (SELECT r2.rolname FROM pg_roles r2 WHERE r2.oid = m.roleid)::text
+                                                 AS path_text,
+    m.admin_option, m.inherit_option, m.set_option, m.grantor,
+    m.inherit_option                             AS path_permits_inheritance,
+    m.set_option                                 AS path_permits_set_role
+  FROM cand c
+  JOIN pg_auth_members m ON m.member = c.oid
+  UNION ALL
+  SELECT
+    p.cand_oid, p.cand_name, m.member, m.roleid,
+    p.depth + 1,
+    p.path_oids || m.roleid,
+    p.path_text || ' -> ' || (SELECT r2.rolname FROM pg_roles r2 WHERE r2.oid = m.roleid)::text,
+    m.admin_option, m.inherit_option, m.set_option, m.grantor,
+    (p.path_permits_inheritance AND m.inherit_option),
+    (p.path_permits_set_role AND m.set_option)
+  FROM paths p
+  JOIN pg_auth_members m ON m.member = p.granted_oid
+  WHERE NOT (m.roleid = ANY (p.path_oids))
+    AND p.depth < 16
 )
 SELECT
-  c.rolname                                                                      AS candidate_role,
-  c.rolinherit                                                                   AS candidate_inherits,
-  g.rolname                                                                      AS granted_role,
-  m.admin_option                                                                 AS with_admin_option,
-  pg_get_userbyid(m.grantor)                                                     AS membership_grantor,
-  (g.rolname LIKE 'pg\_%')                                                       AS granted_role_is_predefined,
-  g.rolcanlogin                                                                  AS granted_role_can_login,
-  g.rolsuper                                                                     AS granted_role_is_superuser,
-  -- Whether privileges of the granted role apply without an explicit SET ROLE.
-  (c.rolinherit AND pg_has_role(c.oid, g.oid, 'USAGE'))                          AS usable_without_set_role,
-  pg_has_role(c.oid, g.oid, 'MEMBER')                                            AS assumable_via_set_role
-FROM cand c
-JOIN pg_auth_members m ON m.member = c.oid
-JOIN pg_roles g ON g.oid = m.roleid
-ORDER BY c.rolname, g.rolname;
+  p.cand_name                                                                    AS candidate_role,
+  p.depth                                                                        AS path_depth,
+  p.path_text                                                                    AS path,
+  (SELECT r.rolname FROM pg_roles r WHERE r.oid = p.member_oid)                  AS edge_member_role,
+  (SELECT r.rolname FROM pg_roles r WHERE r.oid = p.granted_oid)                 AS edge_granted_role,
+  pg_get_userbyid(p.grantor)                                                     AS edge_grantor,
+  p.admin_option                                                                 AS edge_admin_option,
+  p.inherit_option                                                               AS edge_inherit_option,
+  p.set_option                                                                   AS edge_set_option,
+  p.path_permits_inheritance,
+  p.path_permits_set_role,
+  (SELECT r.rolname FROM pg_roles r WHERE r.oid = p.granted_oid) LIKE 'pg\_%'    AS granted_role_is_predefined,
+  (SELECT r.rolcanlogin FROM pg_roles r WHERE r.oid = p.granted_oid)             AS granted_role_can_login,
+  (SELECT r.rolsuper FROM pg_roles r WHERE r.oid = p.granted_oid)                AS granted_role_is_superuser,
+  (p.granted_oid = (SELECT owner_oid FROM ids))                                  AS granted_role_is_pinned_owner,
+  -- Authoritative cross-check for the END role of this path.
+  pg_has_role(p.cand_oid, p.granted_oid, 'MEMBER')                               AS authoritative_member,
+  pg_has_role(p.cand_oid, p.granted_oid, 'USAGE')                                AS authoritative_usage,
+  pg_has_role(p.cand_oid, p.granted_oid, 'SET')                                  AS authoritative_set,
+  p.path_oids::text                                                              AS path_identity
+FROM paths p
+ORDER BY p.cand_name, p.depth, p.path_text;
+
+-- ---------------------------------------------------------------------------
+-- QUERY 5 — structured ACL evidence for the protected schema and table. One
+-- row per explicit ACL entry, with grantee/grantor identity, privilege,
+-- grantability and PUBLIC attribution. Empty output means both ACLs are NULL,
+-- which is the pinned contract.
+-- ---------------------------------------------------------------------------
+SELECT
+  'schema'                                                                       AS object_type,
+  'supabase_migrations'                                                          AS object_identity,
+  ae.grantee                                                                     AS grantee_oid,
+  coalesce(pg_get_userbyid(ae.grantee), '(unknown)')                             AS grantee_name,
+  (ae.grantee = 0)                                                               AS grantee_is_public,
+  ae.grantor                                                                     AS grantor_oid,
+  coalesce(pg_get_userbyid(ae.grantor), '(unknown)')                             AS grantor_name,
+  ae.privilege_type,
+  ae.is_grantable
+FROM pg_namespace n, aclexplode(n.nspacl) ae
+WHERE n.nspname = 'supabase_migrations'
+UNION ALL
+SELECT
+  'table',
+  'supabase_migrations.schema_migrations',
+  ae.grantee,
+  coalesce(pg_get_userbyid(ae.grantee), '(unknown)'),
+  (ae.grantee = 0),
+  ae.grantor,
+  coalesce(pg_get_userbyid(ae.grantor), '(unknown)'),
+  ae.privilege_type,
+  ae.is_grantable
+FROM pg_class c, aclexplode(c.relacl) ae
+WHERE c.oid = to_regclass('supabase_migrations.schema_migrations')
+ORDER BY 1, 4, 8;
 
 COMMIT;
