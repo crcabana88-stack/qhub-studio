@@ -477,16 +477,22 @@ describe('R15.6.5 diagnostic 28 — static contract', () => {
       const window = exec.slice(m.index!, m.index! + 400);
 
       /*
-       * A MEMBER test is legitimate in exactly two shapes: labelled raw
-       * membership evidence (authoritative_member / inactive_membership_*), or
-       * an inactive-membership classification explicitly qualified by NOT USAGE
-       * and NOT SET. It is never allowed to stand alone as reachability.
+       * A MEMBER test is legitimate in exactly three shapes:
+       *   1. labelled raw membership evidence (membership_exists /
+       *      inactive_membership_of_pinned_owner);
+       *   2. an inactive-membership classification explicitly qualified by
+       *      NOT USAGE and NOT SET;
+       *   3. ROW SELECTION in the reachability WHERE clause, which only
+       *      decides which (candidate, role) pairs are worth printing — the
+       *      row's own USAGE/SET columns carry the authority facts.
+       * It is never allowed to stand alone as a reachability claim.
        */
-      const isLabelledEvidence = /AS\s+(authoritative_member|inactive_membership_of_pinned_owner)\b/.test(
+      const isLabelledEvidence = /AS\s+(membership_exists|inactive_membership_of_pinned_owner)\b/.test(
         window.slice(0, 120),
       );
+      const isRowSelection = /^pg_has_role\([^)]*'MEMBER'\)\s*\r?\n\s*OR\s+r\.rolsuper\b/.test(window);
 
-      if (!isLabelledEvidence) {
+      if (!isLabelledEvidence && !isRowSelection) {
         expect(window, 'MEMBER must be qualified by NOT USAGE and NOT SET').toMatch(/NOT pg_has_role\([^)]*'USAGE'\)/);
         expect(window).toMatch(/NOT pg_has_role\([^)]*'SET'\)/);
       }
@@ -522,7 +528,6 @@ describe('R15.6.5 diagnostic 28 — static contract', () => {
       'holder',
       'routed',
       'holds',
-      'paths',
     ]);
 
     for (const t of fromTargets) {
@@ -537,9 +542,53 @@ describe('R15.6.5 diagnostic 28 — static contract', () => {
     expect(analysis).toContain(createHash('sha256').update(readFileSync(DIAG)).digest('hex'));
   });
 
-  it('d-st8 — the path recursion has NO depth cutoff and keeps OID-path cycle prevention', () => {
-    expect(exec, 'no numeric depth comparison may bound the recursion').not.toMatch(/depth\s*[<>]=?\s*\d/i);
-    expect(exec).toMatch(/NOT \(m\.roleid = ANY \(p\.path_oids\)\)/);
+  it('d-st8 — no recursion, no path expansion, and no truncation devices anywhere', () => {
+    /*
+     * R15.6.6: exhaustive simple-path enumeration is exponential in the graph
+     * shape, so it is withdrawn entirely. The bound is structural — there is
+     * no traversal to bound — and it must not be replaced by any of the
+     * devices the review explicitly rejected.
+     */
+    expect(exec, 'no recursive CTE may remain').not.toMatch(/WITH\s+RECURSIVE/i);
+    expect(exec, 'no path array may be carried').not.toMatch(/path_oids|path_text|path_identity/i);
+    expect(exec, 'no depth counter may bound anything').not.toMatch(/\bdepth\b/i);
+    expect(exec, 'no outer LIMIT may truncate a result set').not.toMatch(/\bLIMIT\b/i);
+    expect(exec).not.toMatch(/\bOFFSET\b/i);
+
+    // The bounded replacements are present and named as evidence, not routes.
+    expect(exec).toMatch(/FROM pg_auth_members m\b/);
+    expect(exec).toMatch(/AS membership_exists/);
+    expect(exec).toMatch(/AS privileges_inherited_without_set_role/);
+    expect(exec).toMatch(/AS set_role_permitted/);
+  });
+
+  it('d-st10 — no result set or column claims complete paths or all routes', () => {
+    for (const forbidden of [
+      /complete[_ ]paths/i,
+      /all[_ ]paths/i,
+      /every[_ ]path/i,
+      /all[_ ]routes/i,
+      /every[_ ]route/i,
+      /full[_ ]path/i,
+      /path_permits/i,
+    ]) {
+      expect(exec, `executable SQL must not claim ${forbidden}`).not.toMatch(forbidden);
+    }
+
+    // Column identifiers themselves carry no path vocabulary.
+    const columns = [...exec.matchAll(/\bAS\s+([a-z_][a-z0-9_]*)/gi)].map((m) => m[1].toLowerCase());
+
+    for (const c of columns) {
+      expect(c, `column ${c} must not use path vocabulary`).not.toMatch(/path|route/);
+    }
+  });
+
+  it('d-st11 — a transaction-local statement_timeout is set as defense in depth', () => {
+    expect(exec).toMatch(/SET LOCAL statement_timeout = '\d+s?';/);
+
+    // It is LOCAL, so it cannot outlive the transaction or touch server config.
+    expect(exec).not.toMatch(/^\s*SET\s+statement_timeout/im);
+    expect(exec).not.toMatch(/ALTER (SYSTEM|DATABASE|ROLE)/i);
   });
 
   it('d-st9 — role validity is never a reachability input', () => {
@@ -567,7 +616,8 @@ describe.skipIf(!HAVE_PG)('R15.6.5 diagnostic 28 — PostgreSQL 16 adversarial e
   let fpAfter = '';
   let candidates: Row[] = [];
   let routes: Row[] = [];
-  let paths: Row[] = [];
+  let edges: Row[] = [];
+  let reach: Row[] = [];
   let acls: Row[] = [];
   let q1: Row[] = [];
   let aclsPublic: Row[] = [];
@@ -592,7 +642,8 @@ describe.skipIf(!HAVE_PG)('R15.6.5 diagnostic 28 — PostgreSQL 16 adversarial e
 
     candidates = resultSet(out, 'reaches_protected_objects');
     routes = resultSet(out, 'usable_without_set_role');
-    paths = resultSet(out, 'path_permits_set_role');
+    edges = resultSet(out, 'edge_member_oid');
+    reach = resultSet(out, 'membership_exists');
     acls = resultSet(out, 'grantee_is_public');
     q1 = resultSet(out, 'pinned_contract_owner');
     aclsPublic = resultSet(outPublic, 'grantee_is_public');
@@ -602,7 +653,8 @@ describe.skipIf(!HAVE_PG)('R15.6.5 diagnostic 28 — PostgreSQL 16 adversarial e
   it('d0 — the diagnostic mutates nothing: protected objects and role graph byte-equivalent', () => {
     expect(fpAfter).toBe(fpBefore);
     expect(candidates.length).toBeGreaterThan(0);
-    expect(paths.length).toBeGreaterThan(0);
+    expect(edges.length).toBeGreaterThan(0);
+    expect(reach.length).toBeGreaterThan(0);
     expect(routes.length).toBeGreaterThan(0);
     expect(acls.length).toBeGreaterThan(0);
 
@@ -703,13 +755,19 @@ describe.skipIf(!HAVE_PG)('R15.6.5 diagnostic 28 — PostgreSQL 16 adversarial e
     expect(c.reaches_protected_objects).toBe('f');
     expect(c.roles_inactive_membership_only).toContain('cap_read');
 
-    const edge = paths.find((p) => p.candidate_role === 'c6_admin_only' && p.edge_granted_role === 'cap_read')!;
+    const edge = edges.find((e) => e.edge_member_role === 'c6_admin_only' && e.edge_granted_role === 'cap_read')!;
     expect(edge.edge_admin_option).toBe('t');
-    expect(edge.path_permits_inheritance).toBe('f');
-    expect(edge.path_permits_set_role).toBe('f');
+    expect(edge.edge_inherit_option).toBe('f');
+    expect(edge.edge_set_option).toBe('f');
+
+    const rr = reach.find((r) => r.candidate_role === 'c6_admin_only' && r.related_role === 'cap_read')!;
+    expect(rr.membership_exists).toBe('t');
+    expect(rr.privileges_inherited_without_set_role).toBe('f');
+    expect(rr.set_role_permitted).toBe('f');
+    expect(rr.inactive_membership_only).toBe('t');
   });
 
-  it('case 7 — transitive paths: intermediate roles reported, options compose along the path', () => {
+  it('case 7 — transitive authority: intermediate edges reported, reachability is authoritative', () => {
     expect(asRole('c7_login', `INSERT INTO ${TBL} (version) VALUES ('probe7');`).ok).toBe(true);
     run(`DELETE FROM ${TBL} WHERE version = 'probe7';`);
 
@@ -717,10 +775,17 @@ describe.skipIf(!HAVE_PG)('R15.6.5 diagnostic 28 — PostgreSQL 16 adversarial e
     expect(c7.privileges_usable_without_set_role).toBe('t');
     expect(c7.roles_inherited_from).toContain('cap_write');
 
-    const deep = paths.filter((p) => p.candidate_role === 'c7_login' && p.path_depth === '2');
-    expect(deep.length).toBeGreaterThan(0);
-    expect(deep[0].path).toContain('c7_mid');
-    expect(deep[0].path_permits_inheritance).toBe('t');
+    /*
+     * The two-step route is evidenced by two direct edges plus authoritative
+     * reachability to the END role — not by an enumerated path row.
+     */
+    expect(edges.some((e) => e.edge_member_role === 'c7_login' && e.edge_granted_role === 'c7_mid')).toBe(true);
+    expect(edges.some((e) => e.edge_member_role === 'c7_mid' && e.edge_granted_role === 'cap_write')).toBe(true);
+
+    const r7 = reach.find((r) => r.candidate_role === 'c7_login' && r.related_role === 'cap_write')!;
+    expect(r7.membership_exists).toBe('t');
+    expect(r7.privileges_inherited_without_set_role, 'transitive USAGE without any path row').toBe('t');
+    expect(r7.direct_edge_count, 'reached transitively, not by a direct grant').toBe('0');
 
     // Chain blocked at the second edge: membership exists, access does not.
     expect(asRole('c7b_login', `SELECT count(*) FROM ${TBL};`).ok).toBe(false);
@@ -730,29 +795,43 @@ describe.skipIf(!HAVE_PG)('R15.6.5 diagnostic 28 — PostgreSQL 16 adversarial e
     expect(c7b.reaches_protected_objects).toBe('f');
     expect(c7b.roles_inactive_membership_only).toContain('cap_read');
 
-    const blocked = paths.find(
-      (p) => p.candidate_role === 'c7b_login' && p.edge_granted_role === 'cap_read' && p.path_depth === '2',
-    )!;
-    expect(blocked.path_permits_inheritance).toBe('f');
-    expect(blocked.path_permits_set_role).toBe('f');
-    expect(blocked.authoritative_member).toBe('t');
-    expect(blocked.authoritative_usage).toBe('f');
-    expect(blocked.authoritative_set).toBe('f');
+    // The blocking edge itself is visible, and reachability records the effect.
+    const blockingEdge = edges.find((e) => e.edge_member_role === 'c7b_mid' && e.edge_granted_role === 'cap_read')!;
+    expect(blockingEdge.edge_inherit_option).toBe('f');
+    expect(blockingEdge.edge_set_option).toBe('f');
+
+    const blocked = reach.find((r) => r.candidate_role === 'c7b_login' && r.related_role === 'cap_read')!;
+    expect(blocked.membership_exists).toBe('t');
+    expect(blocked.privileges_inherited_without_set_role).toBe('f');
+    expect(blocked.set_role_permitted).toBe('f');
+    expect(blocked.inactive_membership_only).toBe('t');
   });
 
-  it('case 8 — conflicting paths are reported separately, not collapsed into one boolean', () => {
-    const toCapRead = paths.filter((p) => p.candidate_role === 'c8_login' && p.edge_granted_role === 'cap_read');
-    expect(toCapRead.length, 'both the direct and the via-c8_alt path must appear').toBeGreaterThanOrEqual(2);
+  it('case 8 — conflicting alternative routes stay distinguishable from bounded evidence', () => {
+    /*
+     * c8_login reaches cap_read two ways: a DIRECT inactive grant, and an
+     * ACTIVE two-step route through c8_alt. Without any path enumeration the
+     * conflict is fully visible: the direct edge shows both options false, the
+     * intermediate edges show the active route, and authoritative reachability
+     * reports that some route does confer USAGE and SET.
+     */
+    const direct = edges.find((e) => e.edge_member_role === 'c8_login' && e.edge_granted_role === 'cap_read')!;
+    expect(direct.edge_inherit_option).toBe('f');
+    expect(direct.edge_set_option).toBe('f');
 
-    const direct = toCapRead.find((p) => p.path_depth === '1')!;
-    const viaAlt = toCapRead.find((p) => p.path_depth === '2')!;
-    expect(direct.path_permits_inheritance).toBe('f');
-    expect(direct.path_permits_set_role).toBe('f');
-    expect(viaAlt.path).toContain('c8_alt');
-    expect(viaAlt.path_permits_inheritance).toBe('t');
-    expect(viaAlt.path_permits_set_role).toBe('t');
+    expect(edges.some((e) => e.edge_member_role === 'c8_login' && e.edge_granted_role === 'c8_alt')).toBe(true);
 
-    // The live server agrees the active path wins.
+    const altEdge = edges.find((e) => e.edge_member_role === 'c8_alt' && e.edge_granted_role === 'cap_read')!;
+    expect(altEdge.edge_inherit_option).toBe('t');
+    expect(altEdge.edge_set_option).toBe('t');
+
+    const rr = reach.find((r) => r.candidate_role === 'c8_login' && r.related_role === 'cap_read')!;
+    expect(rr.direct_edge_count, 'the direct grant is counted').toBe('1');
+    expect(rr.privileges_inherited_without_set_role, 'some route activates it').toBe('t');
+    expect(rr.set_role_permitted).toBe('t');
+    expect(rr.inactive_membership_only, 'an active route coexists').toBe('f');
+
+    // The live server agrees the active route wins.
     expect(asRole('c8_login', `SELECT count(*) FROM ${TBL};`).ok).toBe(true);
     expect(asRole('c8_login', 'SET ROLE cap_read;').ok).toBe(true);
     expect(cand('c8_login').privileges_usable_without_set_role).toBe('t');
@@ -844,15 +923,32 @@ describe.skipIf(!HAVE_PG)('R15.6.5 diagnostic 28 — PostgreSQL 16 adversarial e
     expect(asRole('c12_expired', `SELECT count(*) FROM ${TBL};`).ok, 'expired role retains real access').toBe(true);
   });
 
-  it('d-final — path evidence never claims more than PostgreSQL allows', () => {
-    for (const p of paths) {
-      if (p.path_permits_inheritance === 't') {
-        expect(p.authoritative_usage, `path claims inheritance: ${p.path}`).toBe('t');
+  it('d-final — reachability agrees with PostgreSQL for every reported pair', () => {
+    /*
+     * The reachability set IS PostgreSQL's own answer, so the meaningful check
+     * is internal consistency and agreement with an independent per-pair query:
+     * USAGE or SET can never be true without MEMBER, and the inactive flag must
+     * be exactly MEMBER-without-either.
+     */
+    for (const r of reach) {
+      const pair = `${r.candidate_role} -> ${r.related_role}`;
+
+      if (r.privileges_inherited_without_set_role === 't' || r.set_role_permitted === 't') {
+        expect(r.membership_exists, `USAGE/SET without MEMBER: ${pair}`).toBe('t');
       }
 
-      if (p.path_permits_set_role === 't') {
-        expect(p.authoritative_set, `path claims SET ROLE: ${p.path}`).toBe('t');
-      }
+      const expectInactive =
+        r.membership_exists === 't' && r.privileges_inherited_without_set_role === 'f' && r.set_role_permitted === 'f';
+      expect(r.inactive_membership_only, `inactive flag wrong: ${pair}`).toBe(expectInactive ? 't' : 'f');
+    }
+
+    // Spot-check a sample against a freshly evaluated pg_has_role.
+    for (const r of reach.filter((x) => x.membership_exists === 't').slice(0, 25)) {
+      expect(
+        scalar(`SELECT pg_has_role('${r.candidate_role}','${r.related_role}','USAGE')::text || '/'
+             || pg_has_role('${r.candidate_role}','${r.related_role}','SET')::text;`),
+        `${r.candidate_role} -> ${r.related_role}`,
+      ).toBe(`${r.privileges_inherited_without_set_role === 't'}/${r.set_role_permitted === 't'}`);
     }
 
     /*
@@ -868,52 +964,72 @@ describe.skipIf(!HAVE_PG)('R15.6.5 diagnostic 28 — PostgreSQL 16 adversarial e
   });
 });
 
-// ─── P1-1: complete membership-path enumeration ──────────────────────────────
+// ─── P1: bounded membership evidence (no simple-path expansion) ──────────────
 
-describe.skipIf(!HAVE_PG)('R15.6.5 diagnostic 28 — P1-1 complete path enumeration (no depth cutoff)', () => {
+describe.skipIf(!HAVE_PG)('R15.6.6 diagnostic 28 — bounded membership evidence', () => {
   /*
    * Describes in this file run sequentially against the database the first
    * describe's beforeAll built. This one re-derives its rows from a fresh
    * diagnostic execution so it does not depend on captured module state.
    */
-  let paths: Row[] = [];
+  let edges: Row[] = [];
+  let reach: Row[] = [];
 
   beforeAll(() => {
-    paths = resultSet(runFile(DIAG), 'path_permits_set_role');
+    const out = runFile(DIAG);
+    edges = resultSet(out, 'edge_member_oid');
+    reach = resultSet(out, 'membership_exists');
   }, 300_000);
 
-  const dpPath = (depth: number) =>
-    paths.find((p) => p.candidate_role === 'dp_login' && p.path_depth === String(depth));
+  const rr = (candidate: string, related: string) =>
+    reach.find((r) => r.candidate_role === candidate && r.related_role === related);
 
-  it('p1 — depths 15, 16, 17 and 20 are ALL enumerated, ending at the right roles', () => {
-    for (const [depth, terminal] of [
-      [15, 'dp_r15'],
-      [16, 'dp_r16'],
-      [17, 'dp_r17'],
-      [20, 'dp_r20'],
-    ] as const) {
-      const p = dpPath(depth);
-      expect(p, `depth-${depth} path must be enumerated`).toBeDefined();
-      expect(p!.edge_granted_role).toBe(terminal);
-      expect(p!.path_permits_inheritance).toBe('t');
-      expect(p!.path_permits_set_role).toBe('t');
+  it('p1 — depths 15, 16, 17 and 20 stay DETECTABLE via reachability, with no path rows', () => {
+    /*
+     * The deep chain is dp_login -> dp_r01 -> ... -> dp_r20. Under the
+     * withdrawn design each prefix was its own enumerated row. Now the same
+     * facts come from authoritative reachability, which accounts for every
+     * transitive route without materialising any of them.
+     */
+    for (const terminal of ['dp_r15', 'dp_r16', 'dp_r17', 'dp_r20']) {
+      const r = rr('dp_login', terminal);
+      expect(r, `${terminal} must appear in the reachability set`).toBeDefined();
+      expect(r!.membership_exists).toBe('t');
+      expect(r!.privileges_inherited_without_set_role, `${terminal} USAGE`).toBe('t');
+      expect(r!.set_role_permitted, `${terminal} SET`).toBe('t');
+      expect(r!.direct_edge_count, `${terminal} is reached transitively, not directly`).toBe('0');
     }
   });
 
-  it('p2 — the depth-17 defect is closed: the deep terminal, its full route and every edge appear', () => {
-    const p17 = dpPath(17)!;
-    const p20 = dpPath(20)!;
+  it('p2 — the full 20-edge chain is reconstructible from the edge inventory alone', () => {
+    /*
+     * Depth is derivable BY THE READER from edges, which is the point: the
+     * evidence supports reconstruction; the diagnostic does not pre-expand it.
+     * Walking the inventory recovers the exact chain and its length.
+     */
+    const next = new Map(
+      edges.filter((e) => e.edge_granted_role.startsWith('dp_r')).map((e) => [e.edge_member_role, e.edge_granted_role]),
+    );
+    const walked: string[] = [];
+    let node: string | undefined = 'dp_login';
 
-    // Complete path identity: every intermediate role is present, in order.
-    for (const inter of DEEP.slice(0, 17)) {
-      expect(p17.path).toContain(inter);
+    while (node !== undefined && walked.length < 100) {
+      const to: string | undefined = next.get(node);
+
+      if (to === undefined) {
+        break;
+      }
+
+      walked.push(to);
+      node = to;
     }
 
-    expect(p17.path_identity.split(',').length, '17 edges = 18 oids').toBe(18);
-    expect(p20.path_identity.split(',').length).toBe(21);
-    expect(p20.path.startsWith('dp_login -> dp_r01 -> dp_r02')).toBe(true);
-    expect(p20.edge_member_role).toBe('dp_r19');
-    expect(p20.edge_granted_role).toBe('dp_r20');
+    expect(walked.length, 'dp_login -> dp_r01 .. dp_r20 is 20 edges').toBe(20);
+    expect(walked[0]).toBe('dp_r01');
+    expect(walked[14]).toBe('dp_r15');
+    expect(walked[15]).toBe('dp_r16');
+    expect(walked[16]).toBe('dp_r17');
+    expect(walked[19]).toBe('dp_r20');
   });
 
   it('p3 — the terminal role authority matches PostgreSQL: USAGE, SET, real SELECT, real SET ROLE', () => {
@@ -924,24 +1040,55 @@ describe.skipIf(!HAVE_PG)('R15.6.5 diagnostic 28 — P1-1 complete path enumerat
     expect(asRole('dp_login', `SELECT count(*) FROM ${TBL};`).ok, 'real SELECT through 20 edges').toBe(true);
     expect(asRole('dp_login', `SET ROLE dp_r20; SELECT count(*) FROM ${TBL};`).ok).toBe(true);
 
-    const p20 = dpPath(20)!;
-    expect(p20.authoritative_usage).toBe('t');
-    expect(p20.authoritative_set).toBe('t');
+    const r = rr('dp_login', 'dp_r20')!;
+    expect(r.privileges_inherited_without_set_role).toBe('t');
+    expect(r.set_role_permitted).toBe('t');
   });
 
-  it('p4 — multiple paths to one terminal where one is deeper than 16: both rows, never collapsed', () => {
-    const toTerminal = paths.filter((p) => p.candidate_role === 'mp_login' && p.edge_granted_role === 'dp_r20');
-    const depths = toTerminal.map((p) => Number(p.path_depth)).sort((a, b) => a - b);
-    expect(depths[0]).toBe(1);
-    expect(depths[depths.length - 1]).toBe(20);
-    expect(toTerminal.length).toBeGreaterThanOrEqual(2);
+  it('p4 — a direct AND a 20-edge route to one terminal: one reachability row, direct grant counted', () => {
+    const r = rr('mp_login', 'dp_r20')!;
+    expect(r.direct_edge_count, 'the direct grant is visible').toBe('1');
+    expect(r.privileges_inherited_without_set_role).toBe('t');
+    expect(r.set_role_permitted).toBe('t');
+
+    // Both first-hop edges exist in the inventory; neither is expanded.
+    expect(edges.some((e) => e.edge_member_role === 'mp_login' && e.edge_granted_role === 'dp_r01')).toBe(true);
+    expect(edges.some((e) => e.edge_member_role === 'mp_login' && e.edge_granted_role === 'dp_r20')).toBe(true);
   });
 
-  it('p5 — recursion cannot loop: the role graph is acyclic BY SERVER RULE and the guard excludes repeats', () => {
-    /*
-     * PostgreSQL itself refuses circular role grants, so pg_auth_members can
-     * never contain a cycle — proven live, not assumed:
-     */
+  it('p5 — every direct edge in the catalog appears EXACTLY once', () => {
+    const catalogRows = Number(scalar(`SELECT count(*) FROM pg_auth_members;`));
+    expect(edges.length, 'edge inventory row count equals pg_auth_members').toBe(catalogRows);
+
+    const keys = edges.map((e) => `${e.edge_member_oid}/${e.edge_granted_oid}/${e.edge_grantor_oid}`);
+    expect(new Set(keys).size, 'no duplicated edge').toBe(keys.length);
+
+    // Spot-check exact per-edge options against the catalog.
+    for (const e of edges.filter((x) => x.edge_member_role === 'c1_none' || x.edge_member_role === 'c8_alt')) {
+      expect(
+        scalar(`SELECT m.admin_option::text || '/' || m.inherit_option::text || '/' || m.set_option::text
+             FROM pg_auth_members m
+            WHERE m.member = ${e.edge_member_oid} AND m.roleid = ${e.edge_granted_oid}
+              AND m.grantor = ${e.edge_grantor_oid};`),
+        `${e.edge_member_role} -> ${e.edge_granted_role}`,
+      ).toBe(`${e.edge_admin_option === 't'}/${e.edge_inherit_option === 't'}/${e.edge_set_option === 't'}`);
+    }
+  });
+
+  it('p6 — ordering of both bounded result sets is fully deterministic', () => {
+    const out = runFile(DIAG);
+    const again = resultSet(out, 'edge_member_oid');
+    const againReach = resultSet(out, 'membership_exists');
+
+    expect(again.map((e) => `${e.edge_member_oid}/${e.edge_granted_oid}/${e.edge_grantor_oid}`)).toEqual(
+      edges.map((e) => `${e.edge_member_oid}/${e.edge_granted_oid}/${e.edge_grantor_oid}`),
+    );
+    expect(againReach.map((r) => `${r.candidate_role}/${r.related_role}`)).toEqual(
+      reach.map((r) => `${r.candidate_role}/${r.related_role}`),
+    );
+  });
+
+  it('p7 — the role graph is acyclic BY SERVER RULE, so edges cannot describe a loop', () => {
     let message = '';
 
     try {
@@ -951,22 +1098,32 @@ describe.skipIf(!HAVE_PG)('R15.6.5 diagnostic 28 — P1-1 complete path enumerat
     }
 
     expect(message, 'the server must reject the circular grant').toMatch(/is a member of role/);
-
-    /*
-     * Diamond convergence (two branches to one node) also terminates finitely:
-     * c8_login reaches cap_read both directly and via c8_alt, and the deep
-     * chain enumerates exactly its 20 simple paths (plus nothing repeated).
-     */
-    const dpRows = paths.filter((p) => p.candidate_role === 'dp_login');
-    expect(dpRows.length).toBe(20);
-    expect(new Set(dpRows.map((p) => p.path_identity)).size).toBe(20);
   });
 
-  it('p6 — ordering of the path result is fully deterministic', () => {
-    const again = resultSet(runFile(DIAG), 'path_permits_set_role');
-    expect(again.map((p) => `${p.candidate_role}#${p.path_identity}#${p.edge_grantor}`)).toEqual(
-      paths.map((p) => `${p.candidate_role}#${p.path_identity}#${p.edge_grantor}`),
-    );
+  it('p8 — no effective privilege was lost when path rows were removed', () => {
+    /*
+     * Every candidate that PostgreSQL says holds a protected privilege must
+     * still be reported as reaching it, and every reported reach must be real.
+     * This is the guarantee that mattered: reach was never derived from paths.
+     */
+    const candidates = resultSet(runFile(DIAG), 'reaches_protected_objects');
+
+    for (const c of candidates) {
+      const truth = scalar(`SELECT (has_schema_privilege('${c.candidate_role}','${NSP}','USAGE, CREATE')
+             OR has_table_privilege('${c.candidate_role}','${TBL}',
+                  'SELECT, INSERT, UPDATE, DELETE, TRUNCATE, REFERENCES, TRIGGER'))::text;`);
+      expect(c.privileges_usable_without_set_role, `${c.candidate_role} usable-without-SET-ROLE`).toBe(
+        truth === 'true' ? 't' : 'f',
+      );
+    }
+
+    // The deep-chain and transitive candidates are still flagged.
+    for (const name of ['dp_login', 'mp_login', 'c7_login', 'c3_inhonly', 'c8_login']) {
+      expect(
+        candidates.find((c) => c.candidate_role === name)!.reaches_protected_objects,
+        `${name} must still be reported as reaching`,
+      ).toBe('t');
+    }
   });
 });
 
@@ -1031,7 +1188,7 @@ describe.skipIf(!HAVE_PG)('R15.6.5 diagnostic 28 — P1-2 reachability-gated ACL
     expect(s.explicit_acl_inactive_membership_evidence).toBe('t');
   });
 
-  it('a4 — active + inactive paths to the SAME holder: access wins, both edges stay visible', () => {
+  it('a4 — active + inactive routes to the SAME holder: access wins, both edges stay visible', () => {
     expect(asRole('dual_login', `SELECT count(*) FROM ${TBL};`).ok).toBe(true);
 
     const r = route('dual_login', 'table', 'SELECT')!;
@@ -1039,15 +1196,23 @@ describe.skipIf(!HAVE_PG)('R15.6.5 diagnostic 28 — P1-2 reachability-gated ACL
     expect(r.inactive_membership_only, 'NEVER "inactive only" while an active route exists').toBe('f');
     expect(r.explicit_acl_usable_without_set_role).toBe('t');
 
-    // Both conflicting depth-1 edges appear as separate path rows.
-    const paths = resultSet(runFile(DIAG), 'path_permits_set_role').filter(
-      (p) => p.candidate_role === 'dual_login' && p.edge_granted_role === 'cap_read',
+    // Both conflicting direct grants appear as separate EDGE rows.
+    const out = runFile(DIAG);
+    const dualEdges = resultSet(out, 'edge_member_oid').filter(
+      (e) => e.edge_member_role === 'dual_login' && e.edge_granted_role === 'cap_read',
     );
-    expect(paths.length).toBe(2);
+    expect(dualEdges.length).toBe(2);
+    expect(dualEdges.map((e) => e.edge_inherit_option).sort()).toEqual(['f', 't']);
+    expect(new Set(dualEdges.map((e) => e.edge_grantor)).size, 'distinct grantors reported').toBe(2);
 
-    const opts = paths.map((p) => p.edge_inherit_option).sort();
-    expect(opts).toEqual(['f', 't']);
-    expect(new Set(paths.map((p) => p.edge_grantor)).size, 'distinct grantors reported').toBe(2);
+    // Reachability counts them without expanding alternatives.
+    const rr = resultSet(out, 'membership_exists').find(
+      (x) => x.candidate_role === 'dual_login' && x.related_role === 'cap_read',
+    )!;
+    expect(rr.direct_edge_count).toBe('2');
+    expect(rr.distinct_direct_edge_option_shapes, 'the two grants really differ').toBe('2');
+    expect(rr.privileges_inherited_without_set_role).toBe('t');
+    expect(rr.inactive_membership_only).toBe('f');
   });
 
   it('a5 — active + inactive paths to DIFFERENT holders: both kinds of evidence, correctly separated', () => {
@@ -1371,14 +1536,28 @@ describe.skipIf(!HAVE_PG)('R15.6.5 diagnostic 28 — complete adversarial matrix
     expect(cand('c8_login').privileges_usable_without_set_role).toBe('t');
   });
 
-  it('m13-m14 — depth 16, depth 17 and deeper are enumerated with effective terminal authority', () => {
-    const paths = resultSet(runFile(DIAG), 'path_permits_set_role');
-    const dp = (d: number) => paths.find((p) => p.candidate_role === 'dp_login' && p.path_depth === String(d));
-    expect(dp(16), 'depth 16').toBeDefined();
-    expect(dp(17), 'depth 17').toBeDefined();
-    expect(dp(20), 'depth 20').toBeDefined();
-    expect(dp(17)!.authoritative_usage).toBe('t');
-    expect(dp(17)!.authoritative_set).toBe('t');
+  it('m13-m14 — depth 16, 17 and deeper stay detectable without any path expansion', () => {
+    const out = runFile(DIAG);
+    const reach = resultSet(out, 'membership_exists');
+    const edges = resultSet(out, 'edge_member_oid');
+    const dp = (n: string) => reach.find((r) => r.candidate_role === 'dp_login' && r.related_role === n);
+
+    for (const terminal of ['dp_r16', 'dp_r17', 'dp_r20']) {
+      expect(dp(terminal), terminal).toBeDefined();
+      expect(dp(terminal)!.privileges_inherited_without_set_role).toBe('t');
+      expect(dp(terminal)!.set_role_permitted).toBe('t');
+    }
+
+    // Each hop of the chain is present exactly once as a direct edge.
+    for (let i = 1; i < 20; i += 1) {
+      const from = `dp_r${String(i).padStart(2, '0')}`;
+      const to = `dp_r${String(i + 1).padStart(2, '0')}`;
+      expect(
+        edges.filter((e) => e.edge_member_role === from && e.edge_granted_role === to).length,
+        `${from} -> ${to}`,
+      ).toBe(1);
+    }
+
     expect(cand('dp_login').privileges_usable_without_set_role).toBe('t');
   });
 
