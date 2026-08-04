@@ -103,7 +103,7 @@
 -- path rows were removed: no reachability or privilege fact in this file was
 -- ever derived from the enumerated paths — they were illustrative detail.
 --
--- WORST-CASE ROW BOUND (exact, polynomial; R = roles, C = candidates,
+-- WORST-CASE OUTPUT-CARDINALITY BOUND (R = roles, C = candidates,
 -- E = pg_auth_members rows, A = explicit ACL entries on the two objects):
 --   QUERY 1: exactly 1
 --   QUERY 2: exactly C
@@ -112,9 +112,43 @@
 --   QUERY 5: at most C * R
 --   QUERY 6: exactly A
 --   TOTAL:   1 + C + 9C + E + C*R + A  =  O(C*R + E + A)
--- For the 33-role / 116-edge fixture above this is a few hundred rows instead
--- of 87,380, and the bound holds for ANY graph shape because no result set
--- depends on the number of distinct routes.
+--
+-- ---------------------------------------------------------------------------
+-- READ THE BOUND PRECISELY — WHAT IT DOES AND DOES NOT PROMISE.
+--
+-- This is a bound on OUTPUT CARDINALITY. It is not a runtime guarantee, and an
+-- operator must not read it as one.
+--
+--   * The formula is 1 + C + 9C + E + C*R + A.
+--   * For FIXED C, R, E and A, increasing the number of alternative simple
+--     paths does NOT change this output bound. That is the whole point of the
+--     design: the pathological term is the one that is absent.
+--   * This file does NOT enumerate simple paths, and no term of its output
+--     depends on the simple-path count.
+--   * GRAPH DENSITY CAN INCREASE E DIRECTLY. More direct membership grants
+--     means a larger E, and QUERY 4 emits exactly E rows.
+--   * Increasing graph size or density can therefore also increase:
+--       - direct-edge output and result transmission;
+--       - the membership-closure work PostgreSQL performs internally;
+--       - repeated pg_has_role work;
+--       - join work;
+--       - aggregation and array-building work;
+--       - sorting work;
+--       - runtime;
+--       - memory use.
+--   * Internal execution work may EXCEED what the final output-row formula
+--     suggests, while still remaining free of simple-path enumeration. Those
+--     are two separate claims and only the second is guaranteed here.
+--   * The formula is NOT proof of constant runtime, and NOT proof of
+--     density-independent runtime.
+--   * The fixture numbers quoted in this package (for example the 33-role /
+--     116-edge graph returning a few hundred rows instead of 87,380) are
+--     FIXTURE-SPECIFIC OBSERVATIONS on one PostgreSQL 16 instance. They are not
+--     universal guarantees for an arbitrary live PostgreSQL catalog.
+--   * THE SUPPORTED CONCLUSION IS EXACTLY THIS, AND NO MORE: exponential route
+--     enumeration has been removed, while polynomial growth in catalog size and
+--     density remains.
+-- ---------------------------------------------------------------------------
 --
 -- A conservative transaction-local statement_timeout is set below as defense
 -- in depth. It is NOT the protection — the query shapes are. Read the

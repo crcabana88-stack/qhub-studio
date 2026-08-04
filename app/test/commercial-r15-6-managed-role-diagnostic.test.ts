@@ -440,6 +440,26 @@ describe('R15.6.5 diagnostic 28 — static contract', () => {
     .filter((l) => !/^\s*--/.test(l))
     .join('\n');
 
+  /*
+   * THE LEADING SQL HEADER ONLY — everything before executable SQL begins.
+   * Isolated deliberately: the operator-facing qualification must live in the
+   * artifact an operator actually opens and pastes, so this must NOT be
+   * satisfiable by the analysis document or any other file in the repository.
+   */
+  const headerEnd = DIAG_SQL.search(/^BEGIN;$/m);
+  const sqlHeader = DIAG_SQL.slice(0, headerEnd);
+
+  /*
+   * The executable portion: the transaction command through the final
+   * statement, inclusive. Byte-for-byte identical to commit 123eebb, proving
+   * the R15.6.8 correction touched comments only.
+   */
+  const executableBody = (() => {
+    const last = [...DIAG_SQL.matchAll(/^COMMIT;$/gm)].pop()!;
+
+    return DIAG_SQL.slice(headerEnd, last.index! + last[0].length);
+  })();
+
   it('d-st1 — one REPEATABLE READ, READ ONLY transaction and no mutating or dynamic SQL', () => {
     expect(DIAG_SQL).toMatch(/SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY;/);
     expect((DIAG_SQL.match(/^BEGIN;$/gm) ?? []).length).toBe(1);
@@ -537,9 +557,40 @@ describe('R15.6.5 diagnostic 28 — static contract', () => {
     expect(exec).not.toMatch(/rolpassword|auth\.users|storage\.|secrets?|token|credential/i);
   });
 
-  it('d-st7 — the diagnostic hash is recorded in the analysis document', () => {
+  it('d-st7 — the analysis document is bound to the reviewed diagnostic artifact', () => {
+    /*
+     * SPECIFICATION CONFLICT, resolved explicitly rather than silently.
+     *
+     * The analysis document pins the diagnostic's WHOLE-FILE SHA-256. R15.6.8
+     * was required to change the SQL header (comments only) while the analysis
+     * document was frozen by instruction at b0951c20..., so the whole-file
+     * hash necessarily moved and the document's pin is now one revision
+     * behind. That is a consequence of the two instructions, not of any
+     * content drift.
+     *
+     * The binding that carries meaning is therefore asserted here directly:
+     *   * the document still pins the artifact reviewed at R15.6.7, and
+     *   * that artifact's EXECUTABLE BODY is byte-identical to the current
+     *     one — which is exactly what R15.6.8 guarantees.
+     * The stale whole-file pin is asserted as a KNOWN, INTENTIONAL divergence
+     * so it cannot pass unnoticed and must be resolved by the next review.
+     */
+    const REVIEWED_FILE_SHA_R15_6_7 = '46953b5c95afe455313ec6279b86879aa36aff7b252c5e323f9456aa364c29e0';
     const analysis = readFileSync(`${DIR}MANAGED_ROLE_DIAGNOSTIC_ANALYSIS.md`, 'utf8');
-    expect(analysis).toContain(createHash('sha256').update(readFileSync(DIAG)).digest('hex'));
+    const pinned = /\(SHA-256 `([0-9a-f]{64})`\)/.exec(analysis)?.[1];
+
+    expect(pinned, 'the analysis document must pin a diagnostic artifact hash').toBe(REVIEWED_FILE_SHA_R15_6_7);
+
+    // The executable content the document describes is unchanged.
+    expect(createHash('sha256').update(Buffer.from(executableBody, 'utf8')).digest('hex')).toBe(
+      '20bee9767502087ae198dc28c54bfc048a52f290a43db177a3bf172bf89d1e23',
+    );
+
+    // ...and the whole-file divergence is comment-only, by construction.
+    const currentFileSha = createHash('sha256').update(readFileSync(DIAG)).digest('hex');
+    expect(currentFileSha, 'R15.6.8 changed comments, so the whole-file hash moved').not.toBe(
+      REVIEWED_FILE_SHA_R15_6_7,
+    );
   });
 
   it('d-doc1 — the analysis states the output bound honestly and never claims density is free', () => {
@@ -706,6 +757,94 @@ describe('R15.6.5 diagnostic 28 — static contract', () => {
     // It is LOCAL, so it cannot outlive the transaction or touch server config.
     expect(exec).not.toMatch(/^\s*SET\s+statement_timeout/im);
     expect(exec).not.toMatch(/ALTER (SYSTEM|DATABASE|ROLE)/i);
+  });
+
+  it('d-st13 — the SQL HEADER ITSELF carries the operator-facing cost qualification', () => {
+    /*
+     * R15.6.8 P1: the honest output-bound language existed only in the analysis
+     * document. An operator opens and pastes the .sql file, so the
+     * qualification has to travel with it. Every assertion below runs against
+     * `sqlHeader` — the leading comment block, sliced off before BEGIN; — so a
+     * passing analysis document cannot satisfy this test, and neither can any
+     * other file.
+     */
+    expect(sqlHeader.length, 'header must be isolated before executable SQL').toBeGreaterThan(0);
+    expect(sqlHeader, 'the slice must not contain executable SQL').not.toMatch(/^BEGIN;$/m);
+    expect(sqlHeader, 'every header line is a comment').not.toMatch(/^(?!\s*--)\s*\S.*$/m);
+
+    // 1. the formula itself
+    expect(sqlHeader).toMatch(/1 \+ C \+ 9C \+ E \+ C\*R \+ A/);
+    expect(sqlHeader).toMatch(/OUTPUT-CARDINALITY BOUND/i);
+
+    // 2. fixed C, R, E, A => more simple paths does not change the bound
+    expect(sqlHeader).toMatch(
+      /FIXED C, R, E and A, increasing the number of alternative simple\s*--\s*paths does NOT change this output bound/i,
+    );
+
+    // 3. no simple-path enumeration and no output term depends on it
+    expect(sqlHeader).toMatch(/does NOT enumerate simple paths/i);
+    expect(sqlHeader).toMatch(/no term of its output\s*--\s*depends on the simple-path count/i);
+
+    // 4. density increases E directly
+    expect(sqlHeader).toMatch(/GRAPH DENSITY CAN INCREASE E DIRECTLY/i);
+    expect(sqlHeader).toMatch(/QUERY 4 emits exactly E rows/i);
+
+    // 5. the eight cost dimensions, each named in the header
+    for (const dimension of [
+      /direct-edge output and result transmission/i,
+      /membership-closure work/i,
+      /repeated pg_has_role work/i,
+      /join work/i,
+      /aggregation and array-building work/i,
+      /sorting work/i,
+      /runtime;/i,
+      /memory use/i,
+    ]) {
+      expect(sqlHeader, `SQL header must name cost dimension ${dimension}`).toMatch(dimension);
+    }
+
+    // 6. internal work may exceed the output formula, still without enumeration
+    expect(sqlHeader).toMatch(
+      /Internal execution work may EXCEED what the final output-row formula\s*--\s*suggests, while still remaining free of simple-path enumeration/i,
+    );
+
+    // 7. not proof of constant or density-independent runtime
+    expect(sqlHeader).toMatch(/NOT proof of constant runtime/i);
+    expect(sqlHeader).toMatch(/NOT proof of\s*--\s*density-independent runtime/i);
+
+    // 8. fixture measurements are not universal guarantees
+    expect(sqlHeader).toMatch(/FIXTURE-SPECIFIC OBSERVATIONS/i);
+    expect(sqlHeader).toMatch(/not\s*--\s*universal guarantees for an arbitrary live PostgreSQL catalog/i);
+
+    // 9. the supported conclusion, stated exactly and no more
+    expect(sqlHeader).toMatch(
+      /exponential route\s*--\s*enumeration has been removed, while polynomial growth in catalog size and\s*--\s*density remains/i,
+    );
+
+    // The forbidden over-claim must not reappear anywhere in the header.
+    expect(sqlHeader, 'no universal route-count-independent runtime claim').not.toMatch(
+      /bound holds for ANY graph shape|density cannot move|runtime is independent of/i,
+    );
+
+    // The timeout-completeness contract is preserved, not replaced.
+    expect(sqlHeader).toMatch(/COMPLETENESS CONTRACT/);
+    expect(sqlHeader).toMatch(/applies it SEPARATELY TO EACH SUBSEQUENT STATEMENT/i);
+    expect(sqlHeader).toMatch(/NOT limited to 120 seconds in total/i);
+    expect(sqlHeader).toMatch(/no partial output may\s*--\s*be used for authorization/i);
+
+    /*
+     * ...and the correction is COMMENTS ONLY. The executable portion — the
+     * transaction command through the final statement — is pinned to the exact
+     * bytes reviewed at commit 123eebb081791f1839359500b1e1024c66c3fe92, so
+     * this test also proves no executable token moved.
+     */
+    expect(createHash('sha256').update(Buffer.from(executableBody, 'utf8')).digest('hex')).toBe(
+      '20bee9767502087ae198dc28c54bfc048a52f290a43db177a3bf172bf89d1e23',
+    );
+    expect(Buffer.byteLength(executableBody, 'utf8')).toBe(33_114);
+    expect(executableBody.startsWith('BEGIN;')).toBe(true);
+    expect(executableBody.endsWith('COMMIT;')).toBe(true);
+    expect(executableBody, 'Query 6 ordering is inside that hash').toMatch(/ORDER BY 1, 2, 3, 4, 5, 10, 8, 11;/);
   });
 
   it('d-st12 — Query 6 orders by stable catalog identities, with OIDs as the decisive tie-breakers', () => {
