@@ -280,10 +280,34 @@ predicate. The columns are reported exactly (`rolvaliduntil`, `never_expires`, `
 `expired`) purely as reviewer context. The suite proves the point with an **expired** role that
 still holds — and really exercises — an inherited `SELECT`. `rolpassword` is never read or exposed.
 
-## 8. What the diagnostic collects
+## 8. Artifact identity
+
+Two hashes describe this artifact, and they answer different questions. Both are recorded because
+neither alone is sufficient.
+
+| Hash | Value | What it proves |
+|---|---|---|
+| **Current complete artifact** (whole file) | `52acf699ed170ec4ded25301190676491e984e94ad963e13c3d33c6ae037ee60` | Identifies the complete operator-facing artifact — the executable SQL **together with** the safety contract in its header. This is the identity of Diagnostic 28 as reviewed and as an operator receives it. |
+| **Executable body** (`BEGIN;` through the final `COMMIT;`, 33,114 bytes) | `20bee9767502087ae198dc28c54bfc048a52f290a43db177a3bf172bf89d1e23` | Proves the executable SQL itself is unchanged — every SELECT list, predicate, `ORDER BY`, transaction semantic, timeout behaviour and result-set schema. |
+
+**The whole-file hash changed in R15.6.8; the executable body did not.** The artifact moved from
+
+```
+46953b5c95afe455313ec6279b86879aa36aff7b252c5e323f9456aa364c29e0   (superseded — R15.6.7 artifact)
+52acf699ed170ec4ded25301190676491e984e94ad963e13c3d33c6ae037ee60   (current)
+```
+
+and that change was caused **exclusively by the reviewed SQL-header comment correction** — the
+addition of the operator-facing output-bound qualification described in §4. No executable token
+moved: the executable body hashed to `20bee976…1e23` at 33,114 bytes both before and after, and a
+`git diff` of the change contains zero non-comment lines.
+
+`46953b5c…` is retained above **only as the superseded R15.6.7 artifact**. It is not the current
+identity of Diagnostic 28 and is not the artifact this analysis approves.
+
+## 8a. What the diagnostic collects
 
 `28_READ_ONLY_MANAGED_ROLE_DIAGNOSTIC.sql`
-(SHA-256 `46953b5c95afe455313ec6279b86879aa36aff7b252c5e323f9456aa364c29e0`)
 is one explicit `REPEATABLE READ, READ ONLY` transaction containing no mutating SQL, no temporary
 objects, no dynamic SQL and no recursion. Candidates are discovered from `pg_roles` — the three
 observed names appear nowhere in its executable text. It returns **six** ordered result sets:

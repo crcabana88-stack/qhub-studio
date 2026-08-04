@@ -557,40 +557,59 @@ describe('R15.6.5 diagnostic 28 — static contract', () => {
     expect(exec).not.toMatch(/rolpassword|auth\.users|storage\.|secrets?|token|credential/i);
   });
 
-  it('d-st7 — the analysis document is bound to the reviewed diagnostic artifact', () => {
+  it('d-st7 — the analysis document identifies the CURRENT diagnostic artifact', () => {
     /*
-     * SPECIFICATION CONFLICT, resolved explicitly rather than silently.
-     *
-     * The analysis document pins the diagnostic's WHOLE-FILE SHA-256. R15.6.8
-     * was required to change the SQL header (comments only) while the analysis
-     * document was frozen by instruction at b0951c20..., so the whole-file
-     * hash necessarily moved and the document's pin is now one revision
-     * behind. That is a consequence of the two instructions, not of any
-     * content drift.
-     *
-     * The binding that carries meaning is therefore asserted here directly:
-     *   * the document still pins the artifact reviewed at R15.6.7, and
-     *   * that artifact's EXECUTABLE BODY is byte-identical to the current
-     *     one — which is exactly what R15.6.8 guarantees.
-     * The stale whole-file pin is asserted as a KNOWN, INTENTIONAL divergence
-     * so it cannot pass unnoticed and must be resolved by the next review.
+     * R15.6.9: the analysis document must describe the artifact that actually
+     * exists. It records TWO hashes with distinct purposes — the whole-file
+     * hash identifies the complete operator-facing artifact including its
+     * safety contract, and the executable-body hash proves the executable SQL
+     * is unchanged. Both are enforced here, and the superseded R15.6.7 hash is
+     * only tolerated when explicitly labelled as superseded.
      */
-    const REVIEWED_FILE_SHA_R15_6_7 = '46953b5c95afe455313ec6279b86879aa36aff7b252c5e323f9456aa364c29e0';
+    const CURRENT_FILE_SHA = '52acf699ed170ec4ded25301190676491e984e94ad963e13c3d33c6ae037ee60';
+    const CURRENT_BODY_SHA = '20bee9767502087ae198dc28c54bfc048a52f290a43db177a3bf172bf89d1e23';
+    const SUPERSEDED_FILE_SHA = '46953b5c95afe455313ec6279b86879aa36aff7b252c5e323f9456aa364c29e0';
     const analysis = readFileSync(`${DIR}MANAGED_ROLE_DIAGNOSTIC_ANALYSIS.md`, 'utf8');
-    const pinned = /\(SHA-256 `([0-9a-f]{64})`\)/.exec(analysis)?.[1];
 
-    expect(pinned, 'the analysis document must pin a diagnostic artifact hash').toBe(REVIEWED_FILE_SHA_R15_6_7);
+    // 1. the artifact on disk really is the current one
+    expect(createHash('sha256').update(readFileSync(DIAG)).digest('hex')).toBe(CURRENT_FILE_SHA);
 
-    // The executable content the document describes is unchanged.
-    expect(createHash('sha256').update(Buffer.from(executableBody, 'utf8')).digest('hex')).toBe(
-      '20bee9767502087ae198dc28c54bfc048a52f290a43db177a3bf172bf89d1e23',
-    );
+    // 2. the document names that value as the CURRENT complete artifact
+    expect(analysis, 'the current whole-file hash must appear').toContain(CURRENT_FILE_SHA);
 
-    // ...and the whole-file divergence is comment-only, by construction.
-    const currentFileSha = createHash('sha256').update(readFileSync(DIAG)).digest('hex');
-    expect(currentFileSha, 'R15.6.8 changed comments, so the whole-file hash moved').not.toBe(
-      REVIEWED_FILE_SHA_R15_6_7,
-    );
+    const currentRow = analysis.split('\n').find((l) => l.includes(CURRENT_FILE_SHA) && /current/i.test(l));
+    expect(currentRow, 'the current hash must be labelled as the current artifact').toBeDefined();
+
+    // 3. the document records the executable-body hash AND its byte length
+    expect(analysis, 'the executable-body hash must appear').toContain(CURRENT_BODY_SHA);
+
+    const bodyRow = analysis.split('\n').find((l) => l.includes(CURRENT_BODY_SHA) || /33,114 bytes/.test(l));
+    expect(bodyRow, 'the executable body must be described').toBeDefined();
+    expect(analysis, 'the executable-body length must be stated').toMatch(/33,114\s*bytes/);
+
+    // 4. the extracted body matches that hash, at that length
+    expect(createHash('sha256').update(Buffer.from(executableBody, 'utf8')).digest('hex')).toBe(CURRENT_BODY_SHA);
+    expect(Buffer.byteLength(executableBody, 'utf8')).toBe(33_114);
+
+    // 5. the superseded hash is never presented as the current identity
+    for (const line of analysis.split('\n').filter((l) => l.includes(SUPERSEDED_FILE_SHA))) {
+      expect(line, `superseded hash must not be labelled current: ${line}`).not.toMatch(/\bcurrent\b(?!\)?\s*$)/i);
+    }
+
+    // 6. if it remains at all, it is explicitly marked superseded / R15.6.7
+    if (analysis.includes(SUPERSEDED_FILE_SHA)) {
+      const idx = analysis.indexOf(SUPERSEDED_FILE_SHA);
+      const window = analysis.slice(idx, idx + 200);
+      expect(window, 'the old hash must be labelled superseded or R15.6.7').toMatch(/superseded|R15\.6\.7/i);
+    }
+
+    // 7. the two hashes are documented as serving different purposes
+    expect(analysis).toMatch(/complete operator-facing artifact/i);
+    expect(analysis).toMatch(/executable SQL (itself )?is unchanged|proves the executable SQL/i);
+
+    // 8. the reason the whole-file hash moved is recorded, and it is comment-only
+    expect(analysis).toMatch(/exclusively by the reviewed SQL-header comment correction/i);
+    expect(analysis).toMatch(/executable body did not|No executable token\s*\n?moved/i);
   });
 
   it('d-doc1 — the analysis states the output bound honestly and never claims density is free', () => {
