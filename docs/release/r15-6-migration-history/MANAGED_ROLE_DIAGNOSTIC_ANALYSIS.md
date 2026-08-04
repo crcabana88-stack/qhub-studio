@@ -138,7 +138,7 @@ Critically, **no reachability or privilege fact in this file was ever derived fr
 paths** — they were illustrative detail. An effective privilege therefore cannot disappear because
 alternative path rows were removed, and the test suite asserts exactly that against every candidate.
 
-### Exact worst-case row bound
+### Exact worst-case output-cardinality bound
 
 With R = roles, C = candidates, E = `pg_auth_members` rows, A = explicit ACL entries:
 
@@ -148,9 +148,48 @@ QUERY 4: E        QUERY 5: ≤ C·R    QUERY 6: A
 TOTAL:   1 + C + 9C + E + C·R + A  =  O(C·R + E + A)
 ```
 
-No term depends on the number of distinct routes, so graph *density* cannot move the row count —
-only the number of roles can. On the 33-role/116-edge fixture the whole diagnostic returns a few
-hundred rows instead of 87,380, in well under a second, writing **zero** temporary files.
+**Read this bound precisely — it is an output-cardinality bound, not a runtime guarantee.** Four
+distinct quantities are involved and must not be conflated:
+
+| Quantity | What it is | Relationship to the bound |
+|---|---|---|
+| **Output cardinality** | rows the diagnostic returns | exactly the formula above |
+| **Internal execution cost** | time, memory, CPU spent producing them | **not** bounded by the formula |
+| **Graph size and density** | R and E | appear directly in the formula |
+| **Number of alternative simple paths** | how many distinct routes exist | appears **nowhere** in the formula |
+
+What the formula does and does not say:
+
+1. **For fixed C, R, E and A, increasing the number of possible simple paths does not change the
+   formal output bound.** This is the property the correction was about: the pathological quantity
+   is the one term that is absent.
+2. The diagnostic **does not enumerate simple paths**, and no term of its output depends on the
+   simple-path count.
+3. **Graph density can increase E directly** — more direct membership grants means more `E`, and
+   QUERY 4 contributes exactly `E` rows. Denser graphs therefore *do* produce more output rows and
+   more work.
+4. Density and graph size can also increase, beyond the row count:
+   - direct-edge output volume and result-transmission size;
+   - the membership-closure work PostgreSQL performs internally;
+   - repeated `pg_has_role` evaluation (once per reported pair, and inside QUERY 2/3 predicates);
+   - join, aggregation, sorting and array-building work;
+   - overall execution time and memory use.
+5. **The row-count formula is not by itself a proof of constant runtime, nor of
+   density-independent runtime.**
+6. Internal execution cost may therefore exceed what the output-row formula suggests, while still
+   containing no simple-path enumeration at all. Those are separate claims, and only the second is
+   guaranteed here.
+
+The earlier phrasing — that density "cannot move" result size or execution cost — was wrong and has
+been withdrawn. The correct claim is narrower: *the exponential, route-count-driven blow-up is
+gone; growth with graph size and density remains, and remains polynomial in the catalog's own
+dimensions.*
+
+**Measured evidence is fixture-specific, not a universal runtime guarantee.** On the 33-role /
+116-edge fixture the whole diagnostic returned **160 rows in ~0.13 s with zero temporary files**,
+and on a 49-role / 258-edge graph (2,015,538 simple paths) it stayed under 5,000 rows and well
+inside the external timeout. Those are measurements of those graphs on PostgreSQL 16 — evidence
+that the exponential term is gone, not a promise about an arbitrary live catalog.
 
 ### Depth is still detectable
 
@@ -163,8 +202,31 @@ pre-expand it. Conflicting alternative routes remain distinguishable: a candidat
 inactive direct grant and an active two-step route shows the inactive edge, the active edges, and
 reachability saying some route activates it, with `inactive_membership_only = false`.
 
-A conservative transaction-local `statement_timeout` is set as defense in depth. It is not the
-protection — the query shapes are.
+## 4b. The timeout, and what counts as a valid run
+
+The diagnostic sets `SET LOCAL statement_timeout = '120s'` inside its transaction. The complete
+contract, which a reviewer must understand before relying on any output:
+
+1. `SET LOCAL statement_timeout = '120s'` is **transaction-local** — it is reverted when the
+   transaction ends and never touches server or role configuration.
+2. PostgreSQL applies `statement_timeout` **separately to each subsequent statement**. It is a
+   per-statement allowance, not a budget for the script.
+3. The complete six-result-set script is therefore **not limited to 120 seconds in total**. Each of
+   the six queries gets its own 120-second allowance.
+4. A later statement **can time out even after earlier result sets have already been returned to
+   the client**.
+5. When that happens, **earlier result tabs may remain visible** in the SQL editor and look like a
+   successful run.
+6. **Those partial results do not constitute a complete Diagnostic 28 evidence package.**
+7. **Any** of the following invalidates the complete diagnostic run: a statement timeout, any SQL
+   error, connection loss, cancellation, transaction abort, a missing result set, or incomplete
+   result transmission.
+8. After any such failure, **no partial output may be used for authorization** — or for any
+   conclusion about any role.
+9. A **complete new run of the exact reviewed artifact must succeed from the beginning** before its
+   results may be evaluated. All six result sets must be present and fully transmitted.
+10. The timeout remains **defense in depth**. It is not the bounded-design proof; the query shapes
+    are, and they are what §4 argues.
 
 ## 5. Attribution is reachability-gated
 
@@ -221,7 +283,7 @@ still holds — and really exercises — an inherited `SELECT`. `rolpassword` is
 ## 8. What the diagnostic collects
 
 `28_READ_ONLY_MANAGED_ROLE_DIAGNOSTIC.sql`
-(SHA-256 `e869522d253e99601b9f44ded5ea45b578c135b9abeef30612163440994b1304`)
+(SHA-256 `46953b5c95afe455313ec6279b86879aa36aff7b252c5e323f9456aa364c29e0`)
 is one explicit `REPEATABLE READ, READ ONLY` transaction containing no mutating SQL, no temporary
 objects, no dynamic SQL and no recursion. Candidates are discovered from `pg_roles` — the three
 observed names appear nowhere in its executable text. It returns **six** ordered result sets:
@@ -233,13 +295,51 @@ observed names appear nowhere in its executable text. It returns **six** ordered
 | 3 | **The core route table** — one row per (candidate, object, privilege) reached by any route, plus rows where only an inactive membership exists. Reachability-gated attribution for explicit ACLs, the actual object owner, and predefined roles (three columns each); `PUBLIC` attributed independently; holder arrays per route kind; `inactive_membership_only` true only in the absence of any active route. Covers schema `USAGE`/`CREATE` and table `SELECT`/`INSERT`/`UPDATE`/`DELETE`/`TRUNCATE`/`REFERENCES`/`TRIGGER`. |
 | 4 | **Membership edge inventory** — every `pg_auth_members` row exactly once (bound: E): member OID and name, granted-role OID and name, grantor OID and name, `edge_admin_option`, `edge_inherit_option`, `edge_set_option`, plus candidate/predefined/login/superuser/pinned-owner/schema-owner/table-owner context flags. A flat catalog read: no recursion, no traversal, no paths. |
 | 5 | **Role reachability** — per (candidate, related role), PostgreSQL's own answer (bound: C·R): `membership_exists`, `privileges_inherited_without_set_role`, `set_role_permitted`, `inactive_membership_only`, `direct_edge_count`, `distinct_direct_edge_option_shapes`, predefined/login/superuser/pinned-owner/schema-owner/table-owner flags, and whether the related role holds any protected privilege. These already account for every transitive route of any depth without enumerating any. |
-| 6 | **Structured ACL evidence** — one row per explicit ACL entry on the protected schema and table: object type and identity, grantee OID and name, `grantee_is_public`, grantor OID and name, privilege type, grantability. Empty output means both ACLs are NULL, which is the pinned contract. |
+| 6 | **Structured ACL evidence** — one row per explicit ACL entry on the protected schema and table: object type, object OID, object schema, object identity, grantee OID and name, `grantee_is_public`, grantor OID and name, privilege type, grantability. Empty output means both ACLs are NULL, which is the pinned contract. Ordered totally by stable catalog identities (§8b). |
 
 It reads only `pg_roles`, `pg_auth_members`, `pg_namespace`, `pg_class`, `pg_default_acl` and
 PostgreSQL's privilege functions. It reads **no application rows**, no migration-history rows, no
 `auth` or `storage` schema, no secrets, tokens, credentials, password hashes or customer data, and
 no schema other than `supabase_migrations` (the pinned-owner lookup reads `pg_class` metadata for
 `public.qhub_manual_review_requests`, never a row from it).
+
+## 8b. Deterministic ordering of every result set
+
+Every result set is ordered totally over its own rows, so two runs against an unchanged catalog
+return byte-identical output.
+
+| Query | `ORDER BY` | Why it is total |
+|---|---|---|
+| 1 | — | single row |
+| 2 | `reaches_protected_objects DESC, rolname` | one row per candidate; `rolname` is UNIQUE in `pg_authid` |
+| 3 | `candidate_role, ord` | grouped by `(cand_oid, object_kind, priv, ord)`; `ord` is a 1:1 label for the nine (object kind, privilege) pairs |
+| 4 | `member name, granted name, grantor, member, roleid` | the last three are exactly `pg_auth_members`' unique key `(roleid, member, grantor)` |
+| 5 | `candidate_role, related_role` | one row per pair of unique role names |
+| 6 | `object_type, object_oid, object_schema, object_identity, grantee_oid, privilege_type, grantor_oid, is_grantable` | see below |
+
+**Query 6 was the one real defect.** It previously ordered by `(object_type, grantee_name,
+privilege_type)`, which leaves a genuine tie: the same grantee can hold the same privilege on the
+same object from **two different grantors**, and PostgreSQL 16 emits both as separate `aclexplode`
+rows. Two semantically distinct rows could therefore appear in an unspecified relative order.
+
+The corrected ordering is total over **stable catalog identities**, with OIDs — not display names —
+as the decisive tie-breakers. Names remain in the output for readability but never decide an order.
+
+*Proof of totality.* A PostgreSQL ACL is an `aclitem[]` whose entries are keyed by
+`(grantee, grantor)`. Verified on PostgreSQL 16:
+
+- granting the same privilege to the same grantee from **two different grantors** produces **two**
+  entries (the reviewed defect, reproduced);
+- **re-granting** the same privilege from the **same** grantor updates the existing entry rather
+  than appending one — the row count did not change;
+- raising a privilege to `WITH GRANT OPTION` **flips that entry's grant-option bit** rather than
+  adding a row;
+- across a populated ACL, `(grantee, grantor, privilege_type)` was unique for every row.
+
+`aclexplode` emits one row per privilege bit of each entry, so `(object, grantee, grantor,
+privilege_type)` is a unique key. Ordering by all four components is therefore a total order over
+semantically distinct rows; `is_grantable` is functionally determined by that key and is appended
+for completeness. **No ordinality discriminator is required**, and none is used.
 
 ## 9. Which results would remain blocking
 

@@ -542,6 +542,123 @@ describe('R15.6.5 diagnostic 28 — static contract', () => {
     expect(analysis).toContain(createHash('sha256').update(readFileSync(DIAG)).digest('hex'));
   });
 
+  it('d-doc1 — the analysis states the output bound honestly and never claims density is free', () => {
+    const analysis = readFileSync(`${DIR}MANAGED_ROLE_DIAGNOSTIC_ANALYSIS.md`, 'utf8');
+
+    /*
+     * The withdrawn claim: that density "cannot move" result size or cost.
+     * QUERY 4 contributes exactly E rows, so denser graphs DO cost more.
+     */
+    expect(analysis, 'the withdrawn "cannot move" claim must be gone').not.toMatch(
+      /density\s+cannot\s+move|cannot move the row count|density-independent(?!\s+runtime\.)/i,
+    );
+
+    // The four quantities must be named and kept distinct.
+    for (const required of [
+      /output[- ]cardinality bound/i,
+      /internal execution cost/i,
+      /graph size and density/i,
+      /number of alternative simple paths/i,
+    ]) {
+      expect(analysis, `missing distinction: ${required}`).toMatch(required);
+    }
+
+    // The six precise statements the correction requires.
+    expect(analysis, 'fixed C,R,E,A + more simple paths => same formal bound').toMatch(
+      /For fixed C, R, E and A, increasing the number of possible simple paths does not change the\s+formal output bound/i,
+    );
+    expect(analysis, 'no simple-path enumeration and no simple-path term').toMatch(
+      /does not enumerate simple paths.*no term of its output depends on the\s+simple-path count/is,
+    );
+    expect(analysis, 'density increases E directly').toMatch(/[Gg]raph density can increase E directly/);
+    expect(analysis, 'runtime is not proven by the row formula').toMatch(
+      /not by itself a proof of constant runtime, nor of\s+density-independent runtime/i,
+    );
+    expect(analysis, 'internal cost may exceed the output formula').toMatch(
+      /[Ii]nternal execution cost may therefore exceed what the output-row formula suggests/,
+    );
+
+    // The affected cost dimensions are enumerated.
+    for (const dimension of [
+      /result-transmission size|direct-edge output volume/i,
+      /membership-closure work/i,
+      /repeated `pg_has_role` evaluation/i,
+      /join, aggregation, sorting and array-building work/i,
+      /execution time and memory use/i,
+    ]) {
+      expect(analysis, `missing cost dimension: ${dimension}`).toMatch(dimension);
+    }
+
+    // Measurements are labelled as fixture-specific evidence, not a guarantee.
+    expect(analysis).toMatch(/fixture-specific, not a universal runtime guarantee/i);
+    expect(analysis).toMatch(/not a promise about an arbitrary live catalog/i);
+  });
+
+  it('d-doc2 — the analysis documents the complete timeout / valid-run contract', () => {
+    const analysis = readFileSync(`${DIR}MANAGED_ROLE_DIAGNOSTIC_ANALYSIS.md`, 'utf8');
+
+    /*
+     * Finding 2: the timeout is per-statement, so the six-query script is NOT
+     * bounded at 120s in total, and partial output is never evidence. These
+     * are semantic requirements on the DOCUMENT, not on the SQL.
+     */
+    expect(analysis, 'transaction-local').toMatch(
+      /`SET LOCAL statement_timeout = '120s'` is \*\*transaction-local\*\*/,
+    );
+    expect(analysis, 'applied per statement').toMatch(
+      /applies `statement_timeout` \*\*separately to each subsequent statement\*\*/i,
+    );
+    expect(analysis, 'not a total budget').toMatch(/\*\*not limited to 120 seconds in total\*\*/i);
+    expect(analysis, 'later statement can time out after earlier results').toMatch(
+      /can time out even after earlier result sets have already been returned to\s+the client/i,
+    );
+    expect(analysis, 'earlier tabs remain visible').toMatch(/\*\*earlier result tabs may remain visible\*\*/i);
+    expect(analysis, 'partial output is not an evidence package').toMatch(
+      /do not constitute a complete Diagnostic 28 evidence package/i,
+    );
+
+    // Every invalidating condition must be named.
+    for (const condition of [
+      /statement timeout/i,
+      /any SQL\s+error/i,
+      /connection loss/i,
+      /cancellation/i,
+      /transaction abort/i,
+      /missing result set/i,
+      /incomplete\s+result transmission/i,
+    ]) {
+      expect(analysis, `missing invalidating condition: ${condition}`).toMatch(condition);
+    }
+
+    expect(analysis, 'no partial output may authorize').toMatch(
+      /\*\*no partial output may be used for authorization\*\*/i,
+    );
+    expect(analysis, 'a complete fresh run is required').toMatch(
+      /\*\*complete new run of the exact reviewed artifact must succeed from the beginning\*\*/i,
+    );
+    expect(analysis, 'timeout is defense in depth, not the proof').toMatch(
+      /\*\*defense in depth\*\*[\s\S]{0,200}not the bounded-design proof/i,
+    );
+  });
+
+  it('d-doc3 — the analysis documents the total ordering of every result set', () => {
+    const analysis = readFileSync(`${DIR}MANAGED_ROLE_DIAGNOSTIC_ANALYSIS.md`, 'utf8');
+
+    expect(analysis).toMatch(/Deterministic ordering of every result set/i);
+    expect(analysis, 'Query 6 named as the defect').toMatch(/Query 6 was the one real defect/i);
+    expect(analysis, 'two-grantor tie explained').toMatch(/two different grantors/i);
+    expect(analysis, 'OIDs decisive, names not').toMatch(/OIDs — not display names —\s*as the decisive tie-breakers/i);
+    expect(analysis, 'uniqueness proof recorded').toMatch(
+      /`\(object, grantee, grantor,\s*privilege_type\)` is a unique key/i,
+    );
+    expect(analysis, 'no ordinality needed').toMatch(/\*\*No ordinality discriminator is required\*\*/i);
+
+    // The corrected ORDER BY is written out in full.
+    expect(analysis).toMatch(
+      /object_type, object_oid, object_schema, object_identity, grantee_oid, privilege_type, grantor_oid, is_grantable/,
+    );
+  });
+
   it('d-st8 — no recursion, no path expansion, and no truncation devices anywhere', () => {
     /*
      * R15.6.6: exhaustive simple-path enumeration is exponential in the graph
@@ -589,6 +706,50 @@ describe('R15.6.5 diagnostic 28 — static contract', () => {
     // It is LOCAL, so it cannot outlive the transaction or touch server config.
     expect(exec).not.toMatch(/^\s*SET\s+statement_timeout/im);
     expect(exec).not.toMatch(/ALTER (SYSTEM|DATABASE|ROLE)/i);
+  });
+
+  it('d-st12 — Query 6 orders by stable catalog identities, with OIDs as the decisive tie-breakers', () => {
+    /*
+     * The reviewed defect: ORDER BY 1, 4, 8 (object_type, grantee_name,
+     * privilege_type) leaves a tie when one grantee holds one privilege on one
+     * object from TWO grantors. Grantor OID must participate, and names must
+     * never be the only tie-breakers.
+     */
+    expect(exec, 'the tie-leaving ordering must be gone').not.toMatch(/ORDER BY 1, 4, 8;/);
+
+    const q6Order = /ORDER BY ([0-9, ]+);\s*$/m.exec(exec.trimEnd().replace(/COMMIT;\s*$/, ''));
+    expect(q6Order, 'Query 6 must order by explicit output positions').not.toBeNull();
+
+    const positions = q6Order![1].split(',').map((p) => Number(p.trim()));
+
+    /*
+     * Output column order of Query 6:
+     *  1 object_type      2 object_oid    3 object_schema  4 object_identity
+     *  5 grantee_oid      6 grantee_name  7 grantee_is_public
+     *  8 grantor_oid      9 grantor_name 10 privilege_type 11 is_grantable
+     */
+    for (const [pos, label] of [
+      [1, 'object_type'],
+      [2, 'object_oid'],
+      [3, 'object_schema'],
+      [4, 'object_identity'],
+      [5, 'grantee_oid'],
+      [10, 'privilege_type'],
+      [8, 'grantor_oid'],
+      [11, 'is_grantable'],
+    ] as const) {
+      expect(positions, `${label} (position ${pos}) must participate in the ordering`).toContain(pos);
+    }
+
+    // Grantor OID must be decisive BEFORE grantability, and names must not be relied on.
+    expect(positions.indexOf(8)).toBeLessThan(positions.indexOf(11));
+    expect(positions, 'grantee_name must not be an ordering key').not.toContain(6);
+    expect(positions, 'grantor_name must not be an ordering key').not.toContain(9);
+
+    // The columns themselves are emitted.
+    for (const col of ['object_oid', 'object_schema', 'grantee_oid', 'grantor_oid']) {
+      expect(exec).toMatch(new RegExp(`AS ${col}\\b`));
+    }
   });
 
   it('d-st9 — role validity is never a reachability input', () => {
@@ -1663,5 +1824,259 @@ describe.skipIf(!HAVE_PG)('R15.6.5 diagnostic 28 — complete adversarial matrix
     // The bystander is denied the same nine for real.
     expect(asRole('z_bystander', `BEGIN; CREATE TABLE ${NSP}.zz_probe_t(i int); ROLLBACK;`).ok).toBe(false);
     expect(asRole('z_bystander', `BEGIN; TRUNCATE ${TBL}; ROLLBACK;`).ok).toBe(false);
+  });
+});
+
+// ─── Query 6 total ordering under two distinct grantors ─────────────────────
+
+describe.skipIf(!HAVE_PG)('R15.6.7 diagnostic 28 — Query 6 ordering is total with two grantors', () => {
+  /*
+   * The reviewed defect: ORDER BY (object_type, grantee_name, privilege_type)
+   * leaves a genuine tie when ONE grantee holds ONE privilege on ONE object
+   * granted independently by TWO different grantors — PostgreSQL 16 emits both
+   * as separate aclexplode rows. This suite builds exactly that state with two
+   * genuinely distinct NON-SUPERUSER grantors (a superuser's GRANT is recorded
+   * with the object owner as grantor, so a superuser cannot produce a distinct
+   * grantor at all), and proves the corrected ordering resolves it.
+   */
+  const GRANTORS = ['q6_grantor_a', 'q6_grantor_b'];
+  const GRANTEE = 'q6_grantee';
+  let acls: Row[] = [];
+  let aclOid = '';
+  let grantorOids: Record<string, string> = {};
+  let fpBefore = '';
+  let fpAfter = '';
+
+  /*
+   * Roles are cluster-scoped, so a fixture role left behind by an interrupted
+   * run would break CREATE ROLE here.
+   *
+   * ORDER MATTERS, and it is the reverse of the intuitive one. A superuser
+   * REVOKE cannot remove a grant made by a DIFFERENT grantor — which is
+   * exactly the state this suite creates on purpose — and `DROP OWNED BY` on
+   * the GRANTEE does not remove those grants either (proven on PostgreSQL 16:
+   * the subsequent DROP ROLE fails with "cannot be dropped because some
+   * objects depend on it"). Dropping each GRANTOR first cascades away the
+   * grants it made; the grantee is then free of dependencies. With this order
+   * the protected ACLs return byte-identical to their pre-fixture state.
+   */
+  const purge = () => {
+    for (const r of [...GRANTORS, GRANTEE]) {
+      try {
+        run(`DROP OWNED BY ${r} CASCADE;`);
+      } catch {
+        /* role absent */
+      }
+
+      try {
+        run(`DROP ROLE IF EXISTS ${r};`);
+      } catch {
+        /* already gone */
+      }
+    }
+  };
+
+  /**
+   * Order-insensitive protected-state fingerprint. `nspacl::text` renders the
+   * aclitem ARRAY in storage order, and adding then removing entries can
+   * legitimately reorder that array without changing a single privilege — so
+   * the raw text is not a sound restoration check here. This compares the SET
+   * of ACL entries (via aclexplode, sorted), plus rows, owners, RLS, the role
+   * list and the full membership graph.
+   */
+  const normalizedProtectedState = () =>
+    scalar(`SELECT md5(
+       coalesce((SELECT string_agg(to_jsonb(m.*)::text, '|' ORDER BY m.version) FROM ${TBL} m), '-') || '::' ||
+       coalesce((SELECT string_agg(x.e, ',' ORDER BY x.e) FROM (
+         SELECT ae.grantee::text || '/' || ae.grantor::text || '/' || ae.privilege_type || '/' || ae.is_grantable::text AS e
+           FROM pg_namespace n, aclexplode(n.nspacl) ae WHERE n.nspname = '${NSP}') x), '-') || '::' ||
+       coalesce((SELECT string_agg(y.e, ',' ORDER BY y.e) FROM (
+         SELECT ae.grantee::text || '/' || ae.grantor::text || '/' || ae.privilege_type || '/' || ae.is_grantable::text AS e
+           FROM pg_class c, aclexplode(c.relacl) ae WHERE c.oid = '${TBL}'::regclass) y), '-') || '::' ||
+       (SELECT c.relowner::text || c.relrowsecurity::text || c.relforcerowsecurity::text
+          FROM pg_class c WHERE c.oid = '${TBL}'::regclass) || '::' ||
+       (SELECT n.nspowner::text FROM pg_namespace n WHERE n.nspname = '${NSP}') || '::' ||
+       coalesce((SELECT string_agg(rolname, ',' ORDER BY rolname) FROM pg_roles), '-') || '::' ||
+       coalesce((SELECT string_agg(member::text || roleid::text || grantor::text || admin_option::text
+                                   || inherit_option::text || set_option::text, ',' ORDER BY member, roleid, grantor)
+                   FROM pg_auth_members), '-'));`);
+
+  let rawBefore = '';
+
+  beforeAll(() => {
+    purge();
+    fpBefore = normalizedProtectedState();
+    rawBefore = protectedFingerprint();
+
+    run(`CREATE ROLE ${GRANTEE} NOLOGIN;
+      ${GRANTORS.map((g) => `CREATE ROLE ${g} NOLOGIN;`).join('\n')}
+      GRANT USAGE ON SCHEMA ${NSP} TO ${GRANTORS.join(', ')};
+      ${GRANTORS.map((g) => `GRANT SELECT ON ${TBL} TO ${g} WITH GRANT OPTION;`).join('\n')}`);
+
+    // Each grantor independently grants the SAME privilege to the SAME grantee.
+    for (const g of GRANTORS) {
+      run(`SET ROLE ${g}; GRANT SELECT ON ${TBL} TO ${GRANTEE}; RESET ROLE;`);
+    }
+
+    aclOid = scalar(`SELECT '${TBL}'::regclass::oid::text;`)!;
+    grantorOids = Object.fromEntries(GRANTORS.map((g) => [g, scalar(`SELECT '${g}'::regrole::oid::text;`)!]));
+
+    acls = resultSet(runFile(DIAG), 'grantee_is_public');
+  }, 600_000);
+
+  afterAll(() => {
+    // Idempotent: q6-7 already purged on the success path.
+    purge();
+  }, 300_000);
+
+  const granteeRows = () => acls.filter((a) => a.grantee_name === GRANTEE && a.privilege_type === 'SELECT');
+
+  it('q6-1 — aclexplode really contains two distinct grantor OIDs for one grantee+privilege', () => {
+    const distinct = scalar(`SELECT count(DISTINCT ae.grantor)::text
+       FROM pg_class c, aclexplode(c.relacl) ae
+      WHERE c.oid = '${TBL}'::regclass
+        AND ae.grantee = '${GRANTEE}'::regrole AND ae.privilege_type = 'SELECT';`);
+    expect(distinct, 'the reviewed tie condition must genuinely exist').toBe('2');
+
+    const grantors = run(`SELECT pg_get_userbyid(ae.grantor)
+       FROM pg_class c, aclexplode(c.relacl) ae
+      WHERE c.oid = '${TBL}'::regclass
+        AND ae.grantee = '${GRANTEE}'::regrole AND ae.privilege_type = 'SELECT'
+      ORDER BY 1;`);
+
+    for (const g of GRANTORS) {
+      expect(grantors, `${g} must appear as a grantor`).toContain(g);
+    }
+
+    /*
+     * Neither grantor is a superuser: a superuser GRANT records the OBJECT
+     * OWNER as grantor and could never produce a distinct grantor.
+     */
+    for (const g of GRANTORS) {
+      expect(scalar(`SELECT rolsuper::text FROM pg_roles WHERE rolname = '${g}';`)).toBe('false');
+    }
+  });
+
+  it('q6-2 — Query 6 returns BOTH rows, with the correct distinct grantor OIDs', () => {
+    const rows = granteeRows();
+    expect(rows.length, 'both grants must be reported').toBe(2);
+    expect(new Set(rows.map((r) => r.grantor_oid)).size).toBe(2);
+    expect(rows.map((r) => r.grantor_name).sort()).toEqual([...GRANTORS].sort());
+
+    for (const r of rows) {
+      expect(r.object_type).toBe('table');
+      expect(r.object_oid).toBe(aclOid);
+      expect(r.object_schema).toBe(NSP);
+      expect(r.object_identity).toBe(TBL);
+      expect(r.grantee_is_public).toBe('f');
+      expect(r.grantor_oid).toBe(grantorOids[r.grantor_name]);
+    }
+  });
+
+  it('q6-3 — the two rows appear in exactly the order the corrected ORDER BY requires', () => {
+    const rows = granteeRows();
+
+    /*
+     * ORDER BY object_type, object_oid, object_schema, object_identity,
+     *          grantee_oid, privilege_type, grantor_oid, is_grantable
+     * Everything before grantor_oid is equal for these two rows, so grantor
+     * OID — ascending, numerically — decides.
+     */
+    const emitted = rows.map((r) => Number(r.grantor_oid));
+    const expected = [...emitted].sort((a, b) => a - b);
+    expect(emitted, 'ascending grantor OID decides the tie').toEqual(expected);
+
+    // And the emitted order matches PostgreSQL's own ordering of the same key.
+    const authoritative = run(`SELECT ae.grantor::text
+         FROM pg_class c, aclexplode(c.relacl) ae
+        WHERE c.oid = '${TBL}'::regclass
+          AND ae.grantee = '${GRANTEE}'::regrole AND ae.privilege_type = 'SELECT'
+        ORDER BY ae.grantor;`)
+      .split(/\r?\n/)
+      .filter((l) => /^\d+$/.test(l.trim()))
+      .map((l) => Number(l.trim()));
+    expect(emitted).toEqual(authoritative);
+  });
+
+  it('q6-4 — the full result set is byte-identical across repeated runs', () => {
+    const key = (rows: Row[]) =>
+      rows
+        .map(
+          (r) =>
+            `${r.object_type}|${r.object_oid}|${r.object_schema}|${r.object_identity}|` +
+            `${r.grantee_oid}|${r.privilege_type}|${r.grantor_oid}|${r.is_grantable}`,
+        )
+        .join('\n');
+
+    const first = key(acls);
+
+    for (let i = 0; i < 4; i += 1) {
+      expect(key(resultSet(runFile(DIAG), 'grantee_is_public')), `run ${i + 2} must match run 1`).toBe(first);
+    }
+  });
+
+  it('q6-5 — the emitted ordering is a TOTAL order: no two rows share the full key', () => {
+    const keys = acls.map(
+      (r) => `${r.object_type}|${r.object_oid}|${r.grantee_oid}|${r.privilege_type}|${r.grantor_oid}`,
+    );
+    expect(new Set(keys).size, 'every row is distinguished by (object, grantee, grantor, privilege)').toBe(keys.length);
+
+    // Independently: that key is unique in the catalog itself.
+    expect(
+      scalar(`SELECT (count(*) = count(DISTINCT (ae.grantee, ae.grantor, ae.privilege_type)))::text
+         FROM pg_class c, aclexplode(c.relacl) ae WHERE c.oid = '${TBL}'::regclass;`),
+    ).toBe('true');
+  });
+
+  it('q6-6 — re-granting from one grantor adds no row; grant-option flips in place', () => {
+    /*
+     * This is why no ordinality discriminator is needed: an aclitem is keyed by
+     * (grantee, grantor), so repeats update rather than append.
+     */
+    const before = scalar(`SELECT count(*)::text FROM pg_class c, aclexplode(c.relacl) ae
+       WHERE c.oid = '${TBL}'::regclass AND ae.grantee = '${GRANTEE}'::regrole;`);
+
+    run(`SET ROLE ${GRANTORS[0]}; GRANT SELECT ON ${TBL} TO ${GRANTEE}; RESET ROLE;`);
+    expect(
+      scalar(`SELECT count(*)::text FROM pg_class c, aclexplode(c.relacl) ae
+         WHERE c.oid = '${TBL}'::regclass AND ae.grantee = '${GRANTEE}'::regrole;`),
+      're-grant must not append a row',
+    ).toBe(before);
+
+    run(`SET ROLE ${GRANTORS[0]}; GRANT SELECT ON ${TBL} TO ${GRANTEE} WITH GRANT OPTION; RESET ROLE;`);
+    expect(
+      scalar(`SELECT count(*)::text FROM pg_class c, aclexplode(c.relacl) ae
+         WHERE c.oid = '${TBL}'::regclass AND ae.grantee = '${GRANTEE}'::regrole;`),
+      'raising to WITH GRANT OPTION must flip in place, not append',
+    ).toBe(before);
+
+    const rows = resultSet(runFile(DIAG), 'grantee_is_public').filter(
+      (a) => a.grantee_name === GRANTEE && a.privilege_type === 'SELECT',
+    );
+    expect(rows.length).toBe(2);
+    expect(rows.find((r) => r.grantor_name === GRANTORS[0])!.is_grantable).toBe('t');
+    expect(rows.find((r) => r.grantor_name === GRANTORS[1])!.is_grantable).toBe('f');
+
+    // Restore the pre-test grant shape for the teardown fingerprint.
+    run(`SET ROLE ${GRANTORS[0]}; REVOKE GRANT OPTION FOR SELECT ON ${TBL} FROM ${GRANTEE}; RESET ROLE;`);
+  });
+
+  it('q6-7 — teardown leaves no ACL or protected state changed', () => {
+    /*
+     * Runs last in this describe, so it performs the teardown itself and then
+     * proves the protected object is byte-identical to its pre-fixture state.
+     * afterAll repeats the purge idempotently for the failure path.
+     */
+    purge();
+
+    fpAfter = normalizedProtectedState();
+    expect(fpAfter, 'protected rows, ACLs, owners, RLS and role graph restored (semantic)').toBe(fpBefore);
+    expect(protectedFingerprint(), 'restored byte-identically, ACL array order included').toBe(rawBefore);
+    expect(
+      scalar(`SELECT count(*)::text FROM pg_class c, aclexplode(c.relacl) ae
+         WHERE c.oid = '${TBL}'::regclass AND pg_get_userbyid(ae.grantee) LIKE 'q6\\_%';`),
+      'no fixture ACL entry survives',
+    ).toBe('0');
+    expect(scalar(`SELECT count(*)::text FROM pg_roles WHERE rolname LIKE 'q6\\_%';`)).toBe('0');
   });
 });

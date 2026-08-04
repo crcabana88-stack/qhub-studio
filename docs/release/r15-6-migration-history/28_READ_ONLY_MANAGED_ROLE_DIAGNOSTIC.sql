@@ -117,7 +117,26 @@
 -- depends on the number of distinct routes.
 --
 -- A conservative transaction-local statement_timeout is set below as defense
--- in depth. It is NOT the protection — the query shapes are.
+-- in depth. It is NOT the protection — the query shapes are. Read the
+-- COMPLETENESS CONTRACT below before relying on any output.
+--
+-- ---------------------------------------------------------------------------
+-- COMPLETENESS CONTRACT — WHAT COUNTS AS A VALID RUN.
+--
+-- SET LOCAL statement_timeout = '120s' is TRANSACTION-LOCAL, and PostgreSQL
+-- applies it SEPARATELY TO EACH SUBSEQUENT STATEMENT. The six-result-set
+-- script is therefore NOT limited to 120 seconds in total: each query gets its
+-- own 120-second allowance. A later query can time out after earlier result
+-- sets have already been returned to the client, leaving earlier result tabs
+-- visible in the SQL editor.
+--
+-- THOSE PARTIAL RESULTS ARE NOT A DIAGNOSTIC 28 EVIDENCE PACKAGE. Any of the
+-- following invalidates the entire run: a statement timeout, any SQL error,
+-- connection loss, cancellation, transaction abort, a missing result set, or
+-- incomplete result transmission. After any such failure no partial output may
+-- be used for authorization or for any conclusion about a role. A complete new
+-- run of the exact reviewed artifact must succeed from the beginning, and only
+-- then may its results be evaluated.
 --
 -- ROLE VALIDITY. rolvaliduntil bounds PASSWORD AUTHENTICATION only. An expired
 -- LOGIN role still holds every catalog-defined membership and object
@@ -171,6 +190,20 @@
 -- QUERY 5 is a REACHABILITY summary. Neither asserts by which route authority
 -- arrives, only which grants exist and what PostgreSQL says the candidate can
 -- actually do.
+--
+-- ORDERING AUDIT (every result set is a TOTAL order over its own rows):
+--   QUERY 1  single row — nothing to order.
+--   QUERY 2  (reaches_protected_objects DESC, rolname). One row per candidate
+--            role; rolname is UNIQUE in pg_authid, so it alone breaks all ties.
+--   QUERY 3  (candidate_role, ord). Grouped by (cand_oid, object_kind, priv,
+--            ord); ord is a 1:1 label for the nine (object_kind, privilege)
+--            pairs, so (role, ord) is unique per group.
+--   QUERY 4  (member name, granted name, grantor, member, roleid). The last
+--            three are exactly pg_auth_members' unique key (roleid, member,
+--            grantor), so the order is total by construction.
+--   QUERY 5  (candidate_role, related_role). One row per pair of unique names.
+--   QUERY 6  see the proof of totality above QUERY 6 — corrected in R15.6.7,
+--            it was the one result set with a real tie.
 --
 -- TRANSFER SAFELY OR NOT AT ALL:
 --   Get-Content -Raw -Encoding UTF8 <file> | Set-Clipboard
@@ -629,9 +662,35 @@ ORDER BY c.rolname, r.rolname;
 -- row per explicit ACL entry, with grantee/grantor identity, privilege,
 -- grantability and PUBLIC attribution. Empty output means both ACLs are NULL,
 -- which is the pinned contract.
+--
+-- ORDERING (corrected). The previous ordering was (object_type, grantee_name,
+-- privilege_type), which left a genuine tie: the SAME grantee can hold the SAME
+-- privilege on the SAME object from TWO DIFFERENT grantors, and PostgreSQL 16
+-- emits both as separate aclexplode rows. Two semantically distinct rows could
+-- therefore appear in an unspecified relative order.
+--
+-- The ordering is now total over stable catalog identities, with OIDs — not
+-- display names — as the decisive tie-breakers:
+--   object_type, object_oid, object_schema, object_identity,
+--   grantee_oid, privilege_type, grantor_oid, is_grantable
+-- Names are emitted for readability but never decide an ordering.
+--
+-- PROOF OF TOTALITY. A PostgreSQL ACL is an aclitem[] in which each entry is
+-- keyed by (grantee, grantor): re-granting the same privilege from the same
+-- grantor updates the existing entry rather than appending one, and raising a
+-- privilege to WITH GRANT OPTION flips that entry's goption bit rather than
+-- adding a row. aclexplode emits one row per privilege bit of each entry, so
+-- (object, grantee, grantor, privilege_type) is UNIQUE — verified on
+-- PostgreSQL 16, including the two-distinct-grantor case, the re-grant case
+-- and the mixed-grant-option case. Ordering by all four components is
+-- therefore a total order over semantically distinct rows, and is_grantable
+-- (functionally determined by that key) is appended for completeness. No
+-- ordinality discriminator is required.
 -- ---------------------------------------------------------------------------
 SELECT
   'schema'                                                                       AS object_type,
+  (SELECT n2.oid FROM pg_namespace n2 WHERE n2.nspname = 'supabase_migrations')   AS object_oid,
+  'supabase_migrations'                                                          AS object_schema,
   'supabase_migrations'                                                          AS object_identity,
   ae.grantee                                                                     AS grantee_oid,
   coalesce(pg_get_userbyid(ae.grantee), '(unknown)')                             AS grantee_name,
@@ -645,6 +704,8 @@ WHERE n.nspname = 'supabase_migrations'
 UNION ALL
 SELECT
   'table',
+  to_regclass('supabase_migrations.schema_migrations')::oid,
+  'supabase_migrations',
   'supabase_migrations.schema_migrations',
   ae.grantee,
   coalesce(pg_get_userbyid(ae.grantee), '(unknown)'),
@@ -655,6 +716,6 @@ SELECT
   ae.is_grantable
 FROM pg_class c, aclexplode(c.relacl) ae
 WHERE c.oid = to_regclass('supabase_migrations.schema_migrations')
-ORDER BY 1, 4, 8;
+ORDER BY 1, 2, 3, 4, 5, 10, 8, 11;
 
 COMMIT;
