@@ -42,7 +42,9 @@
 
 import { createHash } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
-import { existsSync, readFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { acquireClusterLock, releaseClusterLock } from './helpers/pg-cluster-lock';
@@ -965,22 +967,120 @@ describe('R15.6.5 diagnostic 28 — static contract', () => {
     ).toBe(0);
 
     /*
-     * No LATER active rule may override the self-rule. Every active pattern is
-     * matched against the literal filename; exactly one may match, and it must
-     * be the eol=lf self-rule.
+     * No LATER active rule may override the self-rule.
+     *
+     * Applicability is decided by GIT, never by a JavaScript approximation of
+     * Git's attribute-pattern semantics. The previous revision translated each
+     * pattern into a RegExp, which silently accepted a real override written as
+     * `[.]gitattributes` (Git applies it; the regex did not match) and THREW a
+     * SyntaxError on `?gitattributes` (Git applies it normally) — and even on a
+     * valid NON-matching `?` pattern. Both defects were reproduced before this
+     * correction.
+     *
+     * Instead: build a disposable git repository, write each active rule's
+     * EXACT pattern paired with a unique synthetic probe attribute, and ask
+     * `git check-attr` which probes it sets for the path `.gitattributes`.
+     * Git's own matcher therefore decides — literal patterns, `*`, `?`,
+     * bracket expressions, quoting and path sensitivity all included. The
+     * repository is removed in a finally block and the removal is verified;
+     * any init, evaluation, parse or cleanup failure throws and fails closed.
      */
-    const matchingRules = attrs
-      .split('\n')
-      .map((l) => l.trim())
-      .filter((l) => l !== '' && !l.startsWith('#'))
-      .filter((l) => {
-        const pattern = l.split(/\s+/)[0];
-        const escaped = pattern.replace(/[.+^${}()|[\]\\]/g, '\\$&').replace(/\*/g, '[^/]*');
+    const rulesApplicableToGitattributes = (attrsText: string): string[] => {
+      const rules = attrsText
+        .split('\n')
+        .map((l) => l.trim())
+        .filter((l) => l !== '' && !l.startsWith('#'));
 
-        return new RegExp(`^${escaped}$`).test('.gitattributes');
-      });
-    expect(matchingRules.length, 'exactly one rule may match .gitattributes').toBe(1);
-    expect(matchingRules[0], 'the sole matching rule pins eol=lf').toMatch(/^\.gitattributes\s+text\s+eol=lf$/);
+      if (rules.length === 0) {
+        return [];
+      }
+
+      /*
+       * Preserve exact pattern syntax: a double-quoted pattern may contain
+       * spaces; otherwise the pattern is the first whitespace-delimited token.
+       * An unterminated quote cannot be faithfully preserved, and Git silently
+       * IGNORES such a line, so reject it loudly rather than let a malformed
+       * rule hide an override.
+       */
+      const patternOf = (rule: string): string => {
+        if (rule.startsWith('"')) {
+          const quoted = /^"(?:[^"\\]|\\.)*"/.exec(rule);
+
+          if (quoted === null) {
+            throw new Error(`malformed .gitattributes rule (unterminated quoted pattern): ${rule}`);
+          }
+
+          return quoted[0];
+        }
+
+        return rule.split(/\s+/)[0];
+      };
+
+      const probeDir = mkdtempSync(join(tmpdir(), 'qhub-attrprobe-'));
+
+      try {
+        execFileSync('git', ['init', '-q', probeDir], { stdio: 'ignore', timeout: 30_000 });
+
+        const probes = rules.map((_, i) => `qhubprobe${i}`);
+        writeFileSync(
+          join(probeDir, '.gitattributes'),
+          `${rules.map((r, i) => `${patternOf(r)} ${probes[i]}`).join('\n')}\n`,
+          'utf8',
+        );
+
+        const out = execFileSync('git', ['check-attr', ...probes, '--', '.gitattributes'], {
+          cwd: probeDir,
+          encoding: 'utf8',
+          timeout: 30_000,
+        });
+
+        return rules.filter((_, i) => {
+          const reported = new RegExp(`^\\.gitattributes: ${probes[i]}: (.+)$`, 'm').exec(out);
+
+          if (reported === null) {
+            throw new Error(`git check-attr did not report ${probes[i]}; output was:\n${out}`);
+          }
+
+          return reported[1].trim() !== 'unspecified';
+        });
+      } finally {
+        rmSync(probeDir, { recursive: true, force: true });
+
+        if (existsSync(probeDir)) {
+          throw new Error(`failed to remove the disposable probe repository ${probeDir}`);
+        }
+      }
+    };
+
+    const matchingRules = rulesApplicableToGitattributes(attrs);
+    expect(matchingRules.length, 'exactly one rule may apply to .gitattributes').toBe(1);
+    expect(matchingRules[0], 'the sole applicable rule pins eol=lf').toMatch(/^\.gitattributes\s+text\s+eol=lf$/);
+
+    /*
+     * REGRESSION CONTROLS for the matcher itself — the two reported defects,
+     * the cases that already worked, valid non-matching patterns that must NOT
+     * be flagged, and malformed input that must fail closed.
+     */
+    const applies = (rule: string) => rulesApplicableToGitattributes(rule).length === 1;
+
+    // 1 & 2: the reported defects — rejected now, and without throwing.
+    expect(applies('[.]gitattributes -text eol=crlf'), 'bracket-expression override must be detected').toBe(true);
+    expect(applies('?gitattributes -text eol=crlf'), 'single-char-wildcard override must be detected').toBe(true);
+
+    // 3: overrides that the previous predicate already caught still are.
+    expect(applies('.gitattributes -text eol=crlf'), 'exact override').toBe(true);
+    expect(applies('*.gitattributes -text eol=crlf'), 'star override').toBe(true);
+    expect(applies('* -text'), 'catch-all override').toBe(true);
+
+    // 4 & 5: valid patterns that genuinely do not match must be accepted.
+    expect(applies('[x]gitattributes -text eol=crlf'), 'non-matching bracket pattern').toBe(false);
+    expect(applies('?notmatching -text eol=crlf'), 'non-matching ? pattern').toBe(false);
+    expect(applies('*.sql text eol=lf'), 'the SQL rule must not apply to .gitattributes').toBe(false);
+
+    // 7: malformed input fails closed with a clear diagnostic.
+    expect(() => rulesApplicableToGitattributes('"unterminated text eol=lf\n')).toThrow(
+      /malformed \.gitattributes rule \(unterminated quoted pattern\)/,
+    );
 
     // Git itself must report the effective attributes for BOTH protected files.
     for (const target of [DIAG, `${REPO}.gitattributes`]) {
