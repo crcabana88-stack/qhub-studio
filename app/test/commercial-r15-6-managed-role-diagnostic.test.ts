@@ -54,7 +54,7 @@ import {
   statSync,
   writeFileSync,
 } from 'node:fs';
-import { delimiter, isAbsolute, join, parse } from 'node:path';
+import { basename, delimiter, dirname, isAbsolute, join, parse } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { acquireClusterLock, releaseClusterLock } from './helpers/pg-cluster-lock';
@@ -66,31 +66,60 @@ const DIAG_SQL = readFileSync(DIAG, 'utf8');
 const MIGRATION = `${REPO}supabase/migrations/20260729_commercial_launch_foundation.sql`;
 
 /*
- * TRUSTED GIT EXECUTABLE — R15.6 THIRD CORRECTION (P1-1).
+ * TRUSTED GIT EXECUTABLE — R15.6 THIRD CORRECTION (P1-1), FOURTH CORRECTION (P1).
  *
- * Git must never be selected by the inherited environment. The candidate list
- * is a narrow allowlist of absolute, protected installation paths. On Windows
- * the drive roots come from a literal system-drive entry plus the ROOT of the
- * running interpreter's own absolute location (process.execPath), which the
- * runtime supplies rather than the caller. Nothing here reads process.env, so
- * PATH, PATHEXT, GIT_EXEC_PATH, ProgramFiles, HOME, USERPROFILE, APPDATA,
- * npm_config_git and every other inherited value are irrelevant; no shell,
- * `where.exe` or other locator participates; and there is no bare-name
- * fallback. If nothing validates, resolution fails closed.
+ * Git must never be selected by the inherited environment. Nothing below reads
+ * process.env, so PATH, PATHEXT, GIT_EXEC_PATH, ProgramFiles, SystemRoot, HOME,
+ * USERPROFILE, APPDATA, npm_config_git and every other inherited value are
+ * irrelevant; no shell, `where.exe` or other locator participates; there is no
+ * bare-name fallback; and nothing is ever executed in order to identify it.
+ *
+ * FOURTH CORRECTION. The previous implementation validated a candidate only as
+ * absolute + `.exe` + existing + regular file, so an otherwise-valid executable
+ * OUTSIDE every approved installation path was accepted. Reproduced against the
+ * committed 5aea53d bytes: a disposable Node image named `unapproved-git.exe`
+ * under TEMP, an unapproved file named exactly `git.exe` under a `Git-Evil`
+ * sibling directory, and a plain unapproved `.exe` were ALL accepted and
+ * returned as trusted Git.
+ *
+ * Approval is now an explicit property of the FULL path. TRUSTED_GIT_ALLOWLIST
+ * is built once, frozen, and never exported; `selectTrustedGit()` takes no
+ * arguments and enumerates only that list; and the validation helper closes
+ * over it rather than accepting one. Membership is an EXACT normalized
+ * full-path comparison — never a substring, prefix, suffix, parent-directory,
+ * basename-only or "endsWith .exe" test — so a sibling installation directory,
+ * a path that merely contains an approved path as a prefix, a TEMP or
+ * user-profile location, a renamed executable, and any hardlink, copy, symlink
+ * or junction alias with identical content are all rejected because the path
+ * they present is unapproved. Existence, regular-file status, `.exe` and the
+ * exact basename remain necessary AFTER membership; they never substitute for
+ * it. Resolution fails closed.
  */
-const TRUSTED_GIT_WINDOWS_RELATIVE = [
+const TRUSTED_GIT_WINDOWS_RELATIVE = Object.freeze([
   'Program Files/Git/cmd/git.exe',
   'Program Files/Git/bin/git.exe',
   'Program Files/Git/mingw64/bin/git.exe',
   'Program Files (x86)/Git/cmd/git.exe',
   'Program Files (x86)/Git/bin/git.exe',
-];
+]);
 
-const TRUSTED_GIT_POSIX_ABSOLUTE = ['/usr/bin/git', '/usr/local/bin/git', '/bin/git', '/opt/homebrew/bin/git'];
+const TRUSTED_GIT_POSIX_ABSOLUTE = Object.freeze([
+  '/usr/bin/git',
+  '/usr/local/bin/git',
+  '/bin/git',
+  '/opt/homebrew/bin/git',
+]);
 
-const trustedGitCandidates = (): string[] => {
+/*
+ * The drive roots are a literal system-drive entry plus the ROOT of the running
+ * interpreter's own absolute location, which the runtime supplies rather than
+ * the caller. The allowlist is exactly the intended protected installation
+ * paths — it is never broadened to temp, user-profile, project, Node or
+ * arbitrary filesystem locations.
+ */
+const buildTrustedGitAllowlist = (): readonly string[] => {
   if (process.platform !== 'win32') {
-    return [...TRUSTED_GIT_POSIX_ABSOLUTE];
+    return Object.freeze([...TRUSTED_GIT_POSIX_ABSOLUTE]);
   }
 
   const roots = new Set<string>(['C:\\']);
@@ -100,45 +129,142 @@ const trustedGitCandidates = (): string[] => {
     roots.add(interpreterRoot);
   }
 
-  return [...roots].flatMap((root) => TRUSTED_GIT_WINDOWS_RELATIVE.map((relative) => join(root, relative)));
+  return Object.freeze(
+    [...roots].flatMap((root) => TRUSTED_GIT_WINDOWS_RELATIVE.map((relative) => join(root, relative))),
+  );
 };
 
-/** Validates an allowlist and returns the first approved absolute executable. */
-const selectTrustedGit = (candidates: string[]): string => {
-  const rejected: string[] = [];
+/** The immutable, internally defined set of approved Git executables. */
+const TRUSTED_GIT_ALLOWLIST = buildTrustedGitAllowlist();
 
-  for (const candidate of candidates) {
-    if (!isAbsolute(candidate)) {
-      rejected.push(`${candidate} (not an absolute path)`);
-      continue;
+const TRUSTED_GIT_BASENAME = process.platform === 'win32' ? 'git.exe' : 'git';
+
+/**
+ * Safe lexical normalization for EXACT full-path comparison. Exactly ONE
+ * spelling is deliberately supported per platform: on Windows a plain
+ * drive-letter path using backslash separators, on POSIX a plain `/` path.
+ * Everything else — device paths (\\?\, \\.\), UNC, forward-slash spellings on
+ * Windows, alternate data streams, `.`/`..` traversal, empty or doubled
+ * separators, trailing separators, and segments with trailing dots or spaces
+ * that Windows would silently strip — normalizes to null and can therefore
+ * never become approved. Normalization never rewrites a path into membership:
+ * a candidate must ALREADY be canonical.
+ */
+const normalizeTrustedGitPath = (candidate: unknown): string | null => {
+  if (typeof candidate !== 'string' || candidate === '' || candidate.includes('\0')) {
+    return null;
+  }
+
+  if (process.platform !== 'win32') {
+    if (!candidate.startsWith('/') || candidate.includes('\\')) {
+      return null;
     }
 
-    if (process.platform === 'win32' && !candidate.toLowerCase().endsWith('.exe')) {
-      rejected.push(`${candidate} (not an explicit .exe)`);
-      continue;
-    }
+    const segments = candidate.split('/').slice(1);
 
-    let regularFile = false;
-
-    try {
-      regularFile = statSync(candidate).isFile();
-    } catch {
-      rejected.push(`${candidate} (absent)`);
-      continue;
-    }
-
-    if (!regularFile) {
-      rejected.push(`${candidate} (not a regular file)`);
-      continue;
+    if (segments.length === 0 || segments.some((s) => s === '' || s === '.' || s === '..')) {
+      return null;
     }
 
     return candidate;
   }
 
-  throw new Error(`no trusted Git executable found; rejected ${rejected.length} candidate(s): ${rejected.join(', ')}`);
+  if (!/^[A-Za-z]:\\(?:[^\\/:*?"<>|\r\n]+\\)*[^\\/:*?"<>|\r\n]+$/.test(candidate)) {
+    return null;
+  }
+
+  const segments = candidate.split('\\').slice(1);
+
+  if (segments.some((s) => s === '.' || s === '..' || s.endsWith('.') || s.trimEnd() !== s)) {
+    return null;
+  }
+
+  return candidate;
 };
 
-const resolveTrustedGit = (): string => selectTrustedGit(trustedGitCandidates());
+/**
+ * The single approval decision. Closes over TRUSTED_GIT_ALLOWLIST: it accepts
+ * NO allowlist argument and reads NO environment, so no caller, test or
+ * environment value can widen approval.
+ */
+const trustedGitApproval = (candidate: unknown): { approved: string } | { rejected: string } => {
+  const normalized = normalizeTrustedGitPath(candidate);
+
+  if (normalized === null) {
+    return { rejected: 'not a supported absolute path spelling' };
+  }
+
+  const sameName = (a: string, b: string) =>
+    process.platform === 'win32' ? a.toLowerCase() === b.toLowerCase() : a === b;
+
+  if (!isAbsolute(normalized)) {
+    return { rejected: 'not an absolute path' };
+  }
+
+  if (!sameName(basename(normalized), TRUSTED_GIT_BASENAME)) {
+    return { rejected: `basename is not ${TRUSTED_GIT_BASENAME}` };
+  }
+
+  if (process.platform === 'win32' && !normalized.toLowerCase().endsWith('.exe')) {
+    return { rejected: 'not an explicit .exe' };
+  }
+
+  // EXACT full-path membership. Never substring, prefix, suffix or basename.
+  if (!TRUSTED_GIT_ALLOWLIST.some((approved) => sameName(approved, normalized))) {
+    return { rejected: 'not a member of the approved Git installation allowlist' };
+  }
+
+  let regularFile = false;
+
+  try {
+    regularFile = statSync(normalized).isFile();
+  } catch {
+    return { rejected: 'absent' };
+  }
+
+  if (!regularFile) {
+    return { rejected: 'not a regular file' };
+  }
+
+  return { approved: normalized };
+};
+
+/** Validates ONE candidate. Never executes it; never widens the allowlist. */
+const validateTrustedGitCandidate = (candidate: unknown): string => {
+  const verdict = trustedGitApproval(candidate);
+
+  if ('rejected' in verdict) {
+    const shown = typeof candidate === 'string' ? candidate : `<${typeof candidate}>`;
+    throw new Error(`unapproved Git executable (${verdict.rejected}): ${shown}`);
+  }
+
+  return verdict.approved;
+};
+
+/**
+ * Production resolution. Takes NO parameters and enumerates ONLY the internal
+ * allowlist, so an arbitrary candidate or candidate array passed by a caller is
+ * ignored by the language and can never redirect selection.
+ */
+const selectTrustedGit = (): string => {
+  const rejected: string[] = [];
+
+  for (const approved of TRUSTED_GIT_ALLOWLIST) {
+    const verdict = trustedGitApproval(approved);
+
+    if ('approved' in verdict) {
+      return verdict.approved;
+    }
+
+    rejected.push(`${approved} (${verdict.rejected})`);
+  }
+
+  throw new Error(
+    `no trusted Git executable found; rejected ${rejected.length} approved path(s): ${rejected.join(', ')}`,
+  );
+};
+
+const resolveTrustedGit = (): string => selectTrustedGit();
 
 /** The single absolute executable EVERY Git invocation in this file uses. */
 const TRUSTED_GIT = resolveTrustedGit();
@@ -1446,43 +1572,58 @@ describe('R15.6.5 diagnostic 28 — static contract', () => {
      */
     expect(isAbsolute(TRUSTED_GIT), 'H: the trusted Git path is absolute').toBe(true);
     expect(statSync(TRUSTED_GIT).isFile(), 'H: the trusted Git path is a regular file').toBe(true);
+    expect(TRUSTED_GIT_ALLOWLIST.includes(TRUSTED_GIT), 'H: the resolved path is an approved entry').toBe(true);
     expect(
-      trustedGitCandidates().every((c) => isAbsolute(c)),
-      'H: every candidate is absolute',
+      TRUSTED_GIT_ALLOWLIST.every((c) => isAbsolute(c)),
+      'H: every approved path is absolute',
     ).toBe(true);
     expect(
-      trustedGitCandidates().some((c) => c === 'git' || c === 'git.exe'),
-      'H: no bare-name candidate exists',
+      TRUSTED_GIT_ALLOWLIST.some((c) => c === 'git' || c === 'git.exe'),
+      'H: no bare-name approved path exists',
     ).toBe(false);
 
     if (process.platform === 'win32') {
       expect(TRUSTED_GIT.toLowerCase().endsWith('.exe'), 'H: an explicit .exe name on Windows').toBe(true);
       expect(
-        trustedGitCandidates().every((c) => c.toLowerCase().endsWith('.exe')),
-        'H: every Windows candidate names an .exe',
+        TRUSTED_GIT_ALLOWLIST.every((c) => c.toLowerCase().endsWith('.exe')),
+        'H: every approved Windows path names an .exe',
       ).toBe(true);
     }
 
     // Resolution reads no environment at all, and uses no PATH-based locator.
-    const resolverSource = `${String(trustedGitCandidates)}\n${String(selectTrustedGit)}\n${String(resolveTrustedGit)}`;
+    const resolverSource = [
+      String(buildTrustedGitAllowlist),
+      String(normalizeTrustedGitPath),
+      String(trustedGitApproval),
+      String(validateTrustedGitCandidate),
+      String(selectTrustedGit),
+      String(resolveTrustedGit),
+    ].join('\n');
     expect(resolverSource, 'H: resolution never reads process.env').not.toMatch(/process\.env/);
     expect(resolverSource, 'H: resolution uses no PATH-based locator').not.toMatch(
       /where\.exe|Get-Command|PATHEXT|execFileSync|spawn|delimiter/,
     );
 
-    // Fail-closed: nothing unapproved, relative, missing or non-file resolves.
-    expect(() => selectTrustedGit([]), 'H: an empty allowlist fails closed').toThrow(/no trusted Git executable/);
-    expect(() => selectTrustedGit(['git']), 'H: a bare name fails closed').toThrow(/no trusted Git executable/);
-    expect(() => selectTrustedGit(['git.exe']), 'H: a bare .exe name fails closed').toThrow(
-      /no trusted Git executable/,
+    // Fail-closed: nothing bare, relative, missing, non-file or empty validates.
+    const failsClosed: Array<[string, unknown]> = [
+      ['a bare name', 'git'],
+      ['a bare .exe name', 'git.exe'],
+      ['a relative path', './git.exe'],
+      ['a missing approved-shaped path', join(REPO, 'no-such-git.exe')],
+      ['a directory', join(REPO, 'app')],
+      ['an empty string', ''],
+    ];
+
+    for (const [label, candidate] of failsClosed) {
+      expect(() => validateTrustedGitCandidate(candidate), `H: ${label} fails closed`).toThrow(
+        /unapproved Git executable/,
+      );
+    }
+
+    // Exhausting the allowlist is the only fail-closed exit, and it exists.
+    expect(String(selectTrustedGit), 'H: the resolver has a fail-closed exit').toMatch(
+      /no trusted Git executable found/,
     );
-    expect(() => selectTrustedGit(['./git.exe']), 'H: a relative path fails closed').toThrow(
-      /no trusted Git executable/,
-    );
-    expect(() => selectTrustedGit([join(REPO, 'no-such-git.exe')]), 'H: a missing candidate fails closed').toThrow(
-      /no trusted Git executable/,
-    );
-    expect(() => selectTrustedGit([REPO]), 'H: a directory fails closed').toThrow(/no trusted Git executable/);
 
     /*
      * P2 (second correction) — STRICT VALUE ALLOWLIST, by direct fault injection.
@@ -2369,6 +2510,338 @@ describe('R15.6.5 diagnostic 28 — static contract', () => {
       const window = exec.slice(Math.max(0, m.index! - 200), m.index! + 200);
       expect(window).not.toMatch(/pg_has_role|has_schema_privilege|has_table_privilege|reaches|usable|settable/i);
     }
+  });
+});
+
+// ─── trusted-Git allowlist enforcement (R15.6 fourth correction) ─────────────
+
+/*
+ * The third correction resolved Git to an absolute path but approved a
+ * candidate on shape alone — absolute + `.exe` + existing + regular file — so
+ * any otherwise-valid executable OUTSIDE the approved installation paths was
+ * accepted. These controls prove approval is now EXACT membership in the
+ * immutable internal allowlist, and that nothing an attacker or a caller can
+ * present widens it.
+ *
+ * Every unapproved image below is a real executable (the running interpreter,
+ * placed or hardlinked under a disposable root). None of them is ever executed:
+ * validation rejects on the presented PATH, before any spawn.
+ */
+describe('R15.6.4 diagnostic 28 — trusted Git allowlist enforcement', () => {
+  let root = '';
+  let unapprovedGit = '';
+  let evilSiblingGit = '';
+  let plainExe = '';
+  let renamedExe = '';
+  let profileGit = '';
+  let sentinel = '';
+
+  const plantAlias = (target: string) => {
+    try {
+      linkSync(unapprovedGit, target);
+    } catch {
+      copyFileSync(unapprovedGit, target);
+    }
+  };
+
+  beforeAll(() => {
+    root = createHermeticRoot('allowlist-');
+    sentinel = join(root, 'UNAPPROVED_GIT_EXECUTED');
+
+    // One real executable image; every other alias is a hardlink to it.
+    unapprovedGit = join(root, 'unapproved-git.exe');
+
+    try {
+      linkSync(process.execPath, unapprovedGit);
+    } catch {
+      copyFileSync(process.execPath, unapprovedGit);
+    }
+
+    const evilDir = join(root, 'Program Files', 'Git-Evil', 'cmd');
+    mkdirSync(evilDir, { recursive: true });
+    evilSiblingGit = join(evilDir, 'git.exe');
+    plantAlias(evilSiblingGit);
+
+    plainExe = join(root, 'anything.exe');
+    plantAlias(plainExe);
+
+    renamedExe = join(root, 'node-renamed.exe');
+    plantAlias(renamedExe);
+
+    const profileDir = join(root, 'user-profile', 'AppData', 'Local', 'Temp');
+    mkdirSync(profileDir, { recursive: true });
+    profileGit = join(profileDir, 'git.exe');
+    plantAlias(profileGit);
+  });
+
+  afterAll(() => {
+    if (root !== '') {
+      rmSync(root, { recursive: true, force: true });
+      expect(existsSync(root), 'allowlist fixture root removed').toBe(false);
+    }
+  });
+
+  it('a1 — the approved Git executable resolves and is an immutable allowlist member', () => {
+    expect(isAbsolute(TRUSTED_GIT), 'absolute').toBe(true);
+    expect(basename(TRUSTED_GIT).toLowerCase(), 'basename is exactly git.exe').toBe(TRUSTED_GIT_BASENAME);
+    expect(statSync(TRUSTED_GIT).isFile(), 'a regular file').toBe(true);
+    expect(TRUSTED_GIT_ALLOWLIST.includes(TRUSTED_GIT), 'an approved allowlist entry').toBe(true);
+    expect(selectTrustedGit(), 'resolution is stable').toBe(TRUSTED_GIT);
+    expect(validateTrustedGitCandidate(TRUSTED_GIT), 'the approved path validates to itself').toBe(TRUSTED_GIT);
+
+    // The allowlist is exactly the intended protected installation paths.
+    for (const approved of TRUSTED_GIT_ALLOWLIST) {
+      expect(approved, 'no temp/profile/project/Node location is approved').not.toMatch(
+        /\\Temp\\|\\AppData\\|\\Users\\|node_modules|\\nodejs\\/i,
+      );
+      expect(basename(approved).toLowerCase(), 'every approved entry is named git.exe').toBe(TRUSTED_GIT_BASENAME);
+    }
+
+    /*
+     * Approved-but-absent entries are skipped, never accepted — the fail-closed
+     * loop this machine actually exercises.
+     */
+    const absent = TRUSTED_GIT_ALLOWLIST.filter((p) => !existsSync(p));
+
+    for (const p of absent) {
+      expect(() => validateTrustedGitCandidate(p), `${p} is approved but absent`).toThrow(/absent/);
+    }
+  });
+
+  it('a2 — every matcher Git invocation uses exactly that resolved executable', () => {
+    const source = readFileSync(fileURLToPath(import.meta.url), 'utf8');
+    const invocations = source.match(/execFileSync\(\s*([A-Za-z_$][\w$]*|'[^']*'|"[^"]*"|`[^`]*`)/g) ?? [];
+    const gitInvocations = invocations.filter((m) => !m.includes('PSQL'));
+
+    expect(gitInvocations.length, 'three Git call sites').toBeGreaterThanOrEqual(3);
+
+    for (const invocation of gitInvocations) {
+      expect(invocation, 'every Git call uses TRUSTED_GIT').toMatch(/execFileSync\(\s*TRUSTED_GIT/);
+    }
+    expect(source, 'no bare git invocation remains').not.toMatch(/execFileSync\(\s*['"`]git(\.exe)?['"`]/);
+  });
+
+  it('a3 — an absolute, existing, regular .exe outside the allowlist fails closed', () => {
+    expect(isAbsolute(plainExe), 'absolute').toBe(true);
+    expect(statSync(plainExe).isFile(), 'existing regular file').toBe(true);
+    expect(plainExe.toLowerCase().endsWith('.exe'), 'named .exe').toBe(true);
+    expect(TRUSTED_GIT_ALLOWLIST.includes(plainExe), 'outside the allowlist').toBe(false);
+    expect(() => validateTrustedGitCandidate(plainExe), 'rejected on membership').toThrow(
+      /not a member of the approved Git installation allowlist|basename is not/,
+    );
+  });
+
+  it('a4 — a disposable hardlink named unapproved-git.exe fails closed', () => {
+    expect(isAbsolute(unapprovedGit), 'absolute').toBe(true);
+    expect(statSync(unapprovedGit).isFile(), 'existing regular file').toBe(true);
+    expect(statSync(unapprovedGit).size, 'a genuine executable image').toBe(statSync(process.execPath).size);
+    expect(() => validateTrustedGitCandidate(unapprovedGit), 'rejected despite being valid in every other way').toThrow(
+      /unapproved Git executable/,
+    );
+    expect(existsSync(sentinel), 'nothing was executed').toBe(false);
+  });
+
+  it('a5 — an unapproved file named exactly git.exe fails closed', () => {
+    for (const candidate of [evilSiblingGit, profileGit]) {
+      expect(basename(candidate).toLowerCase(), 'named exactly git.exe').toBe('git.exe');
+      expect(statSync(candidate).isFile(), 'existing regular file').toBe(true);
+      expect(() => validateTrustedGitCandidate(candidate), `${candidate} rejected`).toThrow(
+        /not a member of the approved Git installation allowlist/,
+      );
+    }
+  });
+
+  it('a6 — lookalike, prefix, sibling, renamed and identical-content paths all fail closed', () => {
+    const approved = TRUSTED_GIT;
+    const lookalikes: Array<[string, string]> = [
+      ['sibling installation directory', approved.replace(/\\Git\\/, '\\Git-Evil\\')],
+      ['approved path used only as a prefix', `${approved}.evil.exe`],
+      ['approved directory prefix plus a deeper path', join(dirname(approved), 'nested', 'git.exe')],
+      ['parent directory of an approved path', dirname(approved)],
+      ['renamed executable', renamedExe],
+      ['identical-content alias outside the allowlist', unapprovedGit],
+      ['user-profile location', profileGit],
+      ['sibling with an approved basename', evilSiblingGit],
+    ];
+
+    for (const [label, candidate] of lookalikes) {
+      expect(() => validateTrustedGitCandidate(candidate), `${label}: ${candidate}`).toThrow(
+        /unapproved Git executable/,
+      );
+    }
+
+    // Identical content is explicitly NOT a reason to approve.
+    expect(statSync(unapprovedGit).size, 'the alias really is the same image').toBe(statSync(process.execPath).size);
+  });
+
+  it('a7 — empty, bare, relative, missing, directory and non-.exe candidates fail closed', () => {
+    const negatives: Array<[string, unknown]> = [
+      ['empty string', ''],
+      ['bare name', 'git'],
+      ['bare git.exe', 'git.exe'],
+      ['relative path', './git.exe'],
+      ['parent-relative path', '..\\git.exe'],
+      ['missing approved-shaped path', join(root, 'nope', 'git.exe')],
+      ['existing directory', root],
+      ['non-.exe candidate', join(root, 'unapproved-git.txt')],
+      ['non-string', 42],
+      ['null', null],
+      ['undefined', undefined],
+    ];
+
+    for (const [label, candidate] of negatives) {
+      expect(() => validateTrustedGitCandidate(candidate), label).toThrow(/unapproved Git executable/);
+    }
+  });
+
+  it('a8 — casing is tolerated, but no normalization turns an outside path into a member', () => {
+    /*
+     * A legitimate Windows casing variation of an approved path resolves to the
+     * same approved entry.
+     */
+    expect(validateTrustedGitCandidate(TRUSTED_GIT.toUpperCase()), 'upper-case approved path').toBe(
+      TRUSTED_GIT.toUpperCase(),
+    );
+    expect(validateTrustedGitCandidate(TRUSTED_GIT.toLowerCase()), 'lower-case approved path').toBe(
+      TRUSTED_GIT.toLowerCase(),
+    );
+
+    /*
+     * Dot segments, separator games, device paths, UNC, streams and trailing
+     * dots/spaces are all rejected outright — never normalized into membership.
+     */
+    const spellings = [
+      TRUSTED_GIT.replace(/\\/g, '/'),
+      TRUSTED_GIT.replace('\\Git\\', '\\Git\\.\\'),
+
+      /*
+       * Built by raw concatenation, never path.join: join() would collapse the
+       * traversal into the canonical approved path before validation saw it,
+       * which proves nothing. The validator must see the `..` itself.
+       */
+      `${dirname(dirname(TRUSTED_GIT))}\\cmd\\..\\cmd\\git.exe`,
+      `${dirname(TRUSTED_GIT)}\\..\\cmd\\git.exe`,
+      `${dirname(TRUSTED_GIT)}\\.\\git.exe`,
+      `\\\\?\\${TRUSTED_GIT}`,
+      `\\\\.\\${TRUSTED_GIT}`,
+      `\\\\localhost\\c$\\Program Files\\Git\\cmd\\git.exe`,
+      `${TRUSTED_GIT}:evil`,
+      `${TRUSTED_GIT}.`,
+      `${TRUSTED_GIT} `,
+      `${TRUSTED_GIT}\\`,
+      TRUSTED_GIT.replace('\\cmd\\', '\\\\cmd\\'),
+    ];
+
+    for (const spelling of spellings) {
+      expect(() => validateTrustedGitCandidate(spelling), `spelling rejected: ${JSON.stringify(spelling)}`).toThrow(
+        /unapproved Git executable/,
+      );
+    }
+
+    // Normalization is not a rewriter: it only ever returns the input unchanged.
+    expect(normalizeTrustedGitPath(TRUSTED_GIT), 'canonical input passes through').toBe(TRUSTED_GIT);
+    expect(normalizeTrustedGitPath(`${TRUSTED_GIT}\\`), 'trailing separator is not repaired').toBeNull();
+    expect(normalizeTrustedGitPath(unapprovedGit), 'a canonical outside path is still canonical').toBe(unapprovedGit);
+  });
+
+  it('a9 — no seam widens approval: arguments, arrays, mutation or environment', () => {
+    expect(selectTrustedGit.length, 'the resolver declares no parameters').toBe(0);
+
+    const widened = selectTrustedGit as unknown as (...args: unknown[]) => string;
+    expect(widened(unapprovedGit), 'a string argument is ignored').toBe(TRUSTED_GIT);
+    expect(widened([unapprovedGit]), 'an array argument is ignored').toBe(TRUSTED_GIT);
+    expect(widened([unapprovedGit, evilSiblingGit], unapprovedGit), 'extra arguments are ignored').toBe(TRUSTED_GIT);
+    expect(resolveTrustedGit(), 'resolveTrustedGit takes no candidate either').toBe(TRUSTED_GIT);
+    expect(resolveTrustedGit.length, 'resolveTrustedGit declares no parameters').toBe(0);
+
+    // The allowlist itself is frozen and cannot be extended.
+    expect(Object.isFrozen(TRUSTED_GIT_ALLOWLIST), 'the allowlist is frozen').toBe(true);
+    expect(Object.isFrozen(TRUSTED_GIT_WINDOWS_RELATIVE), 'the Windows entries are frozen').toBe(true);
+    expect(Object.isFrozen(TRUSTED_GIT_POSIX_ABSOLUTE), 'the POSIX entries are frozen').toBe(true);
+
+    const before = [...TRUSTED_GIT_ALLOWLIST];
+    expect(() => (TRUSTED_GIT_ALLOWLIST as string[]).push(unapprovedGit), 'push is refused').toThrow(TypeError);
+    expect(() => ((TRUSTED_GIT_ALLOWLIST as string[])[0] = unapprovedGit), 'assignment is refused').toThrow(TypeError);
+    expect([...TRUSTED_GIT_ALLOWLIST], 'the allowlist is unchanged').toEqual(before);
+    expect(() => validateTrustedGitCandidate(unapprovedGit), 'still unapproved after the attempts').toThrow(
+      /unapproved Git executable/,
+    );
+
+    // No environment value can add an approved path.
+    const hostile: Record<string, string | undefined> = {
+      PATH: dirname(unapprovedGit),
+      GIT_EXEC_PATH: dirname(unapprovedGit),
+      PATHEXT: '.EXE',
+      ProgramFiles: dirname(unapprovedGit),
+      ProgramW6432: dirname(unapprovedGit),
+      SystemRoot: dirname(unapprovedGit),
+      HOME: dirname(unapprovedGit),
+      USERPROFILE: dirname(unapprovedGit),
+      APPDATA: dirname(unapprovedGit),
+      LOCALAPPDATA: dirname(unapprovedGit),
+      TEMP: dirname(unapprovedGit),
+      TMP: dirname(unapprovedGit),
+      npm_config_git: unapprovedGit,
+      GIT_TRUSTED_EXECUTABLE: unapprovedGit,
+    };
+    const saved = new Map<string, string | undefined>();
+
+    for (const key of Object.keys(hostile)) {
+      saved.set(key, process.env[key]);
+    }
+
+    try {
+      Object.assign(process.env, hostile);
+      expect(selectTrustedGit(), 'resolution is unmoved by the environment').toBe(TRUSTED_GIT);
+      expect(buildTrustedGitAllowlist(), 'the allowlist is unmoved by the environment').toEqual(before);
+      expect(() => validateTrustedGitCandidate(unapprovedGit), 'still unapproved').toThrow(/unapproved Git executable/);
+    } finally {
+      for (const [key, value] of saved) {
+        if (value === undefined) {
+          delete process.env[key];
+        } else {
+          process.env[key] = value;
+        }
+      }
+    }
+  });
+
+  it('a10 — a sentinel-capable unapproved executable is rejected before execution', () => {
+    /*
+     * The planted image is the running interpreter, so it can run and can drop
+     * a sentinel; a --require hook is staged so it would.
+     */
+    const hook = join(root, 'sentinel-hook.cjs');
+    writeFileSync(hook, `require('node:fs').writeFileSync(${JSON.stringify(sentinel)}, 'ran\\n');\n`, 'utf8');
+
+    expect(statSync(unapprovedGit).size, 'genuinely executable').toBe(statSync(process.execPath).size);
+    expect(existsSync(hook), 'the sentinel hook is staged').toBe(true);
+
+    const savedOptions = process.env.NODE_OPTIONS;
+
+    try {
+      process.env.NODE_OPTIONS = `--require ${JSON.stringify(hook)}`;
+
+      for (const candidate of [unapprovedGit, evilSiblingGit, profileGit, plainExe, renamedExe]) {
+        expect(() => validateTrustedGitCandidate(candidate), `${candidate} rejected`).toThrow(
+          /unapproved Git executable/,
+        );
+      }
+
+      expect(selectTrustedGit(), 'resolution still returns the approved executable').toBe(TRUSTED_GIT);
+    } finally {
+      if (savedOptions === undefined) {
+        delete process.env.NODE_OPTIONS;
+      } else {
+        process.env.NODE_OPTIONS = savedOptions;
+      }
+    }
+
+    expect(existsSync(sentinel), 'no unapproved executable ever ran').toBe(false);
+
+    // Rejection happens on the path, so nothing is ever spawned to identify it.
+    const approvalSource = [String(normalizeTrustedGitPath), String(trustedGitApproval)].join('\n');
+    expect(approvalSource, 'approval never spawns a process').not.toMatch(/execFileSync|execSync|spawn|exec\(/);
   });
 });
 
