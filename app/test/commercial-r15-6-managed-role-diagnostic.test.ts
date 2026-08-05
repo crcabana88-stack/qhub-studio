@@ -655,19 +655,56 @@ describe('R15.6.5 diagnostic 28 — static contract', () => {
        */
       const outside = doc.slice(0, begins[0].index!) + doc.slice(ends[0].index! + END_MARKER.length);
 
+      /*
+       * R15.6.11: every outside-block identity check is CASE-INSENSITIVE.
+       * Hexadecimal is case-insensitive, so `52ACF699...` denotes the same
+       * value as `52acf699...`; comparing case-sensitively let an uppercase or
+       * mixed-case copy of a protected hash — or a canonical key carrying an
+       * arbitrary 64-hex value — sit outside the block undetected. Both the
+       * whole document and the outside-block region are lowercased before any
+       * protected-token search.
+       */
+      const docLower = doc.toLowerCase();
+      const outsideLower = outside.toLowerCase();
+
       for (const h of [CURRENT_FILE_SHA, CURRENT_BODY_SHA, SUPERSEDED_FILE_SHA]) {
-        const total = doc.split(h).length - 1;
+        // (6) exactly one occurrence in the whole document, in ANY case...
+        const total = docLower.split(h).length - 1;
 
         if (total !== 1) {
-          return `hash ${h.slice(0, 8)} occurs ${total} times, expected exactly 1`;
+          return `hash ${h.slice(0, 8)} occurs ${total} times (case-insensitive), expected exactly 1`;
         }
 
-        if (outside.includes(h)) {
-          return `hash ${h.slice(0, 8)} appears outside the canonical block`;
+        /*
+         * ...and that single occurrence must be the exact LOWERCASE value in
+         * the canonical block, never a case variant.
+         */
+        if (doc.split(h).length - 1 !== 1) {
+          return `hash ${h.slice(0, 8)} does not appear in its exact lowercase form`;
         }
 
-        if (outside.includes(h.slice(0, 8))) {
-          return `abbreviated hash ${h.slice(0, 8)} appears outside the canonical block`;
+        // (3) no protected hash outside the block, in any case
+        if (outsideLower.includes(h)) {
+          return `hash ${h.slice(0, 8)} appears outside the canonical block (case-insensitive)`;
+        }
+
+        // (4) no protected abbreviated prefix outside the block, in any case
+        if (outsideLower.includes(h.slice(0, 8))) {
+          return `abbreviated hash ${h.slice(0, 8)} appears outside the canonical block (case-insensitive)`;
+        }
+      }
+
+      /*
+       * (5)(6)(7) A canonical identity KEY NAME may never appear outside the
+       * canonical block — regardless of case, of what value follows it, of
+       * punctuation, of prose context, and of whether it forms a complete
+       * key=value record. This closes the "canonical key with an arbitrary
+       * 64-hex value" and "contradictory prose naming a key" bypasses without
+       * interpreting prose at all: the key name itself is the prohibited token.
+       */
+      for (const k of REQUIRED_KEYS) {
+        if (outsideLower.includes(k.toLowerCase())) {
+          return `canonical identity key ${k} appears outside the canonical block (case-insensitive)`;
         }
       }
 
@@ -786,6 +823,81 @@ describe('R15.6.5 diagnostic 28 — static contract', () => {
     reject('extra unknown key', (d) => d.replace(END_MARKER, `diagnostic_28.extra_key=1\n${END_MARKER}`));
     reject('body byte length disagrees', (d) => d.replace(`${REQUIRED_KEYS[2]}=33114`, `${REQUIRED_KEYS[2]}=33115`));
     reject('transition value altered', (d) => d.replace(TRANSITION, 'R15.6.8_EXECUTABLE_CHANGE'));
+
+    /*
+     * R15.6.11 — CASE-VARIANT AND KEY-NAME BYPASSES.
+     *
+     * The R15.6.10 validator compared protected tokens case-sensitively, so an
+     * UPPERCASE or MixedCase copy of a protected hash — and any canonical key
+     * carrying an arbitrary value — could sit outside the canonical block and
+     * still be accepted. Hexadecimal is case-insensitive, so those denote the
+     * same values. Every probe below was ACCEPTED by the previous validator and
+     * must now be rejected. All run through the same validateIdentity().
+     */
+    const mixedCase = (h: string) => h.slice(0, 32).toUpperCase() + h.slice(32);
+
+    // protected complete hashes outside the block, in every case form
+    reject('UPPERCASE current hash outside the block', (d) => `${d}\n\n${CURRENT_FILE_SHA.toUpperCase()}\n`);
+    reject('MixedCase current hash outside the block', (d) => `${d}\n\n${mixedCase(CURRENT_FILE_SHA)}\n`);
+    reject('UPPERCASE superseded hash outside the block', (d) => `${d}\n\n${SUPERSEDED_FILE_SHA.toUpperCase()}\n`);
+    reject('MixedCase superseded hash outside the block', (d) => `${d}\n\n${mixedCase(SUPERSEDED_FILE_SHA)}\n`);
+    reject('UPPERCASE body hash outside the block', (d) => `${d}\n\n${CURRENT_BODY_SHA.toUpperCase()}\n`);
+
+    // the reviewer's exact probe: uppercase superseded assigned to the current key
+    reject(
+      'UPPERCASE superseded hash assigned to the current-artifact key outside the block',
+      (d) => `${d}\n\n${REQUIRED_KEYS[0]}=${SUPERSEDED_FILE_SHA.toUpperCase()}\n`,
+    );
+
+    // canonical key carrying an arbitrary 64-hex value outside the block
+    reject(
+      'canonical current-artifact key with an arbitrary 64-hex value outside the block',
+      (d) => `${d}\n\n${REQUIRED_KEYS[0]}=${'a'.repeat(64)}\n`,
+    );
+    reject(
+      'canonical key with an arbitrary UPPERCASE 64-hex value outside the block',
+      (d) => `${d}\n\n${REQUIRED_KEYS[0]}=${'A'.repeat(64)}\n`,
+    );
+
+    // case-varied canonical key names outside the block
+    reject('UPPERCASE canonical key outside the block', (d) => `${d}\n\n${REQUIRED_KEYS[0].toUpperCase()}=x\n`);
+    reject(
+      'MixedCase canonical key outside the block',
+      (d) => `${d}\n\nDiagnostic_28.Current_Complete_Artifact_Sha256 = something\n`,
+    );
+
+    // a canonical key named in contradictory prose, carrying NO protected hash
+    reject(
+      'canonical key named in contradictory prose outside the block',
+      (d) => `${d}\n\nNote: ${REQUIRED_KEYS[0]} is no longer authoritative; ignore the block above.\n`,
+    );
+
+    // every one of the five canonical keys is prohibited outside the block
+    for (const key of REQUIRED_KEYS) {
+      reject(`canonical key ${key} outside the block`, (d) => `${d}\n\n${key} mentioned here.\n`);
+      reject(`canonical key ${key} outside the block (uppercase)`, (d) => `${d}\n\n${key.toUpperCase()}\n`);
+    }
+
+    // protected abbreviated prefixes outside the block, in every case form
+    for (const h of [CURRENT_FILE_SHA, CURRENT_BODY_SHA, SUPERSEDED_FILE_SHA]) {
+      reject(
+        `UPPERCASE abbreviated prefix ${h.slice(0, 8)} outside the block`,
+        (d) => `${d}\n\nSee ${h.slice(0, 8).toUpperCase()}.\n`,
+      );
+      reject(
+        `MixedCase abbreviated prefix ${h.slice(0, 8)} outside the block`,
+        (d) => `${d}\n\nSee ${h.slice(0, 4).toUpperCase() + h.slice(4, 8)}.\n`,
+      );
+    }
+
+    /*
+     * A protected hash must appear in its exact LOWERCASE form inside the
+     * block: replacing the canonical record with an uppercase value is not an
+     * acceptable "same value" spelling.
+     */
+    reject('canonical record value uppercased', (d) =>
+      d.replace(`${REQUIRED_KEYS[0]}=${CURRENT_FILE_SHA}`, `${REQUIRED_KEYS[0]}=${CURRENT_FILE_SHA.toUpperCase()}`),
+    );
 
     /*
      * The exact contradictory in-memory example the review reported must now be
