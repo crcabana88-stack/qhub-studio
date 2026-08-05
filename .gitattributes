@@ -4,6 +4,13 @@
 # copy makes every source file fail lint. Keeping the working tree LF lets the
 # husky pre-commit hook (typecheck + eslint) run cleanly on Windows.
 
+# Keep this policy file byte-stable across Windows and Unix checkouts.
+# Without a rule for itself, core.autocrlf rewrites .gitattributes with CRLF on
+# checkout, so its working-tree bytes stop matching its committed blob even
+# though git reports the tree clean. Declared first, and no later pattern in
+# this file matches '.gitattributes', so nothing can override it.
+.gitattributes text eol=lf
+
 # Source
 *.ts    text eol=lf
 *.tsx   text eol=lf

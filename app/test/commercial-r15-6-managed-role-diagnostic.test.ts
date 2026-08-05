@@ -936,13 +936,81 @@ describe('R15.6.5 diagnostic 28 — static contract', () => {
     expect(activeRuleCount(attrs.replace('*.sql text eol=lf', '# *.sql text eol=lf')), 'commented rule').toBe(0);
     expect(activeRuleCount(attrs.replace('*.sql text eol=lf', '*.sql text eol=crlf')), 'eol=crlf').toBe(0);
 
-    // Git itself must report the effective attributes for the diagnostic.
-    const checkAttr = execFileSync('git', ['check-attr', 'text', 'eol', '--', DIAG], {
-      cwd: REPO,
-      encoding: 'utf8',
-    });
-    expect(checkAttr).toMatch(/text: set/);
-    expect(checkAttr).toMatch(/eol: lf/);
+    /*
+     * R15.6.12 — .gitattributes must pin ITSELF to LF.
+     *
+     * Without a self-rule, core.autocrlf=true rewrites the policy file with
+     * CRLF on checkout, so its working-tree bytes stop matching its committed
+     * blob while git still reports the tree clean. The rule must be ACTIVE: a
+     * commented copy, a prose substring, or eol=crlf must not satisfy it.
+     */
+    const activeSelfRuleCount = (text: string) =>
+      text
+        .split('\n')
+        .map((l) => l.trim())
+        .filter((l) => !l.startsWith('#') && /^\.gitattributes\s+text\s+eol=lf$/.test(l)).length;
+
+    expect(activeSelfRuleCount(attrs), 'exactly one active .gitattributes text eol=lf rule').toBe(1);
+    expect(
+      activeSelfRuleCount(attrs.replace('.gitattributes text eol=lf', '# .gitattributes text eol=lf')),
+      'a commented-out self-rule must be rejected',
+    ).toBe(0);
+    expect(
+      activeSelfRuleCount(attrs.replace('.gitattributes text eol=lf', '.gitattributes text eol=crlf')),
+      'eol=crlf must be rejected',
+    ).toBe(0);
+    expect(
+      activeSelfRuleCount('# see .gitattributes text eol=lf in the policy file\n'),
+      'a prose substring must not satisfy the check',
+    ).toBe(0);
+
+    /*
+     * No LATER active rule may override the self-rule. Every active pattern is
+     * matched against the literal filename; exactly one may match, and it must
+     * be the eol=lf self-rule.
+     */
+    const matchingRules = attrs
+      .split('\n')
+      .map((l) => l.trim())
+      .filter((l) => l !== '' && !l.startsWith('#'))
+      .filter((l) => {
+        const pattern = l.split(/\s+/)[0];
+        const escaped = pattern.replace(/[.+^${}()|[\]\\]/g, '\\$&').replace(/\*/g, '[^/]*');
+
+        return new RegExp(`^${escaped}$`).test('.gitattributes');
+      });
+    expect(matchingRules.length, 'exactly one rule may match .gitattributes').toBe(1);
+    expect(matchingRules[0], 'the sole matching rule pins eol=lf').toMatch(/^\.gitattributes\s+text\s+eol=lf$/);
+
+    // Git itself must report the effective attributes for BOTH protected files.
+    for (const target of [DIAG, `${REPO}.gitattributes`]) {
+      const checkAttr = execFileSync('git', ['check-attr', 'text', 'eol', '--', target], {
+        cwd: REPO,
+        encoding: 'utf8',
+      });
+      expect(checkAttr, `text: set for ${target}`).toMatch(/text: set/);
+      expect(checkAttr, `eol: lf for ${target}`).toMatch(/eol: lf/);
+    }
+
+    /*
+     * And the policy file's RAW working bytes must equal its stored blob — the
+     * invariant this correction restores.
+     *
+     * Asserted as: (a) the working copy contains ZERO carriage returns, and
+     * (b) git records i/lf w/lf with the eol=lf attribute applied. Together
+     * those guarantee raw-byte equality with the stored blob, because git's
+     * clean filter is the identity on LF-only content — so whatever is
+     * committed is byte-for-byte what is on disk. Deliberately NOT phrased as
+     * "no uncommitted difference": that would be circular during the very
+     * change that introduces this rule, and it tests commit state rather than
+     * byte stability.
+     */
+    const attrsBytes = readFileSync(`${REPO}.gitattributes`);
+    expect(attrsBytes.includes(0x0d), '.gitattributes must contain no carriage returns').toBe(false);
+    expect(
+      execFileSync('git', ['ls-files', '--eol', '--', '.gitattributes'], { cwd: REPO, encoding: 'utf8' }),
+      '.gitattributes must be i/lf w/lf with the eol=lf attribute applied',
+    ).toMatch(/i\/lf\s+w\/lf\s+attr\/text eol=lf/);
   });
 
   it('d-doc1 — the analysis states the output bound honestly and never claims density is free', () => {
