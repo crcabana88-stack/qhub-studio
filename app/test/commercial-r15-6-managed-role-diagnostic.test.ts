@@ -967,33 +967,26 @@ describe('R15.6.5 diagnostic 28 — static contract', () => {
     ).toBe(0);
 
     /*
-     * No LATER active rule may override the self-rule.
+     * R15.6 SECOND CORRECTION.
      *
-     * Applicability is decided by GIT, never by a JavaScript approximation of
-     * Git's attribute-pattern semantics. A regex translation silently accepted
-     * a real override written as `[.]gitattributes` and threw on
-     * `?gitattributes`, so it was removed and is not coming back.
+     * P1 — GIT_CONFIG was still inherited. Pointing it at a hostile
+     * configuration made the evaluation repository report an unexpected
+     * core.attributesFile, so a valid candidate THREW. It failed closed, but
+     * caller-controlled configuration still influenced the evaluation, and
+     * with a hostile init.templateDir it broke `git init` outright. Both were
+     * reproduced against the previous commit. GIT_CONFIG is now removed, and
+     * the whole sanitation sweep is CASE-INSENSITIVE so a differently cased
+     * alias (Git_Config, git_config, …) cannot survive in the child
+     * environment object.
      *
-     * R15.6 HERMETICITY: delegating to Git is only sound if Git cannot see any
-     * attribute source except the one under test. It could: an inherited
-     * core.attributesFile containing `.gitattributes qhubprobe0` made a
-     * genuinely non-matching `?notmatching` report as applicable (false
-     * positive), and an inherited init.templateDir seeding
-     * `info/attributes` with `.gitattributes !qhubprobe0` made an exact
-     * `.gitattributes` report as non-matching (false negative). Both were
-     * reproduced before this correction.
-     *
-     * The evaluation environment is therefore fully controlled: an explicitly
-     * empty template, empty global/system config, empty core attributes file
-     * and an isolated XDG config home; every inherited Git variable that can
-     * supply a repository, config, template or attribute source is removed
-     * from the child environment; and after `git init` the generated
-     * repository is INSPECTED to prove no inherited attribute source exists
-     * and that the evaluation file contains exactly the controlled candidates
-     * and unique probes. Collision safety comes from controlling and verifying
-     * every source, not from probe-name entropy.
+     * P2 — the verdict was `value !== 'unspecified'`, so `unset`,
+     * `unexpected-value`, an arbitrary assigned string and an empty value were
+     * all read as APPLICABLE. Every synthetic probe is written as a BARE
+     * attribute, so the only legitimate values are `set` and `unspecified`;
+     * anything else is now an exact-allowlist failure that throws.
      */
     const HERMETIC_GIT_VARS_REMOVED = [
+      'GIT_CONFIG',
       'GIT_DIR',
       'GIT_COMMON_DIR',
       'GIT_WORK_TREE',
@@ -1007,6 +1000,93 @@ describe('R15.6.5 diagnostic 28 — static contract', () => {
       'GIT_CEILING_DIRECTORIES',
       'GIT_NAMESPACE',
     ];
+
+    /** Names this matcher assigns itself; any inherited spelling is dropped first. */
+    const HERMETIC_GIT_VARS_CONTROLLED = [
+      'GIT_CONFIG_GLOBAL',
+      'GIT_CONFIG_SYSTEM',
+      'GIT_CONFIG_NOSYSTEM',
+      'GIT_ATTR_NOSYSTEM',
+      'XDG_CONFIG_HOME',
+      'HOME',
+      'USERPROFILE',
+    ];
+
+    /** `set` / `unspecified` are the ONLY values a bare probe attribute may yield. */
+    const verdictFromCheckAttrValue = (probe: string, value: unknown): boolean => {
+      if (typeof value !== 'string') {
+        throw new Error(`git check-attr returned a non-string value for ${probe}`);
+      }
+
+      if (value === 'set') {
+        return true;
+      }
+
+      if (value === 'unspecified') {
+        return false;
+      }
+
+      throw new Error(`unexpected git check-attr value for ${probe}: ${JSON.stringify(value)}`);
+    };
+
+    /** Structural parse of NUL-delimited `git check-attr -z` output. */
+    const parseCheckAttrZ = (out: string, probes: string[]): Map<string, string> => {
+      const fields = out.split('\0');
+
+      if (fields.length > 0 && fields[fields.length - 1] === '') {
+        fields.pop();
+      }
+
+      if (fields.length !== probes.length * 3) {
+        throw new Error(`git check-attr returned ${fields.length} fields, expected ${probes.length * 3}`);
+      }
+
+      const verdicts = new Map<string, string>();
+
+      for (let i = 0; i < fields.length; i += 3) {
+        const [reportedPath, attr, value] = [fields[i], fields[i + 1], fields[i + 2]];
+
+        if (reportedPath !== '.gitattributes') {
+          throw new Error(`unexpected path in check-attr output: ${reportedPath}`);
+        }
+
+        if (!probes.includes(attr)) {
+          throw new Error(`unexpected attribute in check-attr output: ${attr}`);
+        }
+
+        if (verdicts.has(attr)) {
+          throw new Error(`duplicate check-attr report for ${attr}`);
+        }
+
+        verdicts.set(attr, value);
+      }
+
+      for (const probe of probes) {
+        if (!verdicts.has(probe)) {
+          throw new Error(`git check-attr did not report ${probe}`);
+        }
+      }
+
+      return verdicts;
+    };
+
+    /** Case-insensitive sanitation of an environment object. */
+    const sanitizeGitEnv = (source: NodeJS.ProcessEnv, controlled: Record<string, string>): NodeJS.ProcessEnv => {
+      const env: NodeJS.ProcessEnv = { ...source };
+      const drop = new Set([...HERMETIC_GIT_VARS_REMOVED, ...HERMETIC_GIT_VARS_CONTROLLED].map((n) => n.toUpperCase()));
+
+      for (const key of Object.keys(env)) {
+        const upper = key.toUpperCase();
+
+        if (drop.has(upper) || /^GIT_CONFIG_(KEY|VALUE)_\d+$/.test(upper)) {
+          delete env[key];
+        }
+      }
+
+      Object.assign(env, controlled);
+
+      return env;
+    };
 
     const rulesApplicableToGitattributes = (attrsText: string): string[] => {
       const rules = attrsText
@@ -1042,44 +1122,38 @@ describe('R15.6.5 diagnostic 28 — static contract', () => {
       const root = mkdtempSync(join(tmpdir(), 'qhub-attrprobe-'));
 
       try {
-        // ---- 1. fully controlled evaluation root -------------------------
         const repoDir = join(root, 'repo');
         const emptyTemplate = join(root, 'empty-template');
         const emptyGlobalConfig = join(root, 'empty-global.gitconfig');
         const emptySystemConfig = join(root, 'empty-system.gitconfig');
         const emptyAttributes = join(root, 'empty-attributes');
         const xdgHome = join(root, 'xdg');
+        const isolatedHome = join(root, 'home');
 
         mkdirSync(emptyTemplate);
         mkdirSync(xdgHome);
+        mkdirSync(isolatedHome);
         writeFileSync(emptyGlobalConfig, '', 'utf8');
         writeFileSync(emptySystemConfig, '', 'utf8');
         writeFileSync(emptyAttributes, '', 'utf8');
 
-        // ---- 2. sanitized child environment ------------------------------
-        const env: NodeJS.ProcessEnv = { ...process.env };
+        const env = sanitizeGitEnv(process.env, {
+          GIT_CONFIG_GLOBAL: emptyGlobalConfig,
+          GIT_CONFIG_SYSTEM: emptySystemConfig,
+          GIT_CONFIG_NOSYSTEM: '1',
+          GIT_ATTR_NOSYSTEM: '1',
+          XDG_CONFIG_HOME: xdgHome,
+          HOME: isolatedHome,
+          USERPROFILE: isolatedHome,
+        });
 
-        for (const key of HERMETIC_GIT_VARS_REMOVED) {
-          delete env[key];
-        }
-
-        /*
-         * Environment-injected config (GIT_CONFIG_KEY_<n>/VALUE_<n>) is removed
-         * wholesale; GIT_CONFIG_COUNT above alone would not unset the pairs.
-         */
+        // Nothing named GIT_CONFIG (in any casing) may reach a child process.
         for (const key of Object.keys(env)) {
-          if (/^GIT_CONFIG_(KEY|VALUE)_\d+$/.test(key)) {
-            delete env[key];
+          if (key.toUpperCase() === 'GIT_CONFIG') {
+            throw new Error(`GIT_CONFIG survived sanitation as ${key}`);
           }
         }
 
-        env.GIT_CONFIG_GLOBAL = emptyGlobalConfig;
-        env.GIT_CONFIG_SYSTEM = emptySystemConfig;
-        env.GIT_CONFIG_NOSYSTEM = '1';
-        env.GIT_ATTR_NOSYSTEM = '1';
-        env.XDG_CONFIG_HOME = xdgHome;
-
-        // Command-scoped overrides applied to EVERY git invocation below.
         const scoped = ['-c', `core.attributesFile=${emptyAttributes}`, '-c', 'core.excludesFile='];
         const run = (args: string[], cwd?: string) =>
           execFileSync('git', [...scoped, ...args], {
@@ -1089,10 +1163,8 @@ describe('R15.6.5 diagnostic 28 — static contract', () => {
             timeout: 30_000,
           });
 
-        // ---- 3. init with an EXPLICIT empty template ---------------------
         run(['init', '-q', `--template=${emptyTemplate}`, repoDir]);
 
-        // ---- 5. verify no inherited attribute source reached the repo ----
         const repoInfoAttributes = join(repoDir, '.git', 'info', 'attributes');
 
         if (existsSync(repoInfoAttributes)) {
@@ -1109,15 +1181,13 @@ describe('R15.6.5 diagnostic 28 — static contract', () => {
           throw new Error('the controlled core attributes file is not empty');
         }
 
-        // ---- 6. generate the evaluation source, then prove its contents ---
         const probes = rules.map((_, i) => `qhubprobe${i}`);
 
         if (new Set(probes).size !== probes.length) {
           throw new Error('probe names are not unique');
         }
 
-        const generatedLines = rules.map((r, i) => `${patternOf(r)} ${probes[i]}`);
-        const generated = `${generatedLines.join('\n')}\n`;
+        const generated = `${rules.map((r, i) => `${patternOf(r)} ${probes[i]}`).join('\n')}\n`;
         writeFileSync(join(repoDir, '.gitattributes'), generated, 'utf8');
 
         const readBack = readFileSync(join(repoDir, '.gitattributes'), 'utf8');
@@ -1134,49 +1204,10 @@ describe('R15.6.5 diagnostic 28 — static contract', () => {
           }
         }
 
-        // ---- 7. exact NUL-delimited parsing ------------------------------
-        const out = run(['check-attr', '-z', ...probes, '--', '.gitattributes'], repoDir);
-        const fields = out.split('\0');
+        const verdicts = parseCheckAttrZ(run(['check-attr', '-z', ...probes, '--', '.gitattributes'], repoDir), probes);
 
-        if (fields.length > 0 && fields[fields.length - 1] === '') {
-          fields.pop();
-        }
-
-        if (fields.length !== probes.length * 3) {
-          throw new Error(`git check-attr returned ${fields.length} fields, expected ${probes.length * 3}`);
-        }
-
-        const verdicts = new Map<string, string>();
-
-        for (let i = 0; i < fields.length; i += 3) {
-          const [reportedPath, attr, value] = [fields[i], fields[i + 1], fields[i + 2]];
-
-          if (reportedPath !== '.gitattributes') {
-            throw new Error(`unexpected path in check-attr output: ${reportedPath}`);
-          }
-
-          if (!probes.includes(attr)) {
-            throw new Error(`unexpected attribute in check-attr output: ${attr}`);
-          }
-
-          if (verdicts.has(attr)) {
-            throw new Error(`duplicate check-attr report for ${attr}`);
-          }
-
-          verdicts.set(attr, value);
-        }
-
-        return rules.filter((_, i) => {
-          const value = verdicts.get(probes[i]);
-
-          if (value === undefined) {
-            throw new Error(`git check-attr did not report ${probes[i]}`);
-          }
-
-          return value !== 'unspecified';
-        });
+        return rules.filter((_, i) => verdictFromCheckAttrValue(probes[i], verdicts.get(probes[i])));
       } finally {
-        // ---- 8. cleanup, verified -----------------------------------------
         rmSync(root, { recursive: true, force: true });
 
         if (existsSync(root)) {
@@ -1192,7 +1223,7 @@ describe('R15.6.5 diagnostic 28 — static contract', () => {
     const applies = (rule: string) => rulesApplicableToGitattributes(rule).length === 1;
 
     /*
-     * E — native-Git boundary controls, all preserved.
+     * Native-Git boundary controls — all preserved.
      */
     expect(applies('[.]gitattributes -text eol=crlf'), 'bracket-expression override').toBe(true);
     expect(applies('?gitattributes -text eol=crlf'), 'single-char-wildcard override').toBe(true);
@@ -1212,19 +1243,70 @@ describe('R15.6.5 diagnostic 28 — static contract', () => {
       /malformed \.gitattributes rule \(unterminated quoted pattern\)/,
     );
 
-    // qhubprobe1 vs qhubprobe10 in BOTH orderings — no prefix confusion.
     for (const matchIndex of [1, 10]) {
       const many = Array.from({ length: 12 }, (_, i) =>
         i === matchIndex ? '.gitattributes text' : `nomatch${i} text`,
       ).join('\n');
-      const picked = rulesApplicableToGitattributes(many);
-      expect(picked, `probe collision ordering ${matchIndex}`).toEqual(['.gitattributes text']);
+      expect(rulesApplicableToGitattributes(many), `probe collision ordering ${matchIndex}`).toEqual([
+        '.gitattributes text',
+      ]);
     }
 
     /*
-     * A–D — HOSTILE INHERITED SOURCES. Each installs the reviewer's exact
-     * attack into process.env, evaluates through the real matcher, and restores
-     * the environment in a finally block even if the assertion throws.
+     * P2 — STRICT VALUE ALLOWLIST, by direct fault injection.
+     */
+    expect(verdictFromCheckAttrValue('qhubprobe0', 'set'), 'set => applicable').toBe(true);
+    expect(verdictFromCheckAttrValue('qhubprobe0', 'unspecified'), 'unspecified => not applicable').toBe(false);
+
+    for (const bad of ['unset', 'unexpected-value', 'arbitrary-string', '', ' set', 'set ', 'SET', 'Unspecified']) {
+      expect(() => verdictFromCheckAttrValue('qhubprobe0', bad), `value ${JSON.stringify(bad)} must throw`).toThrow(
+        /unexpected git check-attr value for qhubprobe0/,
+      );
+    }
+
+    expect(() => verdictFromCheckAttrValue('qhubprobe0', undefined), 'missing value must throw').toThrow(
+      /non-string value for qhubprobe0/,
+    );
+
+    // The diagnostic names the probe and the offending value, nothing else.
+    try {
+      verdictFromCheckAttrValue('qhubprobe0', 'unexpected-value');
+      expect.unreachable('should have thrown');
+    } catch (e) {
+      const message = (e as Error).message;
+      expect(message).toContain('qhubprobe0');
+      expect(message).toContain('unexpected-value');
+      expect(message, 'must not leak environment content').not.toMatch(/PATH=|USERPROFILE|APPDATA|GIT_CONFIG/);
+    }
+
+    // Structural fault injection through the real parser.
+    const P = ['qhubprobe0', 'qhubprobe1'];
+    expect(parseCheckAttrZ('.gitattributes\0qhubprobe0\0set\0.gitattributes\0qhubprobe1\0unspecified\0', P).size).toBe(
+      2,
+    );
+    expect(() => parseCheckAttrZ('.gitattributes\0qhubprobe0\0set\0', P), 'missing probe').toThrow(/expected 6/);
+    expect(
+      () => parseCheckAttrZ('.gitattributes\0qhubprobe0\0set\0.gitattributes\0qhubprobe0\0set\0', P),
+      'duplicate probe',
+    ).toThrow(/duplicate check-attr report/);
+    expect(
+      () => parseCheckAttrZ('.gitattributes\0qhubprobe0\0set\0other\0qhubprobe1\0set\0', P),
+      'unexpected path',
+    ).toThrow(/unexpected path/);
+    expect(
+      () => parseCheckAttrZ('.gitattributes\0qhubprobe0\0set\0.gitattributes\0qhubprobe9\0set\0', P),
+      'unknown attribute',
+    ).toThrow(/unexpected attribute/);
+    expect(
+      () => parseCheckAttrZ('.gitattributes\0qhubprobe0\0set\0.gitattributes\0qhubprobe1\0set\0extra\0', P),
+      'extra NUL fields',
+    ).toThrow(/expected 6/);
+    expect(() => parseCheckAttrZ('.gitattributes\0qhubprobe0\0', P), 'malformed triple').toThrow(/expected 6/);
+
+    /*
+     * HOSTILE INHERITED SOURCES. Each installs an attack into process.env,
+     * evaluates through the real matcher, and restores the environment in a
+     * finally block even if the assertion throws.
      */
     const withEnv = (overrides: Record<string, string | undefined>, body: () => void) => {
       const saved = new Map<string, string | undefined>();
@@ -1257,6 +1339,7 @@ describe('R15.6.5 diagnostic 28 — static contract', () => {
     const hostileRoot = mkdtempSync(join(tmpdir(), 'qhub-hostile-'));
 
     try {
+      const posix = (p: string) => p.replace(/\\/g, '/');
       const hostileAttrs = join(hostileRoot, 'hostile-attributes');
       writeFileSync(hostileAttrs, '.gitattributes qhubprobe0\n', 'utf8');
 
@@ -1264,7 +1347,6 @@ describe('R15.6.5 diagnostic 28 — static contract', () => {
       mkdirSync(join(hostileTemplate, 'info'), { recursive: true });
       writeFileSync(join(hostileTemplate, 'info', 'attributes'), '.gitattributes !qhubprobe0\n', 'utf8');
 
-      const posix = (p: string) => p.replace(/\\/g, '/');
       const cfgAttrs = join(hostileRoot, 'hostile-attrs.gitconfig');
       writeFileSync(cfgAttrs, `[core]\n\tattributesFile = ${posix(hostileAttrs)}\n`, 'utf8');
 
@@ -1278,24 +1360,63 @@ describe('R15.6.5 diagnostic 28 — static contract', () => {
         'utf8',
       );
 
-      // A — hostile core.attributesFile must not create a FALSE POSITIVE.
+      const hostileHome = join(hostileRoot, 'hostile-home');
+      mkdirSync(join(hostileHome, 'git'), { recursive: true });
+      writeFileSync(join(hostileHome, '.gitconfig'), `[core]\n\tattributesFile = ${posix(hostileAttrs)}\n`, 'utf8');
+      writeFileSync(join(hostileHome, 'git', 'config'), `[core]\n\tattributesFile = ${posix(hostileAttrs)}\n`, 'utf8');
+      writeFileSync(join(hostileHome, 'git', 'attributes'), '.gitattributes qhubprobe0\n', 'utf8');
+
+      // A — hostile GIT_CONFIG with core.attributesFile: correct verdict, NO throw.
+      withEnv({ GIT_CONFIG: cfgAttrs }, () => {
+        expect(applies('?notmatching -text eol=crlf'), 'A: GIT_CONFIG attributesFile').toBe(false);
+      });
+
+      // B — hostile GIT_CONFIG with init.templateDir.
+      withEnv({ GIT_CONFIG: cfgTemplate }, () => {
+        expect(applies('.gitattributes text eol=lf'), 'B: GIT_CONFIG templateDir').toBe(true);
+      });
+
+      // C — combined hostile GIT_CONFIG.
+      withEnv({ GIT_CONFIG: cfgBoth }, () => {
+        expect(applies('.gitattributes text eol=lf'), 'C: matching').toBe(true);
+        expect(applies('?notmatching -text eol=crlf'), 'C: non-matching').toBe(false);
+        expect(applies('[.]gitattributes -text'), 'C: class match').toBe(true);
+        expect(applies('[x]gitattributes -text'), 'C: class non-match').toBe(false);
+      });
+
+      // D — case-varied GIT_CONFIG spellings must not survive sanitation.
+      for (const spelling of ['Git_Config', 'git_config', 'gIt_CoNfIg']) {
+        const probeEnv = sanitizeGitEnv({ [spelling]: cfgAttrs } as unknown as NodeJS.ProcessEnv, {});
+        expect(
+          Object.keys(probeEnv).some((k) => k.toUpperCase() === 'GIT_CONFIG'),
+          `sanitizer must drop ${spelling}`,
+        ).toBe(false);
+      }
+
+      // The sanitizer also drops case-varied numbered pairs and controlled names.
+      const mixedEnv = sanitizeGitEnv(
+        {
+          Git_Config_Key_0: 'core.attributesFile',
+          git_config_value_0: hostileAttrs,
+          Git_Config_Count: '1',
+          Xdg_Config_Home: hostileRoot,
+          Git_Template_Dir: hostileTemplate,
+        } as unknown as NodeJS.ProcessEnv,
+        { GIT_CONFIG_GLOBAL: 'g' },
+      );
+      expect(
+        Object.keys(mixedEnv)
+          .filter((k) => /^(GIT_|XDG_)/i.test(k))
+          .sort(),
+      ).toEqual(['GIT_CONFIG_GLOBAL']);
+
+      // Existing hostile-source controls, all preserved.
       withEnv({ GIT_CONFIG_GLOBAL: cfgAttrs }, () => {
-        expect(applies('?notmatching -text eol=crlf'), 'A: hostile attributesFile false positive').toBe(false);
+        expect(applies('?notmatching -text eol=crlf'), 'hostile global config').toBe(false);
       });
-
-      // B — hostile init.templateDir must not create a FALSE NEGATIVE.
-      withEnv({ GIT_CONFIG_GLOBAL: cfgTemplate }, () => {
-        expect(applies('.gitattributes text eol=lf'), 'B: hostile templateDir false negative').toBe(true);
+      withEnv({ GIT_CONFIG_SYSTEM: cfgAttrs }, () => {
+        expect(applies('?notmatching -text eol=crlf'), 'hostile system config').toBe(false);
       });
-
-      // C — both hostile sources at once, matching and non-matching candidates.
-      withEnv({ GIT_CONFIG_GLOBAL: cfgBoth }, () => {
-        expect(applies('.gitattributes text eol=lf'), 'C: matching under combined hostility').toBe(true);
-        expect(applies('?notmatching -text eol=crlf'), 'C: non-matching under combined hostility').toBe(false);
-        expect(applies('[.]gitattributes -text'), 'C: bracket override under combined hostility').toBe(true);
-      });
-
-      // D — environment-injected git config must not affect the verdict.
       withEnv(
         {
           GIT_CONFIG_COUNT: '2',
@@ -1305,24 +1426,57 @@ describe('R15.6.5 diagnostic 28 — static contract', () => {
           GIT_CONFIG_VALUE_1: hostileTemplate,
         },
         () => {
-          expect(applies('?notmatching -text eol=crlf'), 'D: env-injected attributesFile').toBe(false);
-          expect(applies('.gitattributes text eol=lf'), 'D: env-injected templateDir').toBe(true);
+          expect(applies('?notmatching -text eol=crlf'), 'env-injected attributesFile').toBe(false);
+          expect(applies('.gitattributes text eol=lf'), 'env-injected templateDir').toBe(true);
         },
       );
-
-      // D2 — GIT_ATTR_SOURCE and GIT_TEMPLATE_DIR directly.
+      withEnv({ GIT_CONFIG_PARAMETERS: `'core.attributesFile=${posix(hostileAttrs)}'` }, () => {
+        expect(applies('?notmatching -text eol=crlf'), 'GIT_CONFIG_PARAMETERS').toBe(false);
+      });
       withEnv({ GIT_TEMPLATE_DIR: hostileTemplate }, () => {
-        expect(applies('.gitattributes text eol=lf'), 'D2: GIT_TEMPLATE_DIR').toBe(true);
+        expect(applies('.gitattributes text eol=lf'), 'GIT_TEMPLATE_DIR').toBe(true);
+      });
+      withEnv({ GIT_ATTR_SOURCE: hostileAttrs }, () => {
+        expect(applies('?notmatching -text eol=crlf'), 'GIT_ATTR_SOURCE').toBe(false);
+      });
+      withEnv(
+        {
+          GIT_DIR: join(hostileRoot, 'nope.git'),
+          GIT_WORK_TREE: hostileRoot,
+          GIT_INDEX_FILE: join(hostileRoot, 'idx'),
+        },
+        () => {
+          expect(applies('.gitattributes text eol=lf'), 'repository/index redirection').toBe(true);
+        },
+      );
+      withEnv({ XDG_CONFIG_HOME: hostileHome }, () => {
+        expect(applies('?notmatching -text eol=crlf'), 'hostile XDG config').toBe(false);
+      });
+      withEnv({ HOME: hostileHome, USERPROFILE: hostileHome }, () => {
+        expect(applies('?notmatching -text eol=crlf'), 'hostile HOME/USERPROFILE').toBe(false);
+        expect(applies('.gitattributes text eol=lf'), 'hostile HOME/USERPROFILE, matching').toBe(true);
       });
 
-      // F — the environment is restored even when an assertion throws.
-      const sentinelBefore = process.env.GIT_CONFIG_GLOBAL;
+      // E — environment restoration after success AND after a forced exception.
+      const before = process.env.GIT_CONFIG;
+      withEnv({ GIT_CONFIG: cfgAttrs }, () => {
+        expect(applies('?notmatching -text'), 'restoration: success path').toBe(false);
+      });
+      expect(process.env.GIT_CONFIG, 'restored after success').toBe(before);
+
       expect(() =>
-        withEnv({ GIT_CONFIG_GLOBAL: cfgAttrs }, () => {
+        withEnv({ GIT_CONFIG: cfgAttrs }, () => {
           throw new Error('deliberate failure inside a hostile context');
         }),
       ).toThrow(/deliberate failure/);
-      expect(process.env.GIT_CONFIG_GLOBAL, 'env restored after a throwing hostile block').toBe(sentinelBefore);
+      expect(process.env.GIT_CONFIG, 'restored after a thrown error').toBe(before);
+
+      expect(() =>
+        withEnv({ GIT_CONFIG: cfgAttrs }, () => {
+          expect(true, 'deliberate assertion failure').toBe(false);
+        }),
+      ).toThrow();
+      expect(process.env.GIT_CONFIG, 'restored after a failed assertion').toBe(before);
     } finally {
       rmSync(hostileRoot, { recursive: true, force: true });
       expect(existsSync(hostileRoot), 'hostile fixture root removed').toBe(false);
