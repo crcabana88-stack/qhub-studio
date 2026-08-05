@@ -42,9 +42,19 @@
 
 import { createHash } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import {
+  copyFileSync,
+  existsSync,
+  linkSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  readdirSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+} from 'node:fs';
+import { delimiter, isAbsolute, join, parse } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { acquireClusterLock, releaseClusterLock } from './helpers/pg-cluster-lock';
@@ -54,6 +64,102 @@ const DIR = `${REPO}docs/release/r15-6-migration-history/`;
 const DIAG = `${DIR}28_READ_ONLY_MANAGED_ROLE_DIAGNOSTIC.sql`;
 const DIAG_SQL = readFileSync(DIAG, 'utf8');
 const MIGRATION = `${REPO}supabase/migrations/20260729_commercial_launch_foundation.sql`;
+
+/*
+ * TRUSTED GIT EXECUTABLE — R15.6 THIRD CORRECTION (P1-1).
+ *
+ * Git must never be selected by the inherited environment. The candidate list
+ * is a narrow allowlist of absolute, protected installation paths. On Windows
+ * the drive roots come from a literal system-drive entry plus the ROOT of the
+ * running interpreter's own absolute location (process.execPath), which the
+ * runtime supplies rather than the caller. Nothing here reads process.env, so
+ * PATH, PATHEXT, GIT_EXEC_PATH, ProgramFiles, HOME, USERPROFILE, APPDATA,
+ * npm_config_git and every other inherited value are irrelevant; no shell,
+ * `where.exe` or other locator participates; and there is no bare-name
+ * fallback. If nothing validates, resolution fails closed.
+ */
+const TRUSTED_GIT_WINDOWS_RELATIVE = [
+  'Program Files/Git/cmd/git.exe',
+  'Program Files/Git/bin/git.exe',
+  'Program Files/Git/mingw64/bin/git.exe',
+  'Program Files (x86)/Git/cmd/git.exe',
+  'Program Files (x86)/Git/bin/git.exe',
+];
+
+const TRUSTED_GIT_POSIX_ABSOLUTE = ['/usr/bin/git', '/usr/local/bin/git', '/bin/git', '/opt/homebrew/bin/git'];
+
+const trustedGitCandidates = (): string[] => {
+  if (process.platform !== 'win32') {
+    return [...TRUSTED_GIT_POSIX_ABSOLUTE];
+  }
+
+  const roots = new Set<string>(['C:\\']);
+  const interpreterRoot = parse(process.execPath).root;
+
+  if (interpreterRoot !== '') {
+    roots.add(interpreterRoot);
+  }
+
+  return [...roots].flatMap((root) => TRUSTED_GIT_WINDOWS_RELATIVE.map((relative) => join(root, relative)));
+};
+
+/** Validates an allowlist and returns the first approved absolute executable. */
+const selectTrustedGit = (candidates: string[]): string => {
+  const rejected: string[] = [];
+
+  for (const candidate of candidates) {
+    if (!isAbsolute(candidate)) {
+      rejected.push(`${candidate} (not an absolute path)`);
+      continue;
+    }
+
+    if (process.platform === 'win32' && !candidate.toLowerCase().endsWith('.exe')) {
+      rejected.push(`${candidate} (not an explicit .exe)`);
+      continue;
+    }
+
+    let regularFile = false;
+
+    try {
+      regularFile = statSync(candidate).isFile();
+    } catch {
+      rejected.push(`${candidate} (absent)`);
+      continue;
+    }
+
+    if (!regularFile) {
+      rejected.push(`${candidate} (not a regular file)`);
+      continue;
+    }
+
+    return candidate;
+  }
+
+  throw new Error(`no trusted Git executable found; rejected ${rejected.length} candidate(s): ${rejected.join(', ')}`);
+};
+
+const resolveTrustedGit = (): string => selectTrustedGit(trustedGitCandidates());
+
+/** The single absolute executable EVERY Git invocation in this file uses. */
+const TRUSTED_GIT = resolveTrustedGit();
+
+/*
+ * EVALUATION-ROOT ANCHOR — R15.6 THIRD CORRECTION (P1-2).
+ *
+ * os.tmpdir() follows caller-controlled TEMP/TMP on Windows, so it can neither
+ * locate nor break a hermetic evaluation. The anchor is derived from THIS
+ * module's own committed location (import.meta.url, via REPO) and lives under
+ * the ignored dependency cache; TEMP, TMP, TMPDIR, PATH, HOME, USERPROFILE,
+ * APPDATA, LOCALAPPDATA, XDG_CONFIG_HOME and the process working directory
+ * play no part. Every root is unique, complete and disposable.
+ */
+const HERMETIC_EVAL_ANCHOR = join(REPO, 'node_modules', '.cache', 'qhub-git-attr-eval');
+
+const createHermeticRoot = (prefix: string): string => {
+  mkdirSync(HERMETIC_EVAL_ANCHOR, { recursive: true });
+
+  return mkdtempSync(join(HERMETIC_EVAL_ANCHOR, prefix));
+};
 
 const PG_BIN =
   process.env.QHUB_SCRATCH_PG_BIN ??
@@ -967,25 +1073,41 @@ describe('R15.6.5 diagnostic 28 — static contract', () => {
     ).toBe(0);
 
     /*
-     * R15.6 SECOND CORRECTION.
+     * R15.6 THIRD CORRECTION.
      *
-     * P1 — GIT_CONFIG was still inherited. Pointing it at a hostile
-     * configuration made the evaluation repository report an unexpected
-     * core.attributesFile, so a valid candidate THREW. It failed closed, but
-     * caller-controlled configuration still influenced the evaluation, and
-     * with a hostile init.templateDir it broke `git init` outright. Both were
-     * reproduced against the previous commit. GIT_CONFIG is now removed, and
-     * the whole sanitation sweep is CASE-INSENSITIVE so a differently cased
-     * alias (Git_Config, git_config, …) cannot survive in the child
-     * environment object.
+     * P1-1 — the matcher invoked the BARE name `git`, so the operating system
+     * resolved it through the INHERITED PATH. Reproduced against the previous
+     * commit: a disposable git.exe planted first in PATH was selected and
+     * EXECUTED, writing a FAKE_GIT_SELECTED sentinel that recorded the real
+     * argument vector. Such an executable owns every init/config/check-attr
+     * response and can manufacture structurally valid applicability output.
+     * Git is now the single trusted ABSOLUTE executable resolved by
+     * resolveTrustedGit() (see TRUSTED_GIT); PATH is removed from the child
+     * environment in every casing and never reassigned; and PATHEXT, COMSPEC
+     * and GIT_EXEC_PATH go with it, so nothing caller-supplied can influence
+     * executable or subprogram selection.
      *
-     * P2 — the verdict was `value !== 'unspecified'`, so `unset`,
-     * `unexpected-value`, an arbitrary assigned string and an empty value were
-     * all read as APPLICABLE. Every synthetic probe is written as a BARE
-     * attribute, so the only legitimate values are `set` and `unspecified`;
-     * anything else is now an exact-allowlist failure that throws.
+     * P1-2 — the evaluation root was created with mkdtempSync(join(tmpdir(),
+     * ...)), and on Windows os.tmpdir() follows caller-controlled TEMP/TMP.
+     * Reproduced: a valid hostile TEMP/TMP relocated the root into the
+     * attacker's directory, and a nonexistent one broke a valid evaluation with
+     * ENOENT. The root now comes from createHermeticRoot(), anchored to THIS
+     * module's own committed location, and the child's TEMP/TMP/TMPDIR are
+     * removed in every casing and reassigned to a controlled directory INSIDE
+     * that root.
+     *
+     * Everything the previous two corrections established is preserved: the
+     * child environment is built from a COPY (process.env is never mutated
+     * here), the sanitation sweep is case-insensitive, and `set`/`unspecified`
+     * remain the only check-attr values that may be interpreted.
      */
-    const HERMETIC_GIT_VARS_REMOVED = [
+
+    /** Removed in EVERY casing and never reassigned. */
+    const HERMETIC_ENV_VARS_REMOVED = [
+      'PATH',
+      'PATHEXT',
+      'COMSPEC',
+      'GIT_EXEC_PATH',
       'GIT_CONFIG',
       'GIT_DIR',
       'GIT_COMMON_DIR',
@@ -1001,8 +1123,11 @@ describe('R15.6.5 diagnostic 28 — static contract', () => {
       'GIT_NAMESPACE',
     ];
 
-    /** Names this matcher assigns itself; any inherited spelling is dropped first. */
-    const HERMETIC_GIT_VARS_CONTROLLED = [
+    /** Removed in EVERY casing first, then reassigned under canonical names. */
+    const HERMETIC_ENV_VARS_CONTROLLED = [
+      'TEMP',
+      'TMP',
+      'TMPDIR',
       'GIT_CONFIG_GLOBAL',
       'GIT_CONFIG_SYSTEM',
       'GIT_CONFIG_NOSYSTEM',
@@ -1070,10 +1195,10 @@ describe('R15.6.5 diagnostic 28 — static contract', () => {
       return verdicts;
     };
 
-    /** Case-insensitive sanitation of an environment object. */
+    /** Case-insensitive sanitation of an environment object; never mutates the source. */
     const sanitizeGitEnv = (source: NodeJS.ProcessEnv, controlled: Record<string, string>): NodeJS.ProcessEnv => {
       const env: NodeJS.ProcessEnv = { ...source };
-      const drop = new Set([...HERMETIC_GIT_VARS_REMOVED, ...HERMETIC_GIT_VARS_CONTROLLED].map((n) => n.toUpperCase()));
+      const drop = new Set([...HERMETIC_ENV_VARS_REMOVED, ...HERMETIC_ENV_VARS_CONTROLLED].map((n) => n.toUpperCase()));
 
       for (const key of Object.keys(env)) {
         const upper = key.toUpperCase();
@@ -1088,7 +1213,59 @@ describe('R15.6.5 diagnostic 28 — static contract', () => {
       return env;
     };
 
-    const rulesApplicableToGitattributes = (attrsText: string): string[] => {
+    /**
+     * Post-sanitation proof. Nothing caller-controlled may survive: no removed
+     * name in any casing, no numbered configuration injection, no controlled
+     * name under a non-canonical spelling, no controlled value that is anything
+     * other than the exact string this matcher assigned (so nothing inherited
+     * can have been concatenated into one), and TEMP/TMP/TMPDIR strictly inside
+     * the controlled evaluation root.
+     */
+    const assertSanitizedGitEnv = (env: NodeJS.ProcessEnv, controlled: Record<string, string>, root: string): void => {
+      const removed = new Set(HERMETIC_ENV_VARS_REMOVED);
+      const controlledNames = new Set(HERMETIC_ENV_VARS_CONTROLLED);
+
+      for (const key of Object.keys(env)) {
+        const upper = key.toUpperCase();
+
+        if (removed.has(upper)) {
+          throw new Error(`${upper} survived sanitation as ${key}`);
+        }
+
+        if (/^GIT_CONFIG_(KEY|VALUE)_\d+$/.test(upper)) {
+          throw new Error(`numbered configuration injection survived sanitation as ${key}`);
+        }
+
+        if (controlledNames.has(upper) && key !== upper) {
+          throw new Error(`controlled variable ${upper} survived under the non-canonical spelling ${key}`);
+        }
+      }
+
+      for (const name of HERMETIC_ENV_VARS_CONTROLLED) {
+        const assigned = controlled[name];
+
+        if (typeof assigned !== 'string') {
+          throw new Error(`controlled variable ${name} was not assigned`);
+        }
+
+        if (env[name] !== assigned) {
+          throw new Error(`controlled variable ${name} is not exactly the value this matcher assigned`);
+        }
+      }
+
+      for (const name of ['TEMP', 'TMP', 'TMPDIR']) {
+        const value = controlled[name];
+
+        if (value !== join(root, 'tmp')) {
+          throw new Error(`${name} does not point inside the controlled evaluation root`);
+        }
+      }
+    };
+
+    /** Read-only record of what an evaluation actually used. Never an override. */
+    type HermeticObservation = { root?: string; env?: NodeJS.ProcessEnv; git?: string };
+
+    const rulesApplicableToGitattributes = (attrsText: string, observed?: HermeticObservation): string[] => {
       const rules = attrsText
         .split('\n')
         .map((l) => l.trim())
@@ -1119,7 +1296,11 @@ describe('R15.6.5 diagnostic 28 — static contract', () => {
         return rule.split(/\s+/)[0];
       };
 
-      const root = mkdtempSync(join(tmpdir(), 'qhub-attrprobe-'));
+      const root = createHermeticRoot('attr-eval-');
+
+      if (observed !== undefined) {
+        observed.root = root;
+      }
 
       try {
         const repoDir = join(root, 'repo');
@@ -1129,15 +1310,20 @@ describe('R15.6.5 diagnostic 28 — static contract', () => {
         const emptyAttributes = join(root, 'empty-attributes');
         const xdgHome = join(root, 'xdg');
         const isolatedHome = join(root, 'home');
+        const childTemp = join(root, 'tmp');
 
         mkdirSync(emptyTemplate);
         mkdirSync(xdgHome);
         mkdirSync(isolatedHome);
+        mkdirSync(childTemp);
         writeFileSync(emptyGlobalConfig, '', 'utf8');
         writeFileSync(emptySystemConfig, '', 'utf8');
         writeFileSync(emptyAttributes, '', 'utf8');
 
-        const env = sanitizeGitEnv(process.env, {
+        const controlled = {
+          TEMP: childTemp,
+          TMP: childTemp,
+          TMPDIR: childTemp,
           GIT_CONFIG_GLOBAL: emptyGlobalConfig,
           GIT_CONFIG_SYSTEM: emptySystemConfig,
           GIT_CONFIG_NOSYSTEM: '1',
@@ -1145,18 +1331,21 @@ describe('R15.6.5 diagnostic 28 — static contract', () => {
           XDG_CONFIG_HOME: xdgHome,
           HOME: isolatedHome,
           USERPROFILE: isolatedHome,
-        });
+        };
 
-        // Nothing named GIT_CONFIG (in any casing) may reach a child process.
-        for (const key of Object.keys(env)) {
-          if (key.toUpperCase() === 'GIT_CONFIG') {
-            throw new Error(`GIT_CONFIG survived sanitation as ${key}`);
-          }
+        const env = sanitizeGitEnv(process.env, controlled);
+        assertSanitizedGitEnv(env, controlled, root);
+
+        if (observed !== undefined) {
+          observed.env = env;
+          observed.git = TRUSTED_GIT;
         }
 
         const scoped = ['-c', `core.attributesFile=${emptyAttributes}`, '-c', 'core.excludesFile='];
+
+        // Absolute, trusted, PATH-independent. There is no bare-name invocation.
         const run = (args: string[], cwd?: string) =>
-          execFileSync('git', [...scoped, ...args], {
+          execFileSync(TRUSTED_GIT, [...scoped, ...args], {
             cwd,
             env,
             encoding: 'utf8',
@@ -1253,7 +1442,50 @@ describe('R15.6.5 diagnostic 28 — static contract', () => {
     }
 
     /*
-     * P2 — STRICT VALUE ALLOWLIST, by direct fault injection.
+     * H — TRUSTED-EXECUTABLE RESOLVER GUARANTEES.
+     */
+    expect(isAbsolute(TRUSTED_GIT), 'H: the trusted Git path is absolute').toBe(true);
+    expect(statSync(TRUSTED_GIT).isFile(), 'H: the trusted Git path is a regular file').toBe(true);
+    expect(
+      trustedGitCandidates().every((c) => isAbsolute(c)),
+      'H: every candidate is absolute',
+    ).toBe(true);
+    expect(
+      trustedGitCandidates().some((c) => c === 'git' || c === 'git.exe'),
+      'H: no bare-name candidate exists',
+    ).toBe(false);
+
+    if (process.platform === 'win32') {
+      expect(TRUSTED_GIT.toLowerCase().endsWith('.exe'), 'H: an explicit .exe name on Windows').toBe(true);
+      expect(
+        trustedGitCandidates().every((c) => c.toLowerCase().endsWith('.exe')),
+        'H: every Windows candidate names an .exe',
+      ).toBe(true);
+    }
+
+    // Resolution reads no environment at all, and uses no PATH-based locator.
+    const resolverSource = `${String(trustedGitCandidates)}\n${String(selectTrustedGit)}\n${String(resolveTrustedGit)}`;
+    expect(resolverSource, 'H: resolution never reads process.env').not.toMatch(/process\.env/);
+    expect(resolverSource, 'H: resolution uses no PATH-based locator').not.toMatch(
+      /where\.exe|Get-Command|PATHEXT|execFileSync|spawn|delimiter/,
+    );
+
+    // Fail-closed: nothing unapproved, relative, missing or non-file resolves.
+    expect(() => selectTrustedGit([]), 'H: an empty allowlist fails closed').toThrow(/no trusted Git executable/);
+    expect(() => selectTrustedGit(['git']), 'H: a bare name fails closed').toThrow(/no trusted Git executable/);
+    expect(() => selectTrustedGit(['git.exe']), 'H: a bare .exe name fails closed').toThrow(
+      /no trusted Git executable/,
+    );
+    expect(() => selectTrustedGit(['./git.exe']), 'H: a relative path fails closed').toThrow(
+      /no trusted Git executable/,
+    );
+    expect(() => selectTrustedGit([join(REPO, 'no-such-git.exe')]), 'H: a missing candidate fails closed').toThrow(
+      /no trusted Git executable/,
+    );
+    expect(() => selectTrustedGit([REPO]), 'H: a directory fails closed').toThrow(/no trusted Git executable/);
+
+    /*
+     * P2 (second correction) — STRICT VALUE ALLOWLIST, by direct fault injection.
      */
     expect(verdictFromCheckAttrValue('qhubprobe0', 'set'), 'set => applicable').toBe(true);
     expect(verdictFromCheckAttrValue('qhubprobe0', 'unspecified'), 'unspecified => not applicable').toBe(false);
@@ -1336,7 +1568,7 @@ describe('R15.6.5 diagnostic 28 — static contract', () => {
       }
     };
 
-    const hostileRoot = mkdtempSync(join(tmpdir(), 'qhub-hostile-'));
+    const hostileRoot = createHermeticRoot('hostile-');
 
     try {
       const posix = (p: string) => p.replace(/\\/g, '/');
@@ -1365,6 +1597,237 @@ describe('R15.6.5 diagnostic 28 — static contract', () => {
       writeFileSync(join(hostileHome, '.gitconfig'), `[core]\n\tattributesFile = ${posix(hostileAttrs)}\n`, 'utf8');
       writeFileSync(join(hostileHome, 'git', 'config'), `[core]\n\tattributesFile = ${posix(hostileAttrs)}\n`, 'utf8');
       writeFileSync(join(hostileHome, 'git', 'attributes'), '.gitattributes qhubprobe0\n', 'utf8');
+
+      /*
+       * A — A DISPOSABLE git.exe FIRST IN PATH MUST NEVER EXECUTE.
+       *
+       * The planted file is a genuine executable image (a link to, or copy of,
+       * the running interpreter), so it CAN run and CAN report structurally
+       * valid output; a --require hook makes it drop a sentinel the instant it
+       * is executed. `.cmd`, `.bat` and an extensionless `git` cover PATHEXT
+       * resolution as well.
+       */
+      const fakeBin = join(hostileRoot, 'fake-bin');
+      mkdirSync(fakeBin);
+
+      const fakeSentinel = join(hostileRoot, 'FAKE_GIT_SELECTED');
+      const fakeHook = join(hostileRoot, 'fake-git-hook.cjs');
+      writeFileSync(
+        fakeHook,
+        `require('node:fs').writeFileSync(${JSON.stringify(fakeSentinel)}, 'fake git executed\\n');\n`,
+        'utf8',
+      );
+
+      const fakeGit = join(fakeBin, process.platform === 'win32' ? 'git.exe' : 'git');
+
+      try {
+        linkSync(process.execPath, fakeGit);
+      } catch {
+        copyFileSync(process.execPath, fakeGit);
+      }
+
+      expect(statSync(fakeGit).size, 'A: the planted fake is a real executable image').toBe(
+        statSync(process.execPath).size,
+      );
+
+      for (const alias of ['git.cmd', 'git.bat', 'git']) {
+        const aliasPath = join(fakeBin, alias);
+
+        if (!existsSync(aliasPath)) {
+          writeFileSync(aliasPath, `@echo off\r\ntype nul > "${fakeSentinel}"\r\n`, 'utf8');
+        }
+      }
+
+      const hostilePath = `${fakeBin}${delimiter}${process.env.PATH ?? ''}`;
+      const observedUnderPathAttack: HermeticObservation = {};
+
+      withEnv({ PATH: hostilePath, NODE_OPTIONS: `--require ${JSON.stringify(fakeHook)}` }, () => {
+        expect(
+          rulesApplicableToGitattributes('.gitattributes text eol=lf', observedUnderPathAttack).length === 1,
+          'A: hostile PATH, exact rule still applies',
+        ).toBe(true);
+        expect(applies('?notmatching -text eol=crlf'), 'A: hostile PATH, non-matching rule').toBe(false);
+        expect(applies('[.]gitattributes -text'), 'A: hostile PATH, character-class match').toBe(true);
+        expect(applies('[x]gitattributes -text'), 'A: hostile PATH, character-class non-match').toBe(false);
+      });
+
+      expect(existsSync(fakeSentinel), 'A: the fake Git sentinel must never appear').toBe(false);
+      expect(observedUnderPathAttack.git, 'A: evaluation used the trusted absolute executable').toBe(TRUSTED_GIT);
+      expect(
+        Object.keys(observedUnderPathAttack.env ?? {}).some((k) => k.toUpperCase() === 'PATH'),
+        'A: no PATH key reaches the child environment',
+      ).toBe(false);
+      expect(
+        JSON.stringify(observedUnderPathAttack.env ?? {}).includes(fakeBin.replace(/\\/g, '\\\\')),
+        'A: no inherited PATH segment survives anywhere in the child environment',
+      ).toBe(false);
+
+      /*
+       * B — PATH ALIASES. Windows keeps process.env case-insensitive, so the
+       * differently cased spellings are exercised on plain objects.
+       */
+      for (const spelling of ['PATH', 'Path', 'path', 'pAtH']) {
+        const probeEnv = sanitizeGitEnv({ [spelling]: fakeBin } as unknown as NodeJS.ProcessEnv, {});
+        expect(
+          Object.keys(probeEnv).some((k) => k.toUpperCase() === 'PATH'),
+          `B: sanitizer must drop ${spelling}`,
+        ).toBe(false);
+      }
+
+      const multiPathEnv = sanitizeGitEnv(
+        {
+          PATH: fakeBin,
+          Path: fakeBin,
+          path: fakeBin,
+          pAtH: fakeBin,
+          PATHEXT: '.COM;.EXE;.BAT;.CMD',
+          ComSpec: join(fakeBin, 'cmd.exe'),
+          Git_Exec_Path: fakeBin,
+        } as unknown as NodeJS.ProcessEnv,
+        {},
+      );
+      expect(
+        Object.keys(multiPathEnv).sort(),
+        'B: every PATH/PATHEXT/COMSPEC/GIT_EXEC_PATH alias is removed together',
+      ).toEqual([]);
+
+      /*
+       * C — HOSTILE TEMP/TMP/TMPDIR, valid and nonexistent.
+       */
+      const hostileTemp = join(hostileRoot, 'hostile-temp');
+      mkdirSync(hostileTemp);
+
+      const missingTempParent = join(hostileRoot, 'no-such-temp');
+      const missingTemp = join(missingTempParent, 'nested');
+
+      const tempAttacks: Array<[string, Record<string, string | undefined>]> = [
+        ['hostile TEMP', { TEMP: hostileTemp }],
+        ['hostile TMP', { TMP: hostileTemp }],
+        ['hostile TMPDIR', { TMPDIR: hostileTemp }],
+        ['hostile TEMP+TMP+TMPDIR', { TEMP: hostileTemp, TMP: hostileTemp, TMPDIR: hostileTemp }],
+        ['nonexistent TEMP+TMP+TMPDIR', { TEMP: missingTemp, TMP: missingTemp, TMPDIR: missingTemp }],
+      ];
+
+      for (const [label, overrides] of tempAttacks) {
+        const observedTemp: HermeticObservation = {};
+
+        withEnv(overrides, () => {
+          expect(
+            rulesApplicableToGitattributes('.gitattributes text eol=lf', observedTemp).length === 1,
+            `C: ${label}, exact rule`,
+          ).toBe(true);
+          expect(applies('?notmatching -text eol=crlf'), `C: ${label}, non-matching rule`).toBe(false);
+        });
+
+        expect(observedTemp.root?.startsWith(HERMETIC_EVAL_ANCHOR), `C: ${label}, root stays under the anchor`).toBe(
+          true,
+        );
+        expect(observedTemp.env?.TEMP, `C: ${label}, controlled TEMP`).toBe(join(observedTemp.root ?? '', 'tmp'));
+        expect(observedTemp.env?.TMP, `C: ${label}, controlled TMP`).toBe(join(observedTemp.root ?? '', 'tmp'));
+        expect(observedTemp.env?.TMPDIR, `C: ${label}, controlled TMPDIR`).toBe(join(observedTemp.root ?? '', 'tmp'));
+      }
+
+      expect(readdirSync(hostileTemp), 'C: nothing was created under the hostile temp directory').toEqual([]);
+      expect(existsSync(missingTempParent), 'C: the nonexistent hostile temp path was never created').toBe(false);
+
+      /*
+       * D — TEMP/TMP/TMPDIR ALIASES on plain objects.
+       */
+      for (const spelling of ['TEMP', 'Temp', 'tEmP', 'TMP', 'tMp', 'TMPDIR', 'TmpDir', 'tmpdir']) {
+        const probeEnv = sanitizeGitEnv({ [spelling]: hostileTemp } as unknown as NodeJS.ProcessEnv, {});
+        expect(
+          Object.keys(probeEnv).some((k) => ['TEMP', 'TMP', 'TMPDIR'].includes(k.toUpperCase())),
+          `D: sanitizer must drop ${spelling}`,
+        ).toBe(false);
+      }
+
+      const controlledTemp = join(hostileRoot, 'controlled-tmp');
+      const mixedTempEnv = sanitizeGitEnv(
+        {
+          Temp: hostileTemp,
+          tMp: hostileTemp,
+          TmpDir: hostileTemp,
+          TMPdir: hostileTemp,
+        } as unknown as NodeJS.ProcessEnv,
+        { TEMP: controlledTemp, TMP: controlledTemp, TMPDIR: controlledTemp },
+      );
+      expect(Object.keys(mixedTempEnv).sort(), 'D: only canonical temp names survive').toEqual([
+        'TEMP',
+        'TMP',
+        'TMPDIR',
+      ]);
+
+      for (const name of ['TEMP', 'TMP', 'TMPDIR']) {
+        expect(mixedTempEnv[name], `D: ${name} holds exactly the controlled value`).toBe(controlledTemp);
+      }
+
+      /*
+       * D' — the post-sanitation guard itself rejects each violation class.
+       */
+      const goodRoot = join(hostileRoot, 'guard-root');
+      const goodTmp = join(goodRoot, 'tmp');
+      const goodControlled: Record<string, string> = {
+        TEMP: goodTmp,
+        TMP: goodTmp,
+        TMPDIR: goodTmp,
+        GIT_CONFIG_GLOBAL: join(goodRoot, 'g'),
+        GIT_CONFIG_SYSTEM: join(goodRoot, 's'),
+        GIT_CONFIG_NOSYSTEM: '1',
+        GIT_ATTR_NOSYSTEM: '1',
+        XDG_CONFIG_HOME: join(goodRoot, 'xdg'),
+        HOME: join(goodRoot, 'home'),
+        USERPROFILE: join(goodRoot, 'home'),
+      };
+      const guardEnv = (extra: Record<string, string>): NodeJS.ProcessEnv =>
+        ({ ...goodControlled, ...extra }) as unknown as NodeJS.ProcessEnv;
+
+      expect(() => assertSanitizedGitEnv(guardEnv({}), goodControlled, goodRoot)).not.toThrow();
+      expect(
+        () => assertSanitizedGitEnv(guardEnv({ Path: fakeBin }), goodControlled, goodRoot),
+        "D': a surviving PATH alias",
+      ).toThrow(/PATH survived sanitation as Path/);
+      expect(
+        () => assertSanitizedGitEnv(guardEnv({ Git_Exec_Path: fakeBin }), goodControlled, goodRoot),
+        "D': a surviving GIT_EXEC_PATH alias",
+      ).toThrow(/GIT_EXEC_PATH survived sanitation/);
+      expect(
+        () => assertSanitizedGitEnv(guardEnv({ Temp: hostileTemp }), goodControlled, goodRoot),
+        "D': a surviving TEMP alias",
+      ).toThrow(/TEMP survived under the non-canonical spelling Temp/);
+      expect(
+        () => assertSanitizedGitEnv(guardEnv({ GIT_CONFIG_KEY_0: 'core.attributesFile' }), goodControlled, goodRoot),
+        "D': surviving numbered injection",
+      ).toThrow(/numbered configuration injection survived/);
+      expect(
+        () =>
+          assertSanitizedGitEnv(
+            guardEnv({ HOME: `${goodControlled.HOME}${delimiter}${fakeBin}` }),
+            goodControlled,
+            goodRoot,
+          ),
+        "D': an inherited value concatenated into a controlled one",
+      ).toThrow(/HOME is not exactly the value this matcher assigned/);
+      expect(
+        () =>
+          assertSanitizedGitEnv(guardEnv({ TEMP: hostileTemp }), { ...goodControlled, TEMP: hostileTemp }, goodRoot),
+        "D': TEMP outside the controlled root",
+      ).toThrow(/TEMP does not point inside the controlled evaluation root/);
+
+      /*
+       * E — GIT_EXEC_PATH must not redirect Git subprogram resolution.
+       */
+      withEnv({ GIT_EXEC_PATH: fakeBin }, () => {
+        expect(applies('.gitattributes text eol=lf'), 'E: GIT_EXEC_PATH, exact rule').toBe(true);
+        expect(applies('?notmatching -text eol=crlf'), 'E: GIT_EXEC_PATH, non-matching rule').toBe(false);
+      });
+
+      for (const spelling of ['GIT_EXEC_PATH', 'Git_Exec_Path', 'git_exec_path', 'gIt_ExEc_PaTh']) {
+        const probeEnv = sanitizeGitEnv({ [spelling]: fakeBin } as unknown as NodeJS.ProcessEnv, {});
+        expect(
+          Object.keys(probeEnv).some((k) => k.toUpperCase() === 'GIT_EXEC_PATH'),
+          `E: sanitizer must drop ${spelling}`,
+        ).toBe(false);
+      }
 
       // A — hostile GIT_CONFIG with core.attributesFile: correct verdict, NO throw.
       withEnv({ GIT_CONFIG: cfgAttrs }, () => {
@@ -1457,26 +1920,108 @@ describe('R15.6.5 diagnostic 28 — static contract', () => {
         expect(applies('.gitattributes text eol=lf'), 'hostile HOME/USERPROFILE, matching').toBe(true);
       });
 
-      // E — environment restoration after success AND after a forced exception.
-      const before = process.env.GIT_CONFIG;
+      /*
+       * F — EVERY hostile source at once, including the fake Git.
+       */
+      const observedCombined: HermeticObservation = {};
+
+      withEnv(
+        {
+          PATH: hostilePath,
+          NODE_OPTIONS: `--require ${JSON.stringify(fakeHook)}`,
+          GIT_EXEC_PATH: fakeBin,
+          TEMP: missingTemp,
+          TMP: hostileTemp,
+          TMPDIR: missingTemp,
+          GIT_CONFIG: cfgBoth,
+          GIT_CONFIG_COUNT: '2',
+          GIT_CONFIG_KEY_0: 'core.attributesFile',
+          GIT_CONFIG_VALUE_0: hostileAttrs,
+          GIT_CONFIG_KEY_1: 'init.templateDir',
+          GIT_CONFIG_VALUE_1: hostileTemplate,
+          GIT_CONFIG_PARAMETERS: `'core.attributesFile=${posix(hostileAttrs)}'`,
+          GIT_TEMPLATE_DIR: hostileTemplate,
+          GIT_ATTR_SOURCE: hostileAttrs,
+          GIT_CONFIG_GLOBAL: cfgAttrs,
+          GIT_CONFIG_SYSTEM: cfgAttrs,
+          XDG_CONFIG_HOME: hostileHome,
+          HOME: hostileHome,
+          USERPROFILE: hostileHome,
+          GIT_DIR: join(hostileRoot, 'nope.git'),
+          GIT_WORK_TREE: hostileRoot,
+          GIT_INDEX_FILE: join(hostileRoot, 'idx'),
+          GIT_OBJECT_DIRECTORY: join(hostileRoot, 'objects'),
+          GIT_ALTERNATE_OBJECT_DIRECTORIES: hostileRoot,
+          GIT_CEILING_DIRECTORIES: hostileRoot,
+          GIT_NAMESPACE: 'hostile',
+        },
+        () => {
+          expect(
+            rulesApplicableToGitattributes('.gitattributes text eol=lf', observedCombined).length === 1,
+            'F: exact rule under every attack at once',
+          ).toBe(true);
+          expect(applies('?notmatching -text eol=crlf'), 'F: non-matching rule').toBe(false);
+          expect(applies('[.]gitattributes -text'), 'F: character-class match').toBe(true);
+          expect(applies('[x]gitattributes -text'), 'F: character-class non-match').toBe(false);
+        },
+      );
+
+      expect(existsSync(fakeSentinel), 'F: the fake Git sentinel must still be absent').toBe(false);
+      expect(observedCombined.git, 'F: the trusted absolute executable was used').toBe(TRUSTED_GIT);
+      expect(observedCombined.root?.startsWith(HERMETIC_EVAL_ANCHOR), 'F: root stayed under the anchor').toBe(true);
+      expect(readdirSync(hostileTemp), 'F: the hostile temp directory stayed empty').toEqual([]);
+      expect(existsSync(missingTempParent), 'F: the nonexistent temp path was never created').toBe(false);
+
+      for (const name of HERMETIC_ENV_VARS_REMOVED) {
+        expect(
+          Object.keys(observedCombined.env ?? {}).some((k) => k.toUpperCase() === name),
+          `F: ${name} never reaches the child environment`,
+        ).toBe(false);
+      }
+
+      /*
+       * G — CALLER ENVIRONMENT PRESERVATION.
+       */
+      const beforeConfig = process.env.GIT_CONFIG;
+      const beforePath = process.env.PATH;
+      const beforeTemp = process.env.TEMP;
+
       withEnv({ GIT_CONFIG: cfgAttrs }, () => {
         expect(applies('?notmatching -text'), 'restoration: success path').toBe(false);
       });
-      expect(process.env.GIT_CONFIG, 'restored after success').toBe(before);
+      expect(process.env.GIT_CONFIG, 'restored after success').toBe(beforeConfig);
+      expect(process.env.PATH, 'PATH untouched by a successful evaluation').toBe(beforePath);
+      expect(process.env.TEMP, 'TEMP untouched by a successful evaluation').toBe(beforeTemp);
 
       expect(() =>
-        withEnv({ GIT_CONFIG: cfgAttrs }, () => {
+        withEnv({ GIT_CONFIG: cfgAttrs, PATH: hostilePath, TEMP: hostileTemp }, () => {
           throw new Error('deliberate failure inside a hostile context');
         }),
       ).toThrow(/deliberate failure/);
-      expect(process.env.GIT_CONFIG, 'restored after a thrown error').toBe(before);
+      expect(process.env.GIT_CONFIG, 'restored after a thrown error').toBe(beforeConfig);
+      expect(process.env.PATH, 'PATH restored after a thrown error').toBe(beforePath);
+      expect(process.env.TEMP, 'TEMP restored after a thrown error').toBe(beforeTemp);
 
       expect(() =>
-        withEnv({ GIT_CONFIG: cfgAttrs }, () => {
+        withEnv({ GIT_CONFIG: cfgAttrs, PATH: hostilePath, TEMP: hostileTemp }, () => {
           expect(true, 'deliberate assertion failure').toBe(false);
         }),
       ).toThrow();
-      expect(process.env.GIT_CONFIG, 'restored after a failed assertion').toBe(before);
+      expect(process.env.GIT_CONFIG, 'restored after a failed assertion').toBe(beforeConfig);
+      expect(process.env.PATH, 'PATH restored after a failed assertion').toBe(beforePath);
+      expect(process.env.TEMP, 'TEMP restored after a failed assertion').toBe(beforeTemp);
+
+      /*
+       * Cleanup lives in `finally` and is VERIFIED, so a failing evaluation
+       * still removes its complete root. The unterminated-quote rejection
+       * happens after the root exists, which makes it the natural probe.
+       */
+      const observedFailure: HermeticObservation = {};
+      expect(() => rulesApplicableToGitattributes('"unterminated text eol=lf\n', observedFailure)).toThrow(
+        /unterminated quoted pattern/,
+      );
+      expect(observedFailure.root, 'a failed evaluation still records its root').toBeTypeOf('string');
+      expect(existsSync(observedFailure.root ?? ''), 'a failed evaluation removes its complete root').toBe(false);
     } finally {
       rmSync(hostileRoot, { recursive: true, force: true });
       expect(existsSync(hostileRoot), 'hostile fixture root removed').toBe(false);
@@ -1484,7 +2029,7 @@ describe('R15.6.5 diagnostic 28 — static contract', () => {
 
     // Git itself must report the effective attributes for BOTH protected files.
     for (const target of [DIAG, `${REPO}.gitattributes`]) {
-      const checkAttr = execFileSync('git', ['check-attr', 'text', 'eol', '--', target], {
+      const checkAttr = execFileSync(TRUSTED_GIT, ['check-attr', 'text', 'eol', '--', target], {
         cwd: REPO,
         encoding: 'utf8',
       });
@@ -1508,7 +2053,7 @@ describe('R15.6.5 diagnostic 28 — static contract', () => {
     const attrsBytes = readFileSync(`${REPO}.gitattributes`);
     expect(attrsBytes.includes(0x0d), '.gitattributes must contain no carriage returns').toBe(false);
     expect(
-      execFileSync('git', ['ls-files', '--eol', '--', '.gitattributes'], { cwd: REPO, encoding: 'utf8' }),
+      execFileSync(TRUSTED_GIT, ['ls-files', '--eol', '--', '.gitattributes'], { cwd: REPO, encoding: 'utf8' }),
       '.gitattributes must be i/lf w/lf with the eol=lf attribute applied',
     ).toMatch(/i\/lf\s+w\/lf\s+attr\/text eol=lf/);
   });
