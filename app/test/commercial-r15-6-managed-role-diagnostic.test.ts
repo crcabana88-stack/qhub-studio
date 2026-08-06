@@ -54,7 +54,7 @@ import {
   statSync,
   writeFileSync,
 } from 'node:fs';
-import { basename, delimiter, dirname, isAbsolute, join, parse } from 'node:path';
+import { basename, delimiter, dirname, isAbsolute, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { acquireClusterLock, releaseClusterLock } from './helpers/pg-cluster-lock';
@@ -94,44 +94,69 @@ const MIGRATION = `${REPO}supabase/migrations/20260729_commercial_launch_foundat
  * they present is unapproved. Existence, regular-file status, `.exe` and the
  * exact basename remain necessary AFTER membership; they never substitute for
  * it. Resolution fails closed.
+ *
+ * FIFTH CORRECTION. The allowlist was still assembled at runtime from relative
+ * fragments joined onto a set of drive roots that included
+ * `parse(process.execPath).root`. Freezing the array afterwards froze content
+ * that had ALREADY been widened. Reproduced against the committed 1a8382f
+ * bytes: an interpreter at `D:\PortableNode\node.exe` produced a TEN-entry list
+ * whose five extra entries were D-drive Git paths, `Z:\HookControlled\node.exe`
+ * did the same for Z:, a real `D:\Program Files\Git\cmd\git.exe` was then
+ * reported APPROVED, and a genuine `NODE_OPTIONS --require` preload set
+ * `process.execPath` to a Z-drive value BEFORE the module was evaluated. Such a
+ * drive can be removable, mapped, substituted or user-controlled.
+ *
+ * The approved-path universe is now declared ENTIRELY in committed source as
+ * literal absolute strings, before any runtime input is consulted. Nothing here
+ * reads `process.execPath` — not its drive, directory, basename, installation
+ * location or resolved path — nor the registry, PATH, the current directory, a
+ * temporary directory, a user profile, a module location or a caller argument.
+ * `process.platform` only SELECTS among lists that are already fixed; it can
+ * never add a path, so running Node from C:, D:, Z:, a mapped, substituted or
+ * removable drive yields a byte-identical trust set. An unsupported platform
+ * gets an empty list and fails closed.
  */
-const TRUSTED_GIT_WINDOWS_RELATIVE = Object.freeze([
-  'Program Files/Git/cmd/git.exe',
-  'Program Files/Git/bin/git.exe',
-  'Program Files/Git/mingw64/bin/git.exe',
-  'Program Files (x86)/Git/cmd/git.exe',
-  'Program Files (x86)/Git/bin/git.exe',
-]);
-
-const TRUSTED_GIT_POSIX_ABSOLUTE = Object.freeze([
-  '/usr/bin/git',
-  '/usr/local/bin/git',
-  '/bin/git',
-  '/opt/homebrew/bin/git',
+const TRUSTED_GIT_WINDOWS_ABSOLUTE = Object.freeze([
+  'C:\\Program Files\\Git\\cmd\\git.exe',
+  'C:\\Program Files\\Git\\bin\\git.exe',
+  'C:\\Program Files\\Git\\mingw64\\bin\\git.exe',
+  'C:\\Program Files (x86)\\Git\\cmd\\git.exe',
+  'C:\\Program Files (x86)\\Git\\bin\\git.exe',
 ]);
 
 /*
- * The drive roots are a literal system-drive entry plus the ROOT of the running
- * interpreter's own absolute location, which the runtime supplies rather than
- * the caller. The allowlist is exactly the intended protected installation
- * paths — it is never broadened to temp, user-profile, project, Node or
- * arbitrary filesystem locations.
+ * Only statically declared, system-protected locations. `/usr/local/bin/git`
+ * and `/opt/homebrew/bin/git` were REMOVED: both are routinely user-managed or
+ * user-writable, so neither can be represented as inherently protected. No
+ * location is derived from Node, HOME, a package-manager prefix, an environment
+ * variable or runtime probing; a path that cannot be shown to be
+ * system-protected is omitted and resolution fails closed instead.
  */
+const TRUSTED_GIT_POSIX_ABSOLUTE = Object.freeze(['/usr/bin/git', '/bin/git']);
+
+/** Platforms for which a static, system-protected list has been declared. */
+const TRUSTED_GIT_POSIX_PLATFORMS = Object.freeze(['linux', 'darwin']);
+
+/** Fail-closed list for any platform this file does not declare paths for. */
+const TRUSTED_GIT_NO_APPROVED_PATHS = Object.freeze([] as string[]);
+
+/**
+ * The complete, finite union across every supported platform — visible in one
+ * place for audit. Selection below can only ever return one of these frozen
+ * lists; it never constructs a path.
+ */
+const TRUSTED_GIT_ALL_PLATFORM_PATHS = Object.freeze([...TRUSTED_GIT_WINDOWS_ABSOLUTE, ...TRUSTED_GIT_POSIX_ABSOLUTE]);
+
 const buildTrustedGitAllowlist = (): readonly string[] => {
-  if (process.platform !== 'win32') {
-    return Object.freeze([...TRUSTED_GIT_POSIX_ABSOLUTE]);
+  if (process.platform === 'win32') {
+    return TRUSTED_GIT_WINDOWS_ABSOLUTE;
   }
 
-  const roots = new Set<string>(['C:\\']);
-  const interpreterRoot = parse(process.execPath).root;
-
-  if (interpreterRoot !== '') {
-    roots.add(interpreterRoot);
+  if (TRUSTED_GIT_POSIX_PLATFORMS.includes(process.platform)) {
+    return TRUSTED_GIT_POSIX_ABSOLUTE;
   }
 
-  return Object.freeze(
-    [...roots].flatMap((root) => TRUSTED_GIT_WINDOWS_RELATIVE.map((relative) => join(root, relative))),
-  );
+  return TRUSTED_GIT_NO_APPROVED_PATHS;
 };
 
 /** The immutable, internally defined set of approved Git executables. */
@@ -2610,14 +2635,29 @@ describe('R15.6.4 diagnostic 28 — trusted Git allowlist enforcement', () => {
 
   it('a2 — every matcher Git invocation uses exactly that resolved executable', () => {
     const source = readFileSync(fileURLToPath(import.meta.url), 'utf8');
-    const invocations = source.match(/execFileSync\(\s*([A-Za-z_$][\w$]*|'[^']*'|"[^"]*"|`[^`]*`)/g) ?? [];
-    const gitInvocations = invocations.filter((m) => !m.includes('PSQL'));
+    const targets = [...source.matchAll(/execFileSync\(\s*([A-Za-z_$][\w$.]*|'[^']*'|"[^"]*"|`[^`]*`)/g)].map(
+      (m) => m[1],
+    );
 
-    expect(gitInvocations.length, 'three Git call sites').toBeGreaterThanOrEqual(3);
+    /*
+     * The COMPLETE set of spawn targets is pinned, so a new call site cannot
+     * appear unnoticed. `PSQL` drives the PostgreSQL fixtures and
+     * `process.execPath` spawns the interpreter for the preload challenge;
+     * neither is a Git invocation. Everything else must be TRUSTED_GIT.
+     */
+    expect([...new Set(targets)].sort(), 'the complete set of spawn targets').toEqual([
+      'PSQL',
+      'TRUSTED_GIT',
+      'process.execPath',
+    ]);
 
-    for (const invocation of gitInvocations) {
-      expect(invocation, 'every Git call uses TRUSTED_GIT').toMatch(/execFileSync\(\s*TRUSTED_GIT/);
+    const gitTargets = targets.filter((t) => t !== 'PSQL' && t !== 'process.execPath');
+    expect(gitTargets.length, 'at least three Git call sites').toBeGreaterThanOrEqual(3);
+
+    for (const target of gitTargets) {
+      expect(target, 'every Git call uses TRUSTED_GIT').toBe('TRUSTED_GIT');
     }
+
     expect(source, 'no bare git invocation remains').not.toMatch(/execFileSync\(\s*['"`]git(\.exe)?['"`]/);
   });
 
@@ -2756,7 +2796,7 @@ describe('R15.6.4 diagnostic 28 — trusted Git allowlist enforcement', () => {
 
     // The allowlist itself is frozen and cannot be extended.
     expect(Object.isFrozen(TRUSTED_GIT_ALLOWLIST), 'the allowlist is frozen').toBe(true);
-    expect(Object.isFrozen(TRUSTED_GIT_WINDOWS_RELATIVE), 'the Windows entries are frozen').toBe(true);
+    expect(Object.isFrozen(TRUSTED_GIT_WINDOWS_ABSOLUTE), 'the Windows entries are frozen').toBe(true);
     expect(Object.isFrozen(TRUSTED_GIT_POSIX_ABSOLUTE), 'the POSIX entries are frozen').toBe(true);
 
     const before = [...TRUSTED_GIT_ALLOWLIST];
@@ -2842,6 +2882,280 @@ describe('R15.6.4 diagnostic 28 — trusted Git allowlist enforcement', () => {
     // Rejection happens on the path, so nothing is ever spawned to identify it.
     const approvalSource = [String(normalizeTrustedGitPath), String(trustedGitApproval)].join('\n');
     expect(approvalSource, 'approval never spawns a process').not.toMatch(/execFileSync|execSync|spawn|exec\(/);
+  });
+
+  /*
+   * FIFTH CORRECTION — the trust set must be static.
+   *
+   * The previous list was assembled at runtime by joining relative fragments
+   * onto drive roots that included `parse(process.execPath).root`, so an
+   * interpreter on another drive silently added five approved Git paths there,
+   * and a `NODE_OPTIONS --require` preload could set `process.execPath` before
+   * the module was evaluated. Freezing afterwards froze already-widened content.
+   */
+  it('a11 — the Windows list is exactly the five literal C-drive paths', () => {
+    expect(TRUSTED_GIT_WINDOWS_ABSOLUTE).toEqual([
+      'C:\\Program Files\\Git\\cmd\\git.exe',
+      'C:\\Program Files\\Git\\bin\\git.exe',
+      'C:\\Program Files\\Git\\mingw64\\bin\\git.exe',
+      'C:\\Program Files (x86)\\Git\\cmd\\git.exe',
+      'C:\\Program Files (x86)\\Git\\bin\\git.exe',
+    ]);
+
+    for (const approved of TRUSTED_GIT_WINDOWS_ABSOLUTE) {
+      expect(approved.slice(0, 3), 'every Windows entry is on the C drive').toBe('C:\\');
+      expect(isAbsolute(approved), 'literal and absolute').toBe(true);
+      expect(basename(approved), 'named exactly git.exe').toBe('git.exe');
+    }
+
+    // No entry on any other drive, and no runtime-derived location at all.
+    for (const approved of TRUSTED_GIT_ALL_PLATFORM_PATHS) {
+      expect(approved, 'no non-C drive letter').not.toMatch(/^[ABD-Za-bd-z]:\\/);
+      expect(approved, 'no temp/profile/project/Node location').not.toMatch(
+        /\\Temp\\|\\AppData\\|\\Users\\|node_modules|nodejs|PortableNode|HookControlled/i,
+      );
+    }
+
+    // The complete cross-platform union is finite and fully enumerated here.
+    expect(TRUSTED_GIT_ALL_PLATFORM_PATHS).toEqual([
+      'C:\\Program Files\\Git\\cmd\\git.exe',
+      'C:\\Program Files\\Git\\bin\\git.exe',
+      'C:\\Program Files\\Git\\mingw64\\bin\\git.exe',
+      'C:\\Program Files (x86)\\Git\\cmd\\git.exe',
+      'C:\\Program Files (x86)\\Git\\bin\\git.exe',
+      '/usr/bin/git',
+      '/bin/git',
+    ]);
+
+    for (const frozen of [
+      TRUSTED_GIT_WINDOWS_ABSOLUTE,
+      TRUSTED_GIT_POSIX_ABSOLUTE,
+      TRUSTED_GIT_POSIX_PLATFORMS,
+      TRUSTED_GIT_NO_APPROVED_PATHS,
+      TRUSTED_GIT_ALL_PLATFORM_PATHS,
+      TRUSTED_GIT_ALLOWLIST,
+    ]) {
+      expect(Object.isFrozen(frozen), 'every declared list is frozen').toBe(true);
+    }
+  });
+
+  it('a12 — the POSIX list drops user-managed locations and fails closed off-platform', () => {
+    expect(TRUSTED_GIT_POSIX_ABSOLUTE).toEqual(['/usr/bin/git', '/bin/git']);
+    expect(TRUSTED_GIT_POSIX_ABSOLUTE, 'user-managed prefix removed').not.toContain('/usr/local/bin/git');
+    expect(TRUSTED_GIT_POSIX_ABSOLUTE, 'homebrew prefix removed').not.toContain('/opt/homebrew/bin/git');
+    expect(TRUSTED_GIT_ALL_PLATFORM_PATHS.some((p) => p.startsWith('/usr/local/') || p.startsWith('/opt/'))).toBe(
+      false,
+    );
+
+    // An unsupported platform gets an empty list, so resolution fails closed.
+    expect(TRUSTED_GIT_NO_APPROVED_PATHS).toEqual([]);
+    expect(TRUSTED_GIT_POSIX_PLATFORMS).toEqual(['linux', 'darwin']);
+    expect(String(buildTrustedGitAllowlist), 'no fallback beyond the declared lists').toMatch(
+      /TRUSTED_GIT_NO_APPROVED_PATHS/,
+    );
+  });
+
+  it('a13 — construction never reads process.execPath or any runtime location', () => {
+    const constructionSource = [
+      String(buildTrustedGitAllowlist),
+      String(normalizeTrustedGitPath),
+      String(trustedGitApproval),
+      String(validateTrustedGitCandidate),
+      String(selectTrustedGit),
+      String(resolveTrustedGit),
+    ].join('\n');
+
+    for (const forbidden of [
+      /execPath/,
+      /process\.env/,
+      /cwd\(/,
+      /tmpdir/,
+      /import\.meta/,
+      /__dirname/,
+      /require\.resolve/,
+
+      // Path helpers, not Array.prototype.join used for an error message.
+      /(?<![.\w])parse\(/,
+      /(?<![.\w])join\(/,
+      /(?<![.\w])resolve\(/,
+      /registry|winreg/i,
+    ]) {
+      expect(constructionSource, `construction must not use ${forbidden}`).not.toMatch(forbidden);
+    }
+
+    // The builder only ever RETURNS one of the frozen literals; it builds none.
+    expect(constructionSource, 'no path concatenation in construction').not.toMatch(/\+\s*['"`][\\/]/);
+  });
+
+  it('a14 — the approved list is byte-identical for every interpreter drive', () => {
+    const original = process.execPath;
+    const baseline = [...TRUSTED_GIT_ALLOWLIST];
+
+    const interpreters = [
+      'C:\\Program Files\\nodejs\\node.exe',
+      'D:\\PortableNode\\node.exe',
+      'Z:\\HookControlled\\node.exe',
+      'E:\\RemovableStick\\node.exe',
+      'Y:\\\\mapped\\\\share\\\\node.exe',
+      'X:\\subst-target\\node.exe',
+      '\\\\?\\C:\\weird\\node.exe',
+      '',
+    ];
+
+    try {
+      for (const interpreter of interpreters) {
+        Object.defineProperty(process, 'execPath', { value: interpreter, configurable: true, writable: true });
+        expect(process.execPath, 'the runtime value really did change').toBe(interpreter);
+        expect(buildTrustedGitAllowlist(), `allowlist unchanged for ${JSON.stringify(interpreter)}`).toEqual(baseline);
+        expect(selectTrustedGit(), `resolution unchanged for ${JSON.stringify(interpreter)}`).toBe(TRUSTED_GIT);
+        expect(
+          () => validateTrustedGitCandidate('Z:\\Program Files\\Git\\cmd\\git.exe'),
+          'a Z-drive Git path is never approved',
+        ).toThrow(/not a member of the approved Git installation allowlist/);
+        expect(
+          () => validateTrustedGitCandidate('D:\\Program Files\\Git\\cmd\\git.exe'),
+          'a D-drive Git path is never approved',
+        ).toThrow(/not a member of the approved Git installation allowlist/);
+      }
+    } finally {
+      Object.defineProperty(process, 'execPath', { value: original, configurable: true, writable: true });
+    }
+
+    expect(process.execPath, 'the interpreter path was restored').toBe(original);
+    expect([...TRUSTED_GIT_ALLOWLIST], 'the frozen list never moved').toEqual(baseline);
+  });
+
+  it('a15 — a preload that rewrites process.execPath cannot widen trust', () => {
+    /*
+     * A real child process: `--require` runs the preload BEFORE the evaluated
+     * module, exactly as the reviewer demonstrated, and the child evaluates the
+     * CURRENT committed construction source rather than a re-implementation.
+     */
+    const preloadRoot = createHermeticRoot('preload-');
+
+    try {
+      const source = readFileSync(fileURLToPath(import.meta.url), 'utf8');
+      const from = source.indexOf('const TRUSTED_GIT_WINDOWS_ABSOLUTE');
+      const to = source.indexOf('const TRUSTED_GIT = resolveTrustedGit();');
+      expect(from, 'construction source located').toBeGreaterThan(-1);
+      expect(to, 'construction source end located').toBeGreaterThan(from);
+
+      const extracted = source.slice(from, to);
+      expect(extracted, 'the extracted construction source has no execPath').not.toMatch(/execPath/);
+
+      writeFileSync(join(preloadRoot, 'extract.ts'), extracted, 'utf8');
+      writeFileSync(
+        join(preloadRoot, 'preload.cjs'),
+        "process.execPath = 'Z:\\\\HookControlled\\\\node.exe';\n",
+        'utf8',
+      );
+      writeFileSync(
+        join(preloadRoot, 'child.cjs'),
+        [
+          "const fs = require('node:fs');",
+          "const path = require('node:path');",
+          "const { createRequire } = require('node:module');",
+          `const REPO = ${JSON.stringify(REPO)};`,
+          "const pnpmDir = path.join(REPO, 'node_modules', '.pnpm');",
+          'let esbuild = null;',
+          'for (const d of fs.readdirSync(pnpmDir).filter((x) => /^esbuild@/.test(x)).sort().reverse()) {',
+          "  const entry = path.join(pnpmDir, d, 'node_modules', 'esbuild');",
+          "  try { esbuild = createRequire(path.join(entry, 'package.json'))(entry); break; } catch {}",
+          '}',
+          `const ts = fs.readFileSync(${JSON.stringify(join(preloadRoot, 'extract.ts'))}, 'utf8');`,
+          "const js = esbuild.transformSync(ts, { loader: 'ts', format: 'cjs' }).code;",
+          "const m = new Function('isAbsolute', 'basename', 'statSync',",
+          "  js + '\\nreturn { TRUSTED_GIT_ALLOWLIST, trustedGitApproval };')",
+          '  (path.win32.isAbsolute, path.win32.basename, fs.statSync);',
+          "const z = 'Z:\\\\Program Files\\\\Git\\\\cmd\\\\git.exe';",
+          'const v = m.trustedGitApproval(z);',
+          'process.stdout.write(JSON.stringify({',
+          '  execPath: process.execPath,',
+          '  allowlist: [...m.TRUSTED_GIT_ALLOWLIST],',
+          "  zVerdict: 'approved' in v ? 'APPROVED' : v.rejected,",
+          '}));',
+        ].join('\n'),
+        'utf8',
+      );
+
+      const raw = execFileSync(
+        process.execPath,
+        ['--require', join(preloadRoot, 'preload.cjs'), join(preloadRoot, 'child.cjs')],
+        { cwd: REPO, encoding: 'utf8', timeout: 120_000 },
+      );
+      const result = JSON.parse(raw) as { execPath: string; allowlist: string[]; zVerdict: string };
+
+      expect(result.execPath, 'the preload really did rewrite process.execPath').toBe('Z:\\HookControlled\\node.exe');
+      expect(result.allowlist, 'the allowlist is still exactly the five C-drive paths').toEqual([
+        ...TRUSTED_GIT_WINDOWS_ABSOLUTE,
+      ]);
+      expect(
+        result.allowlist.some((p) => p.startsWith('Z:')),
+        'no Z-drive entry appeared',
+      ).toBe(false);
+      expect(result.zVerdict, 'the Z-drive Git path is rejected on membership, not on absence').toBe(
+        'not a member of the approved Git installation allowlist',
+      );
+    } finally {
+      rmSync(preloadRoot, { recursive: true, force: true });
+      expect(existsSync(preloadRoot), 'preload fixture root removed').toBe(false);
+    }
+  });
+
+  it('a16 — D- and Z-drive Git lookalikes fail before any execution', () => {
+    const driveRoot = createHermeticRoot('drives-');
+
+    try {
+      const sentinelFile = join(driveRoot, 'DRIVE_LOOKALIKE_EXECUTED');
+      const image = join(driveRoot, 'planted.exe');
+
+      try {
+        linkSync(process.execPath, image);
+      } catch {
+        copyFileSync(process.execPath, image);
+      }
+
+      // Real, existing executables placed under Program Files lookalikes.
+      const lookalikeRoots = ['D', 'Z', 'E', 'Y'].map((letter) => join(driveRoot, `${letter}-drive`));
+      const planted: string[] = [];
+
+      for (const root of lookalikeRoots) {
+        const dir = join(root, 'Program Files', 'Git', 'cmd');
+        mkdirSync(dir, { recursive: true });
+
+        const candidate = join(dir, 'git.exe');
+
+        try {
+          linkSync(image, candidate);
+        } catch {
+          copyFileSync(image, candidate);
+        }
+
+        planted.push(candidate);
+      }
+
+      for (const candidate of planted) {
+        expect(statSync(candidate).isFile(), 'the lookalike really exists').toBe(true);
+        expect(basename(candidate), 'and is named exactly git.exe').toBe('git.exe');
+        expect(() => validateTrustedGitCandidate(candidate), `${candidate} rejected`).toThrow(
+          /not a member of the approved Git installation allowlist/,
+        );
+      }
+
+      // The literal drive spellings are rejected too, existing or not.
+      for (const letter of ['D', 'Z', 'E', 'Y', 'X', 'A']) {
+        for (const tail of ['Program Files\\Git\\cmd\\git.exe', 'Program Files (x86)\\Git\\bin\\git.exe']) {
+          expect(() => validateTrustedGitCandidate(`${letter}:\\${tail}`), `${letter}: drive rejected`).toThrow(
+            /not a member of the approved Git installation allowlist/,
+          );
+        }
+      }
+
+      expect(existsSync(sentinelFile), 'no lookalike was ever executed').toBe(false);
+    } finally {
+      rmSync(driveRoot, { recursive: true, force: true });
+      expect(existsSync(driveRoot), 'drive-lookalike fixture root removed').toBe(false);
+    }
   });
 });
 
